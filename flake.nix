@@ -17,7 +17,7 @@
       };
 
       # ONE EXTERNAL DEPENDENCY THIS FLAKE DOES NOT PROVIDE: consumers who set
-      # services.nixboot.loader.program = "lanzaboote" must compose the
+      # nixboot.loader.program = "lanzaboote" must compose the
       # separate lanzaboote flake's own NixOS module (github:nix-community/
       # lanzaboote) into their host alongside this one -- see the "ONE
       # EXTERNAL DEPENDENCY" note at the top of modules/nixboot.nix. Not

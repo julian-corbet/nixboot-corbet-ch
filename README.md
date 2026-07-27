@@ -83,7 +83,7 @@ are noted in the module's own SCOPE block rather than silently missing.
         lanzaboote.nixosModules.lanzaboote
 
         {
-          services.nixboot = {
+          nixboot = {
             enable = true;
             loader.program = "systemd-boot";
             loader.efiVariables = "write"; # this host owns real NVRAM

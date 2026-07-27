@@ -6,7 +6,7 @@ retention, optional boot counting, an optional Secure Boot posture, and a
 `nixboot-verify` service that checks every one of those things actually
 took after boot. Instead of hand-picking `boot.loader.*` options per host
 and hoping they agree with each other and with whatever a NixOS profile
-already set as a default, you declare one `services.nixboot` block and get
+already set as a default, you declare one `nixboot` block and get
 a coherent whole.
 
 This page is the reader-facing walkthrough. The option-by-option contract —

@@ -1,6 +1,6 @@
 # nixboot — the option-surface contract
 
-This file is the **fixed target**: *what* `services.nixboot` must guarantee
+This file is the **fixed target**: *what* `nixboot` must guarantee
 about every knob it exposes. The behaviors are the spec; `modules/nixboot.nix`
 is one implementation. When implementation and contract disagree, the
 contract wins — and if a goal itself is wrong, fix it *here*, not in a chat

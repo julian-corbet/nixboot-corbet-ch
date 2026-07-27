@@ -104,7 +104,7 @@
   ...
 }:
 let
-  cfg = config.services.nixboot;
+  cfg = config.nixboot;
 
   # Measured, not guessed (contract evidence: a live production ESP
   # measured at 187 MiB used of 2048 MiB declared). A lanzaboote UKI stub is
@@ -122,7 +122,7 @@ let
   ## (nixnas/modules/boot/remote-unlock.nix -- public FOSS, so that
   ## repo's own path:line citations stay valid and are kept below).
   ## `ru` short-hands `cfg.remoteUnlock` the same way `cfg` short-hands
-  ## `config.services.nixboot` above -- both are read lazily, so binding
+  ## `config.nixboot` above -- both are read lazily, so binding
   ## them here ahead of the options section they describe is the same
   ## pattern `espProjectedMiB` already uses for `cfg.generations.keep`.
   ru = cfg.remoteUnlock;
@@ -182,7 +182,7 @@ let
   tpm2PcrsArg = lib.concatMapStringsSep "," toString ru.tpm2.pcrs;
 in
 {
-  options.services.nixboot = {
+  options.nixboot = {
     enable = lib.mkEnableOption "nixboot: one declarative boot stance for this host, firmware handoff through to switch-root";
 
     ## ── Loader ────────────────────────────────────────────────────────────
@@ -715,11 +715,11 @@ in
     assertions = [
       {
         assertion = cfg.bootCounting.tries == null || cfg.loader.program == "lanzaboote";
-        message = "services.nixboot.bootCounting.tries is set but loader.program != \"lanzaboote\" -- boot counting is a lanzaboote-stub-only mechanism and would silently do nothing on any other loader. Either drop bootCounting.tries or switch loader.program.";
+        message = "nixboot.bootCounting.tries is set but loader.program != \"lanzaboote\" -- boot counting is a lanzaboote-stub-only mechanism and would silently do nothing on any other loader. Either drop bootCounting.tries or switch loader.program.";
       }
       {
         assertion = !cfg.secureBoot.enable || (cfg.loader.program == "lanzaboote" && cfg.secureBoot.pkiBundle != null);
-        message = "services.nixboot.secureBoot.enable = true requires loader.program = \"lanzaboote\" (the only loader that signs and verifies what it boots) and secureBoot.pkiBundle set (a signed chain with nowhere to keep its keys is not a real chain).";
+        message = "nixboot.secureBoot.enable = true requires loader.program = \"lanzaboote\" (the only loader that signs and verifies what it boots) and secureBoot.pkiBundle set (a signed chain with nowhere to keep its keys is not a real chain).";
       }
       {
         # Mirrors nixnas/modules/boot/remote-unlock.nix:97-113's first
@@ -729,7 +729,7 @@ in
         # loop-crash ("no hostkeys available").
         assertion = !ru.enable || sealActive || ru.hostKeyPath != null;
         message = ''
-          services.nixboot.remoteUnlock.enable is set but no initrd-SSH host key is configured. Either:
+          nixboot.remoteUnlock.enable is set but no initrd-SSH host key is configured. Either:
             - Set remoteUnlock.tpm2.enable = true to the SAME value as this host's real TPM2-backed
               unlock policy (keeps sealHostKey = true, the default): the key is generated + sealed on
               first boot, and every boot after that the initrd unseals it. The very first boot still
@@ -753,8 +753,8 @@ in
         # (nixnas/modules/boot/remote-unlock.nix:114-129, same reasoning.)
         assertion = !sealActive || cfg.secureBoot.enable;
         message = ''
-          services.nixboot.remoteUnlock.sealHostKey = true (the default) with remoteUnlock.tpm2.enable
-          = true requires services.nixboot.secureBoot.enable: only the lanzaboote (UKI) stub delivers
+          nixboot.remoteUnlock.sealHostKey = true (the default) with remoteUnlock.tpm2.enable
+          = true requires nixboot.secureBoot.enable: only the lanzaboote (UKI) stub delivers
           the TPM2-sealed host-key credential into the initrd. Enable secureBoot, or set
           remoteUnlock.sealHostKey = false with a plaintext hostKeyPath, or set remoteUnlock.tpm2.enable
           = false / remoteUnlock.enable = false.
@@ -766,7 +766,7 @@ in
         # exactly the "setting requested, quietly not applied" class of bug
         # this whole module exists to stop.
         assertion = !ru.enable || ru.authorizedKeys != [ ];
-        message = "services.nixboot.remoteUnlock.enable is set but remoteUnlock.authorizedKeys is empty -- initrd sshd is key-only, so nothing could ever answer the unlock prompt over the network.";
+        message = "nixboot.remoteUnlock.enable is set but remoteUnlock.authorizedKeys is empty -- initrd sshd is key-only, so nothing could ever answer the unlock prompt over the network.";
       }
     ];
 
@@ -900,7 +900,7 @@ in
             set -euo pipefail
 
             if [ -z "${cfg.secureBoot.pkiBundle}" ]; then
-              echo "nixboot-enroll-sb: services.nixboot.secureBoot.pkiBundle is not set." >&2
+              echo "nixboot-enroll-sb: nixboot.secureBoot.pkiBundle is not set." >&2
               exit 1
             fi
             pki="${cfg.secureBoot.pkiBundle}"
