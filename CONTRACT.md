@@ -170,12 +170,35 @@ for a non-zero size and an intact PE/COFF `MZ` header, not merely
 existence — present-but-corrupted is a real, closable gap an existence-only
 check silently missed.
 
+**B17 — Booting off USB-attached removable media is one opt-in fact,
+deliberately usable without taking on this module's whole boot stance, and
+deliberately independent of the removable-vs-NVRAM loader choice.**
+`media.usb.enable` only ever adds the initrd kernel modules (`usb_storage`,
+`uas`, `xhci_pci`, `ehci_pci`) needed to find and drive a USB-attached boot
+device before any root filesystem exists. Two things it deliberately does
+NOT do: it never derives, and is never derived from, `loader.efiVariables`
+— a warning fires when the two look mismatched (`media.usb.enable = true`
+with `efiVariables = "write"`), but nixboot never overrides one from the
+other, because a USB dongle permanently wired into one machine is a
+legitimate case where they disagree. And unlike every other knob in this
+module, its config is wired OUTSIDE the top-level `lib.mkIf cfg.enable` —
+the same "usable without adopting this module's whole boot-stance
+ownership" shape `extraEntries.*`'s own unconditionally-exposed build
+outputs already use — because `nixboot.enable = true` pulls in a bundle of
+OTHER opinions (a required `loader.program`, `nixboot-verify`'s readback
+checks, `secureBoot.sbctlCompat`'s `/etc/sbctl/sbctl.conf` write, which
+crashes eval outright with no `secureBoot.pkiBundle` set) that a host which
+already owns its own primary boot chain should not have to take on, or
+carefully neutralize one knob at a time, just to reuse this one mechanism
+(`modules/nixboot.nix`, the `media` option group + the `config = lib.mkMerge
+[...]` restructure at its top).
+
 ## Which behaviors become automated tests vs. stay observed
 
 - **Automatable** (a `pkgs.testers.nixosTest` VM can assert these directly):
-  B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16.
+  B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16, B17.
 - **Automated today, at the eval/build level, without a VM** (see
-  `checks/default.nix`): B13, B14, and B15's idempotency/self-heal proof
+  `checks/default.nix`): B13, B14, B17, and B15's idempotency/self-heal proof
   (a real invocation of the registrar against a faked `efibootmgr` inside
   the Nix build sandbox — no VM, no KVM, no real firmware, but a genuine
   execution rather than an eval-only assertion).

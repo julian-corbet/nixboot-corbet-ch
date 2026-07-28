@@ -15,7 +15,7 @@ mechanism — is [`CONTRACT.md`](../CONTRACT.md). The module itself, with
 every option's own description, is
 [`modules/nixboot.nix`](../modules/nixboot.nix).
 
-## The six option groups
+## The seven option groups
 
 **`loader.*`** — which program installs to the ESP (`systemd-boot`,
 `lanzaboote`, or `none` for a guest with no firmware of its own) and every
@@ -49,6 +49,16 @@ actually asked for, and the toggle for `nixboot-verify` itself (on by
 default — turning it off means boot-time misconfiguration goes back to
 being silent until the next boot, which is the exact failure mode this
 module exists to close).
+
+**`media.usb.enable`** — does the initrd need to find and drive a
+USB-attached storage device before any root filesystem exists, because the
+boot device is a stick rather than storage fixed inside the machine? The one
+option group in this module that is deliberately usable **without**
+`nixboot.enable` — a host that already owns its own loader/Secure Boot
+wiring can still reuse just this one mechanism, the same "usable standalone"
+shape `extraEntries`'s own build outputs use. Deliberately independent of
+`loader.efiVariables` (nixboot warns, but never overrides one from the
+other) — see CONTRACT.md's B17.
 
 **`extraEntries.*`** — SECOND, non-default UKIs on the same ESP: a durable
 rescue, BMC-recovery, or fallback boot entry, built and signed by the same

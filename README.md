@@ -21,9 +21,17 @@ only evidence often appears at the *next* boot, by which point the box may
 not come back at all. `nixboot-verify` closes that gap by checking, not
 assuming.
 
+It also owns one thing that is deliberately usable **without** taking on any
+of the above: `media.usb.enable` adds the initrd kernel modules a stage-1
+boot needs to find and drive a USB-attached device — a stick — before any
+root filesystem exists. Every other knob in this module lives behind
+`nixboot.enable`; this one is wired independently of it (the same shape
+`extraEntries`'s own unconditionally-exposed build outputs use), so a host
+that already owns its whole boot chain can reuse just this one mechanism.
+
 **What it explicitly does not own**, so no knob ever has two managers
 fighting over it (see the SCOPE block in
-[`modules/nixboot.nix`](modules/nixboot.nix#L17-L58) for the full reasoning
+[`modules/nixboot.nix`](modules/nixboot.nix#L17-L87) for the full reasoning
 behind each line):
 
 - **The ESP's existence.** Partitioning, formatting, and mounting are a
@@ -49,7 +57,7 @@ flake's own NixOS module. nixboot never imports that module itself (kept
 self-contained on purpose); whoever composes a host's module list must
 import lanzaboote's module too, on every host nixboot is imported on, not
 just the hosts that use it — see the "ONE EXTERNAL DEPENDENCY" note in
-[`modules/nixboot.nix`](modules/nixboot.nix#L60-L73).
+[`modules/nixboot.nix`](modules/nixboot.nix#L88-L101).
 
 The full option-by-option contract, including every assertion and warning
 this module ships, lives in [CONTRACT.md](CONTRACT.md).
@@ -108,6 +116,20 @@ at a durable key location — nixboot asserts that combination is complete
 before it will evaluate. See [CONTRACT.md](CONTRACT.md) for every option and
 the assertions/warnings that keep them from silently disagreeing with each
 other.
+
+A host that owns its own boot chain already (so `nixboot.enable` stays
+`false`) can still reuse just the removable-media mechanism:
+
+```nix
+{
+  nixboot.media.usb.enable = true; # find + drive a USB stick in the initrd
+  # ... this host's own loader.program / secureBoot / etc. wiring, unchanged.
+}
+```
+
+The stick's own geometry — device path, image size, partition count — is
+never nixboot's business; that stays with whichever disk-layout tool the
+host already uses.
 
 ## Repository layout
 

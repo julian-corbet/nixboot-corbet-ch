@@ -113,6 +113,29 @@ let
     };
   };
 
+  # ── Fixture 4: media.usb.enable works with nixboot.enable FORCED OFF -- the same
+  # "usable without adopting this module's whole boot stance" shape fixture 3 already
+  # proves for extraEntries, here for the other knob in this file with that shape (B17).
+  cfg-media-usb-standalone = evalFor {
+    nixboot.enable = lib.mkForce false;
+    nixboot.media.usb.enable = true;
+  };
+
+  # ── Fixture 5: media.usb.enable=true alongside the "write" NVRAM stance it warns
+  # about (needs cfg.enable, since loader.efiVariables is only ever read there).
+  cfg-media-usb-mismatched-efi = evalFor {
+    nixboot.loader.program = "systemd-boot";
+    nixboot.loader.efiVariables = "write";
+    nixboot.media.usb.enable = true;
+  };
+
+  # ── Fixture 6: same, but the loader stance the warning wants -- no warning expected.
+  cfg-media-usb-removable = evalFor {
+    nixboot.loader.program = "systemd-boot";
+    nixboot.loader.efiVariables = "removable";
+    nixboot.media.usb.enable = true;
+  };
+
   results = [
     # --- decoupling from loader.program / secureBoot.enable (requirement 3) -------------
     (check "none-unsigned/builds-with-no-primary-chain-owned"
@@ -261,6 +284,30 @@ let
         in lib.hasInfix "SKIP  extraEntries: none declared" cfg.systemd.services.nixboot-verify.script
       )
       "nixboot-verify script does not SKIP cleanly when nixboot.extraEntries is empty")
+
+    # --- media.usb.enable (B17): usable standalone, adds exactly the USB-controller
+    # modules, and cross-checks against loader.efiVariables without ever overriding it ---
+    (check "media-usb/works-with-nixboot-enable-forced-off"
+      (
+        let mods = cfg-media-usb-standalone.boot.initrd.availableKernelModules;
+        in lib.all (m: lib.elem m mods) [ "usb_storage" "uas" "xhci_pci" "ehci_pci" ]
+      )
+      "boot.initrd.availableKernelModules: ${builtins.toJSON cfg-media-usb-standalone.boot.initrd.availableKernelModules}")
+
+    (check "media-usb/default-off-adds-nothing"
+      (
+        let cfg = evalFor { }; # nixboot.enable = true (fixture default), media.usb.enable at its own default (false)
+        in !(lib.elem "usb_storage" cfg.boot.initrd.availableKernelModules)
+      )
+      "boot.initrd.availableKernelModules unexpectedly carries usb_storage with media.usb.enable left at its default")
+
+    (check "media-usb/warns-when-loader-efiVariables-is-write"
+      (lib.any (w: lib.hasInfix "media.usb.enable" w && lib.hasInfix "loader.efiVariables" w) cfg-media-usb-mismatched-efi.warnings)
+      "warnings: ${builtins.toJSON cfg-media-usb-mismatched-efi.warnings}")
+
+    (check "media-usb/no-warning-when-loader-efiVariables-is-removable"
+      (!(lib.any (w: lib.hasInfix "media.usb.enable" w) cfg-media-usb-removable.warnings))
+      "warnings: ${builtins.toJSON cfg-media-usb-removable.warnings}")
   ];
 
   failed = builtins.filter (r: !r.ok) results;

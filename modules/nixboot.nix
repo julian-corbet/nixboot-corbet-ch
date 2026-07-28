@@ -44,13 +44,26 @@
 #           description for why signing an extra entry cannot be derived
 #           from a policy that requires loader.program == "lanzaboote");
 #           and nixboot-verify, which reads every one of the above back
-#           from the live system.
+#           from the live system; whether the initrd must be able to find
+#           and drive a USB-attached boot device at all (media.usb.enable)
+#           -- the one knob in this file that is DELIBERATELY independent
+#           of `cfg.enable` (see that option's own doc, and the config-side
+#           comment where it is wired, for why: the same "usable without
+#           taking on this module's whole boot-stance ownership" shape
+#           `extraEntries.*`'s unconditionally-exposed build outputs
+#           already use).
 #   NOT   : the ESP is never partitioned, formatted, or mounted here --
 #           that is disko (modules/nixos/disko/*.nix on this fleet) or,
 #           on a host running nixnas, its `disko.memSize` appliance layout.
 #           nixboot only DECLARES where an ESP that already exists lives
 #           (esp.mountPoint) and what must already be true about it
-#           (esp.byLabel, esp.capacityMiB) so it can assert and verify.
+#           (esp.byLabel, esp.capacityMiB) so it can assert and verify. The
+#           same line applies to `media.usb.enable`: it says nothing about
+#           the STICK a USB-booted host actually uses -- device path, image
+#           size, ESP size, partition count are all geometry that stays
+#           with whoever lays out that stick (e.g. nixnas's own
+#           `boot.usb.*`); this module only ever answers whether the
+#           initrd can see a USB device at all.
 #   NOT   : kernel packaging -- variant/march/lto, the ZFS kernel module
 #           pairing, substituter choice. A foreign domain by the same rule
 #           that put PCI/USB power in nixpower and not nixbmc: this stays
@@ -359,6 +372,55 @@ in
         type = lib.types.listOf lib.types.str;
         default = [ ];
         description = "Which paths on this ESP, relative to esp.mountPoint, belong to someone else and must never be touched or garbage-collected by nixboot or its loader? For example a vendor firmware-update capsule tree, fwupd's own loader entry, or a rescue-media directory. nixboot-verify checks each one still exists.";
+      };
+    };
+
+    ## ── Media: is the boot device fixed internal storage, or a USB stick
+    ## that might be plugged into any spare box? DELIBERATELY independent of
+    ## `cfg.enable` -- see the config-side comment on `media.usb` below for
+    ## why, and `extraEntries.*` for the one other surface in this module
+    ## with the same shape.
+    media = {
+      usb.enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Does the initrd need to find and drive a USB-ATTACHED storage
+          device before ANY root filesystem exists -- because the boot
+          device (and, usually, the whole OS store) is a USB stick rather
+          than storage fixed inside the machine? When true, nixboot adds
+          the kernel modules early userspace needs to even SEE such a
+          device to `boot.initrd.availableKernelModules`: `usb_storage`,
+          `uas`, and the two common USB host-controller drivers --
+          `xhci_pci` (USB 3) and `ehci_pci` (USB 2). Without them the
+          stage-1 boot hangs waiting for a root device it can never see,
+          since only what THIS list names ships in the initrd (the full
+          stage-2 module tree is not available yet).
+
+          Ported from one appliance distribution's own
+          `boot.initrd.availableKernelModules` USB-controller entries
+          (nixnas/modules/boot/image.nix:52-59), which lived inline in
+          that host's boot glue with no reuse path for any other host that
+          also boots off a stick.
+
+          DELIBERATELY INDEPENDENT of `loader.efiVariables`: a stick can
+          rely on the removable-media EFI fallback path while the initrd
+          it boots reads from FIXED storage once switch-root happens (an
+          appliance image meant to be portable but with its real store
+          elsewhere), and a USB-attached device can legitimately keep
+          `efiVariables = "write"` if it is a dongle permanently wired
+          into one specific machine and never swapped. nixboot does not
+          derive one from the other -- it only warns when the common,
+          field-proven combination (`media.usb.enable = true` with
+          `loader.efiVariables = "write"`) looks like a host that forgot
+          to say "removable" (see the warnings list, below).
+
+          The SIZE of the stick, its partition layout, and the filesystem
+          the store itself uses are NOT this option's business -- those
+          stay with whoever lays out the disk (a disk-layout tool's own
+          geometry options); this option only ever answers "can the
+          initrd SEE a USB device at all".
+        '';
       };
     };
 
@@ -712,7 +774,27 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable (lib.mkMerge [
+  config = lib.mkMerge [
+    # ── media.usb: DELIBERATELY independent of `cfg.enable` ─────────────────
+    # A consumer who wants nixboot to own its WHOLE boot stance sets
+    # `nixboot.enable = true` and gets everything below this block. A
+    # consumer who already owns its own loader/Secure Boot/remote-unlock
+    # wiring (the exact position a sibling appliance distribution's own
+    # boot glue is in today) should not have to take all of that on just to
+    # reuse this ONE mechanism -- so it is wired unconditionally, the same
+    # shape `extraEntries.nix` already uses for its own unconditionally-
+    # exposed `system.build.extraEntryMaintainers` (see that file's header).
+    # `boot.initrd.availableKernelModules` is a list-type option that
+    # MERGES across every module that contributes to it, so this needs no
+    # priority discipline the way the `boot.loader.*` writes further down
+    # do -- it can never collide with a host's own list, only add to it.
+    {
+      boot.initrd.availableKernelModules = lib.mkIf cfg.media.usb.enable [
+        "usb_storage" "uas" "xhci_pci" "ehci_pci"
+      ];
+    }
+
+    (lib.mkIf cfg.enable (lib.mkMerge [
     {
     assertions = [
       {
@@ -778,6 +860,9 @@ in
       ''
       ++ lib.optional (cfg.secureBoot.sbctlCompat && !cfg.tools.sbctl.enable) ''
         nixboot: secureBoot.sbctlCompat writes /etc/sbctl/sbctl.conf, but tools.sbctl.enable is false, so the sbctl binary that file exists for is not installed on this host. Either turn tools.sbctl.enable on or drop sbctlCompat -- a config file for an absent tool is exactly the kind of setting-that-does-nothing this module exists to surface, not to ship quietly.
+      ''
+      ++ lib.optional (cfg.media.usb.enable && cfg.loader.efiVariables == "write") ''
+        nixboot: media.usb.enable is set (the initrd is wired to find a USB-attached boot device) but loader.efiVariables = "write" -- firmware then gets an NVRAM entry pointing at THIS specific device path, so a stick meant to move between boxes stops booting reliably the moment it is plugged into a different one (or even the same one after a port change that renumbers the USB topology). Set loader.efiVariables = "removable" unless this device is permanently, physically fixed to one machine.
       '';
 
     boot.loader = lib.mkMerge [
@@ -1549,5 +1634,6 @@ in
       # verify's checks run, not vanish along with this unit.
       systemd.services.nixboot-verify.after = lib.mkIf cfg.verify.enable [ "nixboot-seal-hostkey.service" ];
     })
-  ]);
+    ]))
+  ];
 }
