@@ -33,6 +33,16 @@
 #           enrollment -- while only READING the TPM2 enable/pcrs/device
 #           values it seals against, never declaring that policy itself
 #           (see remoteUnlock.tpm2.* below and the NOT note underneath);
+#           SECOND, non-default UKIs on the same ESP (extraEntries.*,
+#           modules/extra-entries.nix) -- built and signed by the same
+#           ukify+sbsign pipeline, placed under an operator-named file,
+#           optionally rotated as a current/previous pair and optionally
+#           registered as an idempotent firmware NVRAM boot entry --
+#           deliberately independent of generations.keep/bootCounting.tries
+#           (which only ever govern loader.program's OWN generations) and
+#           of secureBoot.enable (see extraEntries.*.sign.enable's own
+#           description for why signing an extra entry cannot be derived
+#           from a policy that requires loader.program == "lanzaboote");
 #           and nixboot-verify, which reads every one of the above back
 #           from the live system.
 #   NOT   : the ESP is never partitioned, formatted, or mounted here --
@@ -62,14 +72,6 @@
 #           though a suspend/resume cycle is boot-adjacent. Two managers
 #           on one kernel-param list is exactly the mistake nixpower's own
 #           header warns against.
-#   NOT   : the extraEntries UKI-build mechanism (a durable rescue/BMC
-#           entry built with ukify+sbsign) the source contract specifies.
-#           Real, evidenced, and deliberately deferred -- unlike
-#           remoteUnlock.* (now implemented; see OWNED above), building
-#           and signing an extra UKI touches the same ukify+sbsign
-#           pipeline as rescue-maintain's on the source fleet, sight
-#           unseen from this port.
-#
 # ONE EXTERNAL DEPENDENCY THIS MODULE DOES NOT PROVIDE: `boot.lanzaboote.*`
 # is not a stock NixOS option -- it is defined by the separate lanzaboote
 # flake's own NixOS module. nixboot WRITES to those options when
@@ -1039,10 +1041,33 @@ in
           fi
         ''}
 
-        # ── Check 4: foreign paths still present ──
+        # ── Check 4: foreign paths still present -- AND, for anything that
+        # looks like an EFI binary (a foreign fallback loader is the common
+        # case: EFI/BOOT/BOOTX64.EFI, a vendor rescue stub), actually intact,
+        # not merely present. Existence alone is a weaker claim than it
+        # looks: a `-e` check is satisfied equally by the real binary and by
+        # a zero-byte or truncated file left behind by some other write that
+        # failed partway -- present-but-corrupted is a real, closable gap an
+        # existence-only check silently misses. PE/COFF images (which every
+        # EFI binary is) start with the two bytes "MZ"; checking that plus a
+        # non-zero size catches gross corruption without needing a full
+        # parse of the executable.
         ${lib.concatMapStringsSep "\n" (p: ''
           if [ -e "$esp/${p}" ]; then
-            echo "PASS  esp.foreignPaths: ${p} present"
+            ${
+              if lib.hasSuffix ".efi" (lib.toLower p) then ''
+                sz="$(stat -c%s "$esp/${p}" 2>/dev/null || echo 0)"
+                magic="$(head -c2 "$esp/${p}" 2>/dev/null | tr -d '\0')"
+                if [ "$sz" -gt 0 ] && [ "$magic" = "MZ" ]; then
+                  echo "PASS  esp.foreignPaths: ${p} present and looks like an intact PE/EFI binary ($sz bytes)"
+                else
+                  echo "FAIL  esp.foreignPaths: ${p} exists but is not an intact EFI binary (size=$sz bytes, magic='$magic') -- present-but-corrupted is exactly what an existence-only check misses"
+                  fail=1
+                fi
+              '' else ''
+                echo "PASS  esp.foreignPaths: ${p} present"
+              ''
+            }
           else
             echo "FAIL  esp.foreignPaths: ${p} is MISSING -- something removed a path nixboot promised never to touch or garbage-collect"
             fail=1
@@ -1171,6 +1196,38 @@ in
         ''}
         ${lib.optionalString (!ru.enable) ''
           echo "SKIP  remoteUnlock: not managed by nixboot"
+        ''}
+
+        # ── Check 9: extraEntries -- the placed UKI exists under its
+        # declared name, and, if signed, verifies against the enrolled db
+        # key. This is the same "requesting a setting is not evidence it
+        # took" contract Check 1-8 already enforce, applied to
+        # nixboot.extraEntries: the maintainer unit ran on a TIMER (never a
+        # boot/switch dependency, see modules/extra-entries.nix), so nothing
+        # else in this system ever confirms it actually succeeded.
+        ${lib.concatStringsSep "\n" (lib.mapAttrsToList (extraName: entry: ''
+          ef="$esp/EFI/Linux/${entry.espFileName}"
+          if [ -f "$ef" ]; then
+            echo "PASS  extraEntries.${extraName}: $ef exists"
+            ${lib.optionalString entry.sign.enable ''
+              if command -v sbverify >/dev/null 2>&1; then
+                if sbverify --cert "${lib.escapeShellArg (if entry.sign.pkiBundle != null then "${entry.sign.pkiBundle}/keys/db/db.pem" else "/dev/null")}" "$ef" >/dev/null 2>&1; then
+                  echo "PASS  extraEntries.${extraName}: signature verifies against the enrolled db key"
+                else
+                  echo "FAIL  extraEntries.${extraName}: $ef does NOT verify against ${lib.escapeShellArg (if entry.sign.pkiBundle != null then "${entry.sign.pkiBundle}/keys/db/db.pem" else "(no pkiBundle declared)")}"
+                  fail=1
+                fi
+              else
+                echo "SKIP  extraEntries.${extraName}: sbverify not on PATH (tools.sbsigntool.enable is off) -- cannot check the signature"
+              fi
+            ''}
+          else
+            echo "FAIL  extraEntries.${extraName}: declared UKI $ef is MISSING"
+            fail=1
+          fi
+        '') cfg.extraEntries)}
+        ${lib.optionalString (cfg.extraEntries == { }) ''
+          echo "SKIP  extraEntries: none declared"
         ''}
 
         if [ "$fail" -ne 0 ]; then

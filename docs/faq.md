@@ -67,10 +67,42 @@ refusal rather than a silent partial enrollment. See
 
 ## What isn't implemented yet?
 
-Two pieces of the source contract that motivated this module are real,
-evidenced, and deliberately deferred rather than guessed at: the
-`extraEntries` UKI-build mechanism for a durable rescue/BMC boot entry
-(built with `ukify`+`sbsign`), and the initrd-time surface — unlock members,
-SSH-unlock, console keymap. Both are called out explicitly in the module's
-own SCOPE block rather than silently missing. See
-`modules/nixboot.nix:51-58`.
+The initrd-time surface beyond `remoteUnlock.*` — unlock members, the
+initrd console keymap — is real, evidenced, and deliberately deferred rather
+than guessed at, called out explicitly in the module's own SCOPE block
+rather than silently missing. See `modules/nixboot.nix`'s header.
+
+`extraEntries.*` (second, non-default UKIs on the same ESP) was the other
+deferred piece as of the previous revision of this page — it is now
+implemented in `modules/extra-entries.nix`. See the next question.
+
+## What is `nixboot.extraEntries`, and how is it different from a normal
+generation?
+
+A normal generation is one of loader.program's OWN boot entries —
+`generations.keep` and `bootCounting.tries` govern those, and they always
+carry the `nixos-` prefix both shipped loaders use to garbage-collect their
+own history. `extraEntries.<name>` is a SEPARATE, operator-named UKI built
+from a DIFFERENT toplevel (a foreign `nixosConfiguration`'s own
+`system.build.toplevel` is the common case — a rescue system, a BMC-recovery
+image), asserted to never collide with that `nixos-` prefix, so it survives
+both loaders' generation GC untouched. It is built, optionally signed,
+placed, optionally rotated as a current/previous pair, and optionally
+registered as a firmware NVRAM boot entry by its own maintainer service —
+one per attrset entry, driven by a timer, never a boot/switch dependency
+(the same "never block the boot/switch transaction on an ESP write"
+discipline the sibling appliance distribution's own rescue-maintenance
+module states and this one absorbs). See `modules/extra-entries.nix`'s
+header and CONTRACT.md's B13–B16.
+
+## Why isn't `extraEntries.<name>.sign.enable` just `secureBoot.enable`?
+
+Because `secureBoot.enable` asserts `loader.program == "lanzaboote"` (B5),
+but an extra entry is exactly the case where a host's PRIMARY chain may not
+be owned by nixboot at all (`loader.program = "none"` — a foreign ESP this
+module is only allowed to add ONE entry to). Deriving `sign.enable` from
+`secureBoot.enable` the way `tools.sbctl.enable` legitimately does would
+make a signed extra entry impossible on precisely the hosts most likely to
+want one. `sign.pkiBundle` defaults to `secureBoot.pkiBundle` (the same bare
+path fact, with no dependency on `secureBoot.enable` either) but can point
+anywhere. See `modules/extra-entries.nix`'s `sign.enable` option doc.

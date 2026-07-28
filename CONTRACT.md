@@ -128,18 +128,70 @@ including hosts that leave it disabled, or evaluation fails the moment any
 host anywhere sets `loader.program = "lanzaboote"`
 (`modules/nixboot.nix:60-73, 418-425`).
 
+**B13 — An extra entry's name must not collide with either loader's own
+generation-GC prefix, and must resolve to a unique ESP path.**
+`extraEntries.<name>.espFileName` has no default and is asserted to end in
+`.efi` and never start with `nixos-` — the one prefix both shipped loaders
+key their own generation garbage collection on. Two entries (including an
+entry's own auto-derived `-prev.efi` rotation target) resolving to the same
+ESP path is also an assertion failure, not a silent clobber
+(`modules/extra-entries.nix`, the `assertions` block).
+
+**B14 — Signing an extra entry is independent of `secureBoot.enable` and
+`loader.program`.**
+`extraEntries.<name>.sign.enable` is never derived from `secureBoot.enable`
+(which itself requires `loader.program == "lanzaboote"`, per B5) — a host
+whose primary chain nixboot does not own at all (`loader.program = "none"`)
+can still place a signed extra entry via its own `sign.pkiBundle` (which
+defaults to, but is independent of, `secureBoot.pkiBundle`). Equally, a host
+with Secure Boot off and no PKI anywhere places an unsigned entry with no
+`sign.pkiBundle` required — asserted to be required only when
+`sign.enable = true` (`modules/extra-entries.nix`).
+
+**B15 — Registering a firmware boot entry is idempotent and self-healing,
+never a naive `efibootmgr --create`.**
+`nixboot-register-boot-entry` matches an existing NVRAM entry on BOTH label
+and current device path before deciding what to do: a full match is a
+true no-op; a label match with a different path (the documented
+consequence of an ESP resize changing the `HD()` device path's start LBA
+and size) is treated as stale and replaced; no match creates. This is what
+makes it safe to run unconditionally on a recurring timer, where a naive
+`--create` would pile up duplicate NVRAM entries until firmware boot
+variable slots exhaust (`modules/extra-entries.nix`, proved in
+`checks/default.nix`'s `register-boot-entry-idempotency`).
+
+**B16 — Every extraEntries entry is read back by `nixboot-verify`.**
+The placed UKI's existence under its declared name, and, when signed, its
+signature against the declared PKI bundle's db key, are checked the same
+way every other managed boot knob is — PASS/FAIL/SKIP, exit non-zero on any
+FAIL (`modules/nixboot.nix`, Check 9). `esp.foreignPaths`' own check (B3)
+was strengthened alongside this: a `.efi` foreign path is now also checked
+for a non-zero size and an intact PE/COFF `MZ` header, not merely
+existence — present-but-corrupted is a real, closable gap an existence-only
+check silently missed.
+
 ## Which behaviors become automated tests vs. stay observed
 
 - **Automatable** (a `pkgs.testers.nixosTest` VM can assert these directly):
-  B1, B2, B3, B4, B5, B7, B9, B10, B12.
+  B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16.
+- **Automated today, at the eval/build level, without a VM** (see
+  `checks/default.nix`): B13, B14, and B15's idempotency/self-heal proof
+  (a real invocation of the registrar against a faked `efibootmgr` inside
+  the Nix build sandbox — no VM, no KVM, no real firmware, but a genuine
+  execution rather than an eval-only assertion).
 - **Observed / operational** (need real firmware, a real TPM, or real NVRAM
   state that a disposable VM cannot faithfully reproduce): B6 (Setup Mode
   gating against real UEFI variables), B8 (a real ESP actually approaching
-  its declared capacity over many generations).
+  its declared capacity over many generations), and the REST of B15 (that a
+  real firmware implementation accepts the entry and actually offers it at
+  POST — the registrar's own logic is proved, real firmware quirks are not).
 
-No automated test suite exists yet in this repo — see
+`checks/default.nix` is this repo's first automated test suite — eval-level
+assertions plus the one build-level idempotency proof described above. A
+full `pkgs.testers.nixosTest` VM suite covering the boot path itself (real
+UEFI via OVMF, real UKI discovery) remains future work — see
 [`experiments/README.md`](experiments/README.md) and
-[`studies/README.md`](studies/README.md) for where that work would land.
+[`studies/README.md`](studies/README.md).
 
 ## Priority discipline (how B1 and the loader writes are actually enforced)
 

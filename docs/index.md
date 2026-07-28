@@ -15,7 +15,7 @@ mechanism — is [`CONTRACT.md`](../CONTRACT.md). The module itself, with
 every option's own description, is
 [`modules/nixboot.nix`](../modules/nixboot.nix).
 
-## The five option groups
+## The six option groups
 
 **`loader.*`** — which program installs to the ESP (`systemd-boot`,
 `lanzaboote`, or `none` for a guest with no firmware of its own) and every
@@ -49,6 +49,18 @@ actually asked for, and the toggle for `nixboot-verify` itself (on by
 default — turning it off means boot-time misconfiguration goes back to
 being silent until the next boot, which is the exact failure mode this
 module exists to close).
+
+**`extraEntries.*`** — SECOND, non-default UKIs on the same ESP: a durable
+rescue, BMC-recovery, or fallback boot entry, built and signed by the same
+`ukify`+`sbsign` pipeline, placed under an operator-named file that never
+collides with either loader's own generation-GC prefix, optionally rotated
+as a current/previous pair, and optionally registered as an idempotent
+firmware NVRAM boot entry. Deliberately independent of
+`generations.keep`/`bootCounting.tries` (which only ever govern
+loader.program's own generations) and of `secureBoot.enable`/`loader.program`
+(a host that owns no primary boot chain at all, or runs one with Secure Boot
+off, can still carry a signed or unsigned extra entry) — see
+`modules/extra-entries.nix` and CONTRACT.md's B13–B16.
 
 ## Why a `*-verify` service at all
 
