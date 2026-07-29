@@ -120,6 +120,19 @@
 }:
 let
   cfg = config.nixboot;
+  # ── nixstorage.layout: read defensively, see the ESP option block for why ──
+  # Which layout image describes THIS host's medium cannot be guessed, so it is named by
+  # esp.fromLayout. Absent that (or absent nixstorage entirely) every derived default
+  # falls back to null and the operator states the facts directly.
+  nsImages = config.nixstorage.layout.images or { };
+  espSourceImage =
+    if cfg.esp.fromLayout != null && nsImages ? "${cfg.esp.fromLayout}"
+    then nsImages."${cfg.esp.fromLayout}"
+    else null;
+  espSourcePart =
+    if espSourceImage == null then null
+    else lib.findFirst (p: p.role or null == "esp") null (espSourceImage.partitions or [ ]);
+
 
   # Measured, not guessed (contract evidence: a live production ESP
   # measured at 187 MiB used of 2048 MiB declared). A lanzaboote UKI stub is
@@ -349,6 +362,25 @@ in
     };
 
     ## ── ESP (declared, never created -- nixboot does not partition) ────────
+    #
+    # nixboot OWNS the ESP as a boot concern -- what must be on it, that its label and
+    # capacity are what this host expects, that foreign paths survive GC. It does NOT own
+    # the ESP as a PARTITION: size, label and position are storage shape, and nixstorage's
+    # layout is where a medium is carved.
+    #
+    # THOSE TWO FACTS USED TO BE TYPED SEPARATELY, AND IT NEARLY COST A STICK. Three repos
+    # each carried an ESP fact with no edge between them -- nixnas.boot.usb.espSizeMiB said
+    # 2048 MiB, nixstorage's layout said 512, nixboot asserted its own capacityMiB, and
+    # nothing compared any of them. Re-flashing from the wrong one would have replaced a
+    # 5-partition medium with a 2-partition one, destroying three rescue slots and a vault,
+    # with every declaration still looking locally correct.
+    #
+    # So byLabel and capacityMiB now DEFAULT to whatever nixstorage's layout declares for
+    # this host's ESP, read DEFENSIVELY (`config.nixstorage.layout … or null`) exactly as
+    # nixstorage itself reads nixid -- so importing nixboot without nixstorage keeps
+    # working, and a host that carves its medium elsewhere can still state these by hand.
+    # nixboot does not import nixstorage and never will; it only reads a value if one is
+    # there. The direction is fixed: BOOT reads STORAGE, never the reverse.
     esp = {
       mountPoint = lib.mkOption {
         type = lib.types.str;
@@ -356,15 +388,37 @@ in
         description = "Where is the ESP mounted? nixboot never mounts it -- this is only the path its own units and nixboot-verify read.";
       };
 
-      byLabel = lib.mkOption {
+      fromLayout = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
+        example = "nixnas-stick";
+        description = ''
+          Name of the `nixstorage.layout.images.<name>` describing the medium this host's
+          ESP lives on. When set, `byLabel` and `capacityMiB` default to whatever that
+          layout declares for its `esp`-role partition, instead of being restated here.
+
+          Which image describes THIS host cannot be inferred -- a host may declare several
+          (its own stick, plus another machine's rescue medium it builds images for) -- so
+          it is named rather than guessed.
+
+          Leave null on a host whose medium is carved by something other than nixstorage;
+          the two options below then behave exactly as before. nixboot never imports
+          nixstorage and reads it defensively, so this is inert if nixstorage is absent.
+        '';
+      };
+
+      byLabel = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        # Derived from the layout when esp.fromLayout names one -- see the block header.
+        default = if espSourcePart == null then null else (espSourcePart.espLabel or null);
+        defaultText = lib.literalExpression "the esp partition's espLabel from esp.fromLayout, else null";
         description = "Which FAT label must the filesystem at esp.mountPoint carry? Assert/verify only -- never used to mount anything. On a host whose ESP is not placed by disko (e.g. the appliance MAIN never runs disko), any other FAT volume labelled the same is a boot-time coin flip nixboot-verify exists to catch.";
       };
 
       capacityMiB = lib.mkOption {
         type = lib.types.nullOr lib.types.ints.positive;
-        default = null;
+        default = if espSourcePart == null then null else (espSourcePart.sizeMiB or null);
+        defaultText = lib.literalExpression "the esp partition's sizeMiB from esp.fromLayout, else null";
         description = "How big is this ESP, so nixboot can warn before it overflows? Declared, never enforced -- resizing an ESP is an image reprovision, not something a deploy can do, so nixboot only ever warns loudly and lets a human schedule the reprovision.";
       };
 
