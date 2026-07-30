@@ -468,7 +468,7 @@ in
     #
     # So byLabel and capacityMiB now DEFAULT to whatever nixstorage's layout declares for
     # this host's ESP, read DEFENSIVELY (`config.nixstorage.layout … or null`) exactly as
-    # nixstorage itself reads nixid -- so importing nixboot without nixstorage keeps
+    # nixstorage itself reads nixiam -- so importing nixboot without nixstorage keeps
     # working, and a host that carves its medium elsewhere can still state these by hand.
     # nixboot does not import nixstorage and never will; it only reads a value if one is
     # there. The direction is fixed: BOOT reads STORAGE, never the reverse.
