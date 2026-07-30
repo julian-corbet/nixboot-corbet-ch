@@ -6,9 +6,17 @@
 # against a faked efibootmgr on PATH inside the Nix build sandbox, converging to exactly one
 # NVRAM entry across a simulated ESP-path change.
 #
-# No lanzaboote input exists on this flake (see flake.nix's own note) -- every fixture below
-# deliberately stays on loader.program = "systemd-boot" or "none" so this file needs nothing
-# beyond nixpkgs itself.
+# No lanzaboote input exists on this flake (see flake.nix's own note) -- every fixture that needs
+# `boot.lanzaboote.*` to merely EXIST as an option stays on loader.program = "systemd-boot" or
+# "none" and uses `fakeLanzabooteModule` below, so this file needs nothing beyond nixpkgs itself.
+# limine fixtures need no such stand-in: `boot.loader.limine` ships INSIDE nixpkgs (see
+# modules/nixboot.nix's own "ONE EXTERNAL DEPENDENCY" header note), so those fixtures exercise
+# the real module directly.
+#
+# checks/system-manager.nix is the separate suite for modules/system-manager-limine.nix (the
+# system-manager backend) -- a different technique (a bare `lib.evalModules` stub, no
+# `nixos/lib/eval-config.nix`) because that backend has no NixOS-shaped `config` to evaluate at
+# all. See that file's own header for why.
 
 { pkgs, nixpkgs, system, nixbootModule }:
 
@@ -134,6 +142,36 @@ let
     nixboot.loader.program = "systemd-boot";
     nixboot.loader.efiVariables = "removable";
     nixboot.media.usb.enable = true;
+  };
+
+  # ── Fixture 7: limine -- the third loader.program value. No fake stand-in module needed
+  # (unlike lanzaboote): `boot.loader.limine` ships inside nixpkgs itself, so `evalFor`'s real
+  # nixpkgs already provides it. Exercises the options that DO carry over (editor,
+  # generations.keep, efiVariables) with efiVariables = "removable" -- limine's own
+  # `efiInstallAsRemovable` default reads `!canTouchEfiVariables`, so this also proves that
+  # cross-option default resolves correctly through nixboot's write.
+  cfg-limine = evalFor {
+    nixboot.loader.program = "limine";
+    nixboot.loader.editor = true;
+    nixboot.loader.efiVariables = "removable";
+    nixboot.generations.keep = 12;
+  };
+
+  # ── Fixture 8: limine with efiVariables = "write" -- canTouchEfiVariables flips, and
+  # limine's own efiInstallAsRemovable default (unwritten by nixboot) should flip with it.
+  cfg-limine-write = evalFor {
+    nixboot.loader.program = "limine";
+    nixboot.loader.efiVariables = "write";
+  };
+
+  # ── Fixture 9: proves nixboot genuinely does not write `boot.loader.systemd-boot.editor`
+  # under limine -- see the "limine/does-not-touch-systemd-boot-editor" check's own comment for
+  # why a plain value comparison can't tell this apart from NixOS' own systemd-boot default.
+  cfg-limine-editor-isolation = evalFor {
+    nixboot.loader.program = "limine";
+    nixboot.loader.editor = true;
+    nixboot.loader.efiVariables = "removable";
+    boot.loader.systemd-boot.editor = lib.mkDefault false;
   };
 
   results = [
@@ -308,6 +346,138 @@ let
     (check "media-usb/no-warning-when-loader-efiVariables-is-removable"
       (!(lib.any (w: lib.hasInfix "media.usb.enable" w) cfg-media-usb-removable.warnings))
       "warnings: ${builtins.toJSON cfg-media-usb-removable.warnings}")
+
+    # --- limine: the knobs that DO carry over render into boot.loader.limine.*, never into
+    # boot.loader.systemd-boot.* -------------------------------------------------------------
+    (check "limine/enable-and-editor-and-generations-keep-render-into-limine-namespace"
+      (cfg-limine.boot.loader.limine.enable == true
+        && cfg-limine.boot.loader.limine.enableEditor == true
+        && cfg-limine.boot.loader.limine.maxGenerations == 12)
+      "limine.enable: ${builtins.toJSON cfg-limine.boot.loader.limine.enable}, enableEditor: ${builtins.toJSON cfg-limine.boot.loader.limine.enableEditor}, maxGenerations: ${builtins.toJSON cfg-limine.boot.loader.limine.maxGenerations}")
+
+    # A plain value check here would be too weak to prove anything: NixOS' own systemd-boot
+    # module ALSO defaults `editor` to `true` (see loader.editor's own doc: "NixOS defaults this
+    # true"), so `cfg-limine`'s `loader.editor = true` reading back as `true` would pass whether
+    # or not nixboot ever wrote it. Race a `mkDefault` (priority 1000) host-level definition
+    # instead (bound in the outer `let`, `cfg-limine-editor-isolation`): if nixboot's boot.loader
+    # merge block incorrectly still wrote `systemd-boot.editor = mkOverride 500 ...` for limine
+    # (e.g. isSystemdBootFamily regressed to always-true), that `mkOverride 500` would beat this
+    # `mkDefault false` and the result would read back `true`, not `false` -- so this only stays
+    # green while the write is genuinely scoped away from limine, proving the isolation rather
+    # than assuming it.
+    (check "limine/does-not-touch-systemd-boot-editor"
+      (cfg-limine-editor-isolation.boot.loader.systemd-boot.editor == false)
+      "expected the host's own mkDefault false to stand unopposed (nixboot must not write systemd-boot.editor under limine); got: ${builtins.toJSON cfg-limine-editor-isolation.boot.loader.systemd-boot.editor}")
+
+    (check "limine/systemd-boot-enable-stays-at-its-own-default"
+      (cfg-limine.boot.loader.systemd-boot.enable == false)
+      "got: ${builtins.toJSON cfg-limine.boot.loader.systemd-boot.enable}")
+
+    (check "limine/grub-still-forced-off"
+      (cfg-limine.boot.loader.grub.enable == false)
+      "got: ${builtins.toJSON cfg-limine.boot.loader.grub.enable}")
+
+    (check "limine/efiVariables-removable-leaves-limine-efiInstallAsRemovable-default-true"
+      (cfg-limine.boot.loader.efi.canTouchEfiVariables == false
+        && cfg-limine.boot.loader.limine.efiInstallAsRemovable == true)
+      "canTouchEfiVariables: ${builtins.toJSON cfg-limine.boot.loader.efi.canTouchEfiVariables}, efiInstallAsRemovable: ${builtins.toJSON cfg-limine.boot.loader.limine.efiInstallAsRemovable}")
+
+    (check "limine/efiVariables-write-flips-canTouchEfiVariables-and-limine-follows"
+      (cfg-limine-write.boot.loader.efi.canTouchEfiVariables == true
+        && cfg-limine-write.boot.loader.limine.efiInstallAsRemovable == false)
+      "canTouchEfiVariables: ${builtins.toJSON cfg-limine-write.boot.loader.efi.canTouchEfiVariables}, efiInstallAsRemovable: ${builtins.toJSON cfg-limine-write.boot.loader.limine.efiInstallAsRemovable}")
+
+    # --- limine: verify-script gains a limine-shaped Check 1 / Check 6, never the bootctl one -
+    # "lanzastub" / "Product: *systemd-boot" are Check 1's bootctl-based detection strings,
+    # gated on isSystemdBootFamily -- their absence proves that whole block was skipped for a
+    # limine host, not merely that a limine-specific branch was ALSO added alongside it. (Check
+    # 6, tested separately below, legitimately renders `case "limine" in` for its OWN
+    # generation-count logic, so that substring is not a valid thing to assert absent here.)
+    (check "limine/verify-script-checks-limine-conf-path-not-bootctl"
+      (
+        lib.hasInfix "limine/limine.conf" cfg-limine.systemd.services.nixboot-verify.script
+        && !(lib.hasInfix "lanzastub" cfg-limine.systemd.services.nixboot-verify.script)
+        && !(lib.hasInfix "Product: *systemd-boot" cfg-limine.systemd.services.nixboot-verify.script)
+      )
+      "nixboot-verify script does not check the limine config path, or wrongly still renders the bootctl-based Check 1 branch for a limine host")
+
+    (check "limine/verify-script-check6-counts-generation-entries-in-limine-conf"
+      (lib.hasInfix ''grep -cE '^/+\+?Generation [0-9]+$' "$esp/limine/limine.conf"'' cfg-limine.systemd.services.nixboot-verify.script)
+      "nixboot-verify script is missing Check 6's limine generation-count branch")
+
+    (check "limine/verify-script-warns-on-config-shadow-trap"
+      (lib.hasInfix "ACTIVE config the moment" cfg-limine.systemd.services.nixboot-verify.script)
+      "nixboot-verify script is missing the limine config-shadow WARN")
+
+    # --- limine: the systemd-boot/lanzaboote-only knobs are refused, not silently ignored -----
+    # `efiVariables` is set in every one of these (it has NO default -- modules/nixboot.nix's
+    # own header note on why guessing it is an outage) purely so the ONLY reason
+    # `evalFailsBuild` can fail is the assertion actually under test, not an unrelated
+    # required-option error masking whether that assertion is even wired correctly.
+    (check "limine-with-consoleMode/eval-fails"
+      (evalFailsBuild {
+        nixboot.loader.program = "limine";
+        nixboot.loader.efiVariables = "removable";
+        nixboot.loader.consoleMode = "auto";
+      })
+      "expected forcing system.build.toplevel to fail (consoleMode has no limine equivalent) but it succeeded")
+
+    (check "limine-with-graceful/eval-fails"
+      (evalFailsBuild {
+        nixboot.loader.program = "limine";
+        nixboot.loader.efiVariables = "removable";
+        nixboot.loader.graceful = true;
+      })
+      "expected forcing system.build.toplevel to fail (graceful has no limine equivalent) but it succeeded")
+
+    (check "limine-with-selfHeal/eval-fails"
+      (evalFailsBuild {
+        nixboot.loader.program = "limine";
+        nixboot.loader.efiVariables = "removable";
+        nixboot.loader.selfHeal = true;
+      })
+      "expected forcing system.build.toplevel to fail (selfHeal hardcodes bootctl, which limine never uses) but it succeeded")
+
+    (check "limine-with-bootCounting/eval-fails"
+      (evalFailsBuild {
+        nixboot.loader.program = "limine";
+        nixboot.loader.efiVariables = "removable";
+        nixboot.bootCounting.tries = 3;
+      })
+      "expected forcing system.build.toplevel to fail (bootCounting.tries is lanzaboote-stub-only) but it succeeded")
+
+    (check "limine-with-secureBoot/eval-fails"
+      (evalFailsBuild {
+        nixboot.loader.program = "limine";
+        nixboot.loader.efiVariables = "removable";
+        nixboot.secureBoot.enable = true;
+        nixboot.secureBoot.pkiBundle = "/var/lib/some-pki";
+      })
+      "expected forcing system.build.toplevel to fail (secureBoot.enable requires loader.program == \"lanzaboote\") but it succeeded")
+
+    (check "systemd-boot-with-consoleMode/eval-succeeds"
+      (
+        !(evalFailsBuild {
+          nixboot.loader.program = "systemd-boot";
+          nixboot.loader.efiVariables = "removable";
+          nixboot.loader.consoleMode = "auto";
+        })
+      )
+      "expected forcing system.build.toplevel to succeed (consoleMode is valid on the systemd-boot family) but it failed")
+
+    # --- the flip side of every limine-with-X/eval-fails check above: a clean limine host with
+    # NONE of the systemd-boot/lanzaboote-only knobs touched builds fine -- proving the new
+    # combined assertion is silent when satisfied, not merely that it fires when violated ---
+    (check "limine-clean/eval-succeeds"
+      (
+        !(evalFailsBuild {
+          nixboot.loader.program = "limine";
+          nixboot.loader.efiVariables = "removable";
+          nixboot.loader.editor = true;
+          nixboot.generations.keep = 10;
+        })
+      )
+      "expected forcing system.build.toplevel to succeed (a clean limine config touches none of the refused knobs) but it failed")
   ];
 
   failed = builtins.filter (r: !r.ok) results;

@@ -6,14 +6,25 @@ not post-boot service ordering.**
 
 ## What nixboot is
 
-A single NixOS module that owns everything between firmware and
-`switch-root`: which program installs to the ESP and every knob of its menu,
-the declared shape of the ESP itself (for assertions and verification —
-nixboot never partitions, formats, or mounts anything), how many past
-generations stay in the rollback menu, whether the loader counts down failed
-boots, the Secure Boot posture and its operator-run enrollment command, and
-a `nixboot-verify` service that reads every one of those knobs back from the
-live system after boot and reports PASS/FAIL/SKIP per knob.
+A NixOS module (plus a narrower system-manager backend, for Arch/CachyOS
+hosts) that owns everything between firmware and `switch-root`: which
+program installs to the ESP — `systemd-boot`, `lanzaboote`, or `limine` —
+and every knob of its menu, the declared shape of the ESP itself (for
+assertions and verification — nixboot never partitions, formats, or mounts
+anything), how many past generations stay in the rollback menu, whether the
+loader counts down failed boots, the Secure Boot posture and its
+operator-run enrollment command, and a `nixboot-verify` service that reads
+every one of those knobs back from the live system after boot and reports
+PASS/FAIL/SKIP per knob.
+
+`limine` is the odd one out on purpose: its Secure Boot model (sign the
+loader once, enroll a hash of the *whole* config) and its fixed,
+non-configurable config search order share no mechanism with the other two
+loaders, so nixboot refuses — rather than silently ignores — the knobs that
+don't carry over (`secureBoot.*`, `bootCounting.tries`, `loader.graceful`,
+`loader.selfHeal`, `loader.consoleMode`). See
+[`modules/nixboot.nix`](modules/nixboot.nix)'s `loader.program` option doc,
+and [CONTRACT.md](CONTRACT.md)'s B18/B19, for the full reasoning.
 
 It exists because a boot setting that is requested and silently refused is
 worse than almost any other kind of misconfiguration: on real hardware the
@@ -57,18 +68,74 @@ flake's own NixOS module. nixboot never imports that module itself (kept
 self-contained on purpose); whoever composes a host's module list must
 import lanzaboote's module too, on every host nixboot is imported on, not
 just the hosts that use it — see the "ONE EXTERNAL DEPENDENCY" note in
-[`modules/nixboot.nix`](modules/nixboot.nix#L88-L101).
+[`modules/nixboot.nix`](modules/nixboot.nix#L88-L101). `loader.program =
+"limine"` needs no such composition step: `boot.loader.limine` ships inside
+nixpkgs itself.
 
 The full option-by-option contract, including every assertion and warning
 this module ships, lives in [CONTRACT.md](CONTRACT.md).
 
+## The system-manager backend
+
+`systemManagerModules.nixboot` (`modules/system-manager-limine.nix`) is a
+**separate, deliberately narrow** module for hosts with no `boot.*` option
+surface at all — a plain Arch/CachyOS install managed by
+[system-manager](https://github.com/numtide/system-manager) rather than
+NixOS. It is not a second copy of the module above: system-manager has
+nothing resembling `boot.loader.*`, `boot.initrd.*`, or
+`system.build.toplevel` to chainload, so `remoteUnlock`, `secureBoot`'s
+sbctl/pkiBundle machinery, `generations.keep`, `extraEntries`, and every
+systemd-boot/lanzaboote-specific knob above have **no counterpart here at
+all** — stated plainly as a ceiling, not silently dropped.
+
+What it *can* do soundly: render a limine.conf header
+(`timeout`/`editor_enabled`), install the limine EFI loader from
+`pkgs.limine`, optionally enroll a hash of the config
+(`nixboot.limine.enrollConfig`), and optionally register a firmware NVRAM
+boot entry via the exact same idempotent registrar the NixOS backend's
+`extraEntries.*.bootEntry` uses. The menu *entries* themselves
+(`nixboot.limine.configText`) are the operator's own hand-authored text —
+a system-manager host's installed kernels are pacman/mkinitcpio state this
+module has no visibility into, the same foreign/Nix boundary
+[nixarch](https://github.com/julian-corbet/nixarch-corbet-ch)'s own
+`modules/foreign-service.nix` draws for other pacman-owned services:
+
+```nix
+{
+  inputs.nixboot.url = "github:julian-corbet/nixboot-corbet-ch";
+
+  # a system-manager flake's own host config:
+  imports = [ inputs.nixboot.systemManagerModules.default ];
+
+  nixboot.limine = {
+    enable = true;
+    efiVariables = "removable";
+    timeout = 5;
+    configText = ''
+      /CachyOS
+          comment: current kernel
+          protocol: linux
+          kernel_path: boot():/vmlinuz-linux-cachyos
+          module_path: boot():/initramfs-linux-cachyos.img
+          cmdline: root=/dev/mapper/root rw
+    '';
+  };
+}
+```
+
+See [CONTRACT.md](CONTRACT.md)'s B20 for the full reasoning, and
+`checks/system-manager.nix` for its eval-test suite (the same
+`lib.evalModules`-stub technique
+[nixarch](https://github.com/julian-corbet/nixarch-corbet-ch)'s own checks
+use for its system-manager modules).
+
 ## Status
 
 Pre-alpha. The module is complete and was extracted verbatim from a private
-fleet's boot-stance audit (see the header of
+operator's boot-stance audit (see the header of
 [`modules/nixboot.nix`](modules/nixboot.nix) for the extraction story), but
 this standalone flake has not yet been re-verified live as its own input —
-only as an in-tree module in the fleet it came from. Two real, evidenced
+only as an in-tree module in the configuration it came from. Two real, evidenced
 pieces of the source contract are deliberately **not** implemented in this
 first cut: the `extraEntries` UKI-build mechanism for a durable rescue/BMC
 boot entry, and the initrd unlock/SSH-unlock/console-keymap surface. Both
@@ -135,10 +202,16 @@ host already uses.
 
 | Path | Purpose |
 |---|---|
-| `flake.nix` | Flake entry point: `nixosModules.nixboot` / `nixosModules.default`. |
-| `modules/nixboot.nix` | The module itself. |
+| `flake.nix` | Flake entry point: `nixosModules.nixboot` / `.default`, `systemManagerModules.nixboot` / `.default`. |
+| `modules/nixboot.nix` | The NixOS module itself. |
+| `modules/extra-entries.nix` | `nixboot.extraEntries.*` — second, non-default UKIs on the same ESP (NixOS only). |
+| `modules/system-manager-limine.nix` | The system-manager backend — `nixboot.limine.*`, a narrower, separate option tree. |
+| `lib/register-boot-entry.nix` | The idempotent/self-healing NVRAM registrar, shared by both backends. |
+| `lib/render-limine-header.nix` | Pure function rendering the limine.conf header, used by the system-manager backend. |
 | `docs/` | Reader-facing option-surface walkthrough and FAQ. |
 | `CONTRACT.md` | The option surface as a fixed behavioral contract. |
+| `checks/default.nix` | Eval-time tests for the NixOS module (+ one build-level idempotency proof). |
+| `checks/system-manager.nix` | Eval-time tests for the system-manager backend. |
 | `experiments/` | Runnable trials with recorded results — see [`experiments/README.md`](experiments/README.md). |
 | `studies/` | Written investigations that motivate design decisions — see [`studies/README.md`](studies/README.md). |
 

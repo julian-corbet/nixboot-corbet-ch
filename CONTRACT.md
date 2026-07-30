@@ -193,15 +193,72 @@ carefully neutralize one knob at a time, just to reuse this one mechanism
 (`modules/nixboot.nix`, the `media` option group + the `config = lib.mkMerge
 [...]` restructure at its top).
 
+**B18 — limine is a third `loader.program`, with its own namespace and its
+own refusals, never a silent fallthrough into systemd-boot's.**
+`loader.program = "limine"` renders into `boot.loader.limine.*` (a stock
+nixpkgs module -- unlike lanzaboote, no external flake composition is
+needed, `modules/nixboot.nix`'s own "ONE EXTERNAL DEPENDENCY" header note).
+Only the knobs that genuinely carry over do: `loader.editor` →
+`enableEditor`, `generations.keep` → `maxGenerations`, `loader.efiVariables`
+→ the shared `boot.loader.efi.canTouchEfiVariables` (limine's own
+`efiInstallAsRemovable` default already reads that). `loader.consoleMode`,
+`loader.graceful`, and `loader.selfHeal` are systemd-boot/lanzaboote-only
+(they write `boot.loader.systemd-boot.*` or hardcode `bootctl`) and are
+**asserted off** under limine, not silently ignored — the same "setting
+requested, quietly not applied" bug class B4 refuses for `bootCounting`.
+`bootCounting.tries` (B4) and `secureBoot.enable` (B5) are *also* refused
+under limine for a sharper reason than mere absence: limine's own Secure
+Boot model signs the loader binary once and enrolls a BLAKE2b hash of the
+*entire* rendered config (`limine enroll-config`), a whole-config trust
+boundary that shares no mechanism with lanzaboote's per-generation UKI
+signing — reusing either subsystem would silently promise a guarantee
+limine cannot deliver (`modules/nixboot.nix`, the `boot.loader` merge block
+and the assertions block).
+
+**B19 — limine's fixed config search order is a shadow trap `nixboot-verify`
+checks for, on both backends.**
+`<esp.mountPoint>/limine/limine.conf` beats `<esp.mountPoint>/limine.conf`
+in limine's own, non-configurable search order; the loser is ignored
+SILENTLY, not reported as a conflict. `nixboot-verify`'s Check 1 (NixOS)
+and `nixboot-limine-verify` (system-manager, below) both PASS/FAIL on the
+winning path's presence and separately WARN if the shadowed, losing path
+also exists — inert today, but it would become the ACTIVE config the
+instant the winning file ever disappears, with zero warning from limine
+itself at that moment.
+
+**B20 — The system-manager backend is a deliberately narrow slice, not a
+second copy of the NixOS module.**
+`modules/system-manager-limine.nix` exposes its own `nixboot.limine.*` tree
+— not a reuse of `nixboot.loader.*` — because system-manager has no
+`boot.*` option surface at all, and no `system.build.toplevel` to chainload
+either (a system-manager host boots its own pacman-managed kernel, not a
+Nix-built generation). What it renders: the limine.conf HEADER
+(`timeout`/`editor_enabled`, via the pure `lib/render-limine-header.nix`),
+the loader EFI binary (from `pkgs.limine`), and — if `enrollConfig` is set
+— the config-hash enrollment. What it does NOT do, stated as a ceiling
+rather than faked: generate menu ENTRIES (`configText` is the operator's
+own hand-authored text — a system-manager host's installed kernels are
+pacman/mkinitcpio state, foreign to this module, the same foreign/Nix split
+`nixarch`'s own `modules/foreign-service.nix` draws for other pacman-owned
+services), BIOS/legacy install, or sign the loader binary itself (`sbctl
+sign` — a one-time, human-run operation with no system-manager counterpart
+in this first cut). `efiVariables = "write"` reuses the exact same
+idempotent/self-healing NVRAM registrar the NixOS backend's `extraEntries`
+uses (`lib/register-boot-entry.nix`, extracted specifically so neither
+backend drifts from the other's copy of that logic).
+
 ## Which behaviors become automated tests vs. stay observed
 
 - **Automatable** (a `pkgs.testers.nixosTest` VM can assert these directly):
-  B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16, B17.
+  B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16, B17, B18, B19.
 - **Automated today, at the eval/build level, without a VM** (see
-  `checks/default.nix`): B13, B14, B17, and B15's idempotency/self-heal proof
-  (a real invocation of the registrar against a faked `efibootmgr` inside
-  the Nix build sandbox — no VM, no KVM, no real firmware, but a genuine
-  execution rather than an eval-only assertion).
+  `checks/default.nix` and `checks/system-manager.nix`): B13, B14, B17, B18,
+  B19, B20 (the option-surface and rendering half — real system-manager
+  enrollment enforcement is out of this repo's reach, see
+  `checks/system-manager.nix`'s own header), and B15's idempotency/self-heal
+  proof (a real invocation of the registrar against a faked `efibootmgr`
+  inside the Nix build sandbox — no VM, no KVM, no real firmware, but a
+  genuine execution rather than an eval-only assertion).
 - **Observed / operational** (need real firmware, a real TPM, or real NVRAM
   state that a disposable VM cannot faithfully reproduce): B6 (Setup Mode
   gating against real UEFI variables), B8 (a real ESP actually approaching

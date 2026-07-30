@@ -106,3 +106,40 @@ make a signed extra entry impossible on precisely the hosts most likely to
 want one. `sign.pkiBundle` defaults to `secureBoot.pkiBundle` (the same bare
 path fact, with no dependency on `secureBoot.enable` either) but can point
 anywhere. See `modules/extra-entries.nix`'s `sign.enable` option doc.
+
+## Why does `loader.program = "limine"` refuse `secureBoot.enable`,
+`bootCounting.tries`, `loader.graceful`, `loader.selfHeal` and
+`loader.consoleMode` instead of just doing something reasonable with them?
+
+Because none of the five have a reasonable thing to do under limine, and
+this module's whole reason for existing is refusing to pretend otherwise.
+`secureBoot`/`bootCounting` are built entirely around lanzaboote's
+per-generation UKI signing and stub-side boot counting; limine's own Secure
+Boot model signs the loader binary *once* and enrolls a hash of the
+*entire* config instead — a different trust boundary, not a smaller
+version of the same one. `graceful` and `selfHeal` both hardcode `bootctl`,
+a binary limine never touches (running `bootctl install` against a
+limine-owned ESP would actively install systemd-boot's own EFI stub over
+whatever limine placed there, not merely no-op). `consoleMode` writes
+`boot.loader.systemd-boot.consoleMode`, an option limine never reads at
+all. Every one of these is asserted rather than silently ignored — the
+exact "setting requested, quietly not applied" bug class B4 already refuses
+for `bootCounting.tries` on a non-lanzaboote host. See
+`loader.program`'s own doc in `modules/nixboot.nix` and CONTRACT.md's
+B18–B19.
+
+## What does the system-manager backend (`systemManagerModules.nixboot`) actually cover?
+
+Much less than the NixOS module, on purpose. system-manager has no
+`boot.*` option surface and no `system.build.toplevel` to chainload — a
+system-manager host boots its own pacman-managed kernel, not a Nix-built
+generation — so `remoteUnlock`, `secureBoot`, `generations.keep`,
+`extraEntries`, and every systemd-boot/lanzaboote-specific knob have no
+counterpart there at all. What *is* soundly possible: rendering a
+limine.conf header, installing the limine EFI loader, optionally enrolling
+a config hash, and optionally registering a firmware NVRAM entry (reusing
+the exact same idempotent registrar `extraEntries.*.bootEntry` uses). The
+menu entries themselves are the operator's own text — a system-manager
+host's installed kernels are pacman/mkinitcpio state this module has no
+visibility into. See `modules/system-manager-limine.nix`'s header and
+CONTRACT.md's B20.

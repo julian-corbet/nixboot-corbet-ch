@@ -15,10 +15,17 @@
 # boot, and must be treated as such.
 #
 # SCOPE -- what this module owns, so no knob has two managers:
-#   OWNED : which program installs to the ESP (loader.program) and every
-#           knob of ITS menu (timeout/editor/consoleMode/efiVariables);
-#           whether a failed bootloader install aborts the switch
-#           (loader.graceful) or self-heals every boot (loader.selfHeal);
+#   OWNED : which program installs to the ESP (loader.program: systemd-boot,
+#           lanzaboote, limine, or none) and every knob of ITS menu that
+#           actually transfers across all three (timeout/editor/efiVariables)
+#           -- consoleMode does NOT (asserted below: it is a systemd-boot-
+#           family-only concept, limine's own menu resolution is a different
+#           option with a different value shape, see loader.consoleMode's own
+#           doc); whether a failed bootloader install aborts the switch
+#           (loader.graceful) or self-heals every boot (loader.selfHeal) --
+#           BOTH also systemd-boot-family-only (asserted below): limine has
+#           no `graceful`-shaped install-failure knob, and selfHeal's unit
+#           hardcodes `bootctl`, a binary limine never uses;
 #           the DECLARED shape of the ESP (esp.*) for assertions and
 #           verify -- see below, nixboot never creates any of it; how many
 #           past generations stay in the menu (generations.keep) and
@@ -53,7 +60,7 @@
 #           `extraEntries.*`'s unconditionally-exposed build outputs
 #           already use).
 #   NOT   : the ESP is never partitioned, formatted, or mounted here --
-#           that is disko (modules/nixos/disko/*.nix on this fleet) or,
+#           that is disko (modules/nixos/disko/*.nix on these hosts) or,
 #           on a host running nixnas, its `disko.memSize` appliance layout.
 #           nixboot only DECLARES where an ESP that already exists lives
 #           (esp.mountPoint) and what must already be true about it
@@ -96,9 +103,18 @@
 # the hosts that use it -- an LXC guest (loader.program = "none") still
 # needs `boot.lanzaboote.enable` to EXIST as an option so this module can
 # set it to `false` without an eval error. This is the same shape as the
-# existing composition: the lanzaboote module is already added fleet-wide,
-# not per-host (evidence: a fleet-wide flake composes the lanzaboote module
+# existing composition: the lanzaboote module is already added once across every host,
+# not per-host (evidence: one top-level flake composes the lanzaboote module
 # once, at the top level, not per host).
+#
+# `loader.program = "limine"` needs NO SUCH COMPOSITION STEP: unlike
+# lanzaboote, `boot.loader.limine.*` ships INSIDE nixpkgs itself
+# (nixos/modules/system/boot/loader/limine/limine.nix, landed as a stock
+# module -- nothing to add to a host's module list, nothing this flake
+# could accidentally break by not tracking it). This is also why limine's
+# own eval-tests in checks/default.nix need no fake stand-in module the way
+# `fakeLanzabooteModule` does there for lanzaboote: nixpkgs already provides
+# the real thing.
 #
 # PRIORITY DISCIPLINE -- read before touching any `boot.loader.*` write in
 # this file: always `lib.mkOverride 500`, NEVER `lib.mkForce`. `mkOverride
@@ -112,14 +128,26 @@
 # same-priority definitions disagreeing -- an eval error, not a warning.
 # `mkOverride 500` is the only priority that cannot collide with a host's
 # `mkForce` no matter what either side wants.
-{
-  config,
-  lib,
-  pkgs,
-  ...
+{ config
+, lib
+, pkgs
+, ...
 }:
 let
   cfg = config.nixboot;
+
+  # Every knob this module wires straight into `boot.loader.systemd-boot.*` -- editor, graceful,
+  # consoleMode, configurationLimit -- is a systemd-boot MENU concept that lanzaboote's own stub
+  # also reads from the same namespace (it builds on the systemd-boot stub, it does not replace
+  # its options). limine has its OWN, differently-shaped option tree
+  # (`boot.loader.limine.enableEditor`/`.maxGenerations`, no `graceful` or `consoleMode`
+  # equivalent at all) and must never fall through to writing `systemd-boot.*` silently --
+  # every write and assertion below that is specific to the systemd-boot/lanzaboote pair gates on
+  # this, so adding a FOURTH loader later only ever means adding a fourth branch, never widening
+  # this one by accident.
+  isSystemdBootFamily = cfg.loader.program == "systemd-boot" || cfg.loader.program == "lanzaboote";
+  isLimine = cfg.loader.program == "limine";
+
   # ── nixstorage.layout: read defensively, see the ESP option block for why ──
   # Which layout image describes THIS host's medium cannot be guessed, so it is named by
   # esp.fromLayout. Absent that (or absent nixstorage entirely) every derived default
@@ -216,7 +244,7 @@ in
     ## ── Loader ────────────────────────────────────────────────────────────
     loader = {
       program = lib.mkOption {
-        type = lib.types.enum [ "systemd-boot" "lanzaboote" "none" ];
+        type = lib.types.enum [ "systemd-boot" "lanzaboote" "limine" "none" ];
         # NO default -- every enabled host must answer this in its own file.
         description = ''
           Which program owns this ESP? "lanzaboote" hands installation to
@@ -224,6 +252,39 @@ in
           the same ESP otherwise -- both would try to write loader.conf and
           the type-1/UKI entries). "none" is for hosts with no firmware of
           their own to hand off to, such as an LXC container.
+
+          "limine" hands installation to `boot.loader.limine` (a stock
+          nixpkgs module, unlike lanzaboote -- see this file's own "ONE
+          EXTERNAL DEPENDENCY" header note for why that composition
+          question does not even arise here). Its Secure Boot model is
+          CATEGORICALLY different from lanzaboote's: instead of signing
+          each generation's own UKI stub, limine signs the LOADER BINARY
+          once and enrolls a BLAKE2b hash of the ENTIRE rendered
+          limine.conf into it (`limine enroll-config`) -- a whole-config
+          trust boundary, not a per-generation one. Because that model
+          shares no mechanism with `secureBoot.*` (built entirely around
+          sbctl + per-UKI lanzaboote signing) or `bootCounting.tries`
+          (decremented by the lanzaboote stub specifically), both are
+          asserted to require `loader.program == "lanzaboote"` and are
+          therefore REFUSED outright on a limine host, below -- rather
+          than silently doing something that looks similar but is not the
+          same guarantee. `loader.graceful`, `loader.selfHeal` and
+          `loader.consoleMode` are asserted off here too: all three are
+          wired straight into `boot.loader.systemd-boot.*`/`bootctl`,
+          which limine never touches (see each option's own doc).
+
+          Also load-bearing: limine's own config file search order is
+          FIXED and not configurable -- of the two paths this module knows
+          about, `<esp.mountPoint>/limine/limine.conf` wins over
+          `<esp.mountPoint>/limine.conf`, and whichever loses is ignored
+          SILENTLY, not reported as a conflict. `nixboot-verify`'s Check 1
+          places nixpkgs' own installer output at the winning path (it
+          already does, unprompted) and separately WARNs if the losing,
+          shadowed path also exists -- inert today, but it would become the
+          ACTIVE config the moment the winning file ever goes missing, with
+          zero warning from limine itself. The system-manager backend
+          (modules/system-manager-limine.nix, for hosts with no `boot.*` at
+          all) hits the exact same trap and applies the same rule.
         '';
       };
 
@@ -242,7 +303,18 @@ in
       consoleMode = lib.mkOption {
         type = lib.types.nullOr (lib.types.enum [ "0" "1" "2" "auto" "max" "keep" ]);
         default = null;
-        description = "Which UEFI console resolution does the boot menu render at? null = don't manage.";
+        description = ''
+          Which UEFI console resolution does the boot menu render at? null
+          = don't manage. Writes `boot.loader.systemd-boot.consoleMode` --
+          a systemd-boot/lanzaboote-only option (asserted below to require
+          `loader.program` be one of those two). limine has its own,
+          differently-shaped menu-resolution knob
+          (`boot.loader.limine.style.interface.resolution`, a raw
+          "WIDTHxHEIGHT" string, not this enum) that this option does not
+          attempt to drive -- setting consoleMode on a limine host would
+          write into `systemd-boot.consoleMode`, which limine never reads,
+          exactly the silent no-op this module exists to refuse.
+        '';
       };
 
       efiVariables = lib.mkOption {
@@ -265,7 +337,17 @@ in
       graceful = lib.mkOption {
         type = lib.types.bool;
         default = false;
-        description = "Should a bootloader-install failure during switch-to-configuration be a warning instead of aborting the switch? Kept separate from efiVariables on purpose -- a PULL-only host with no console to fix a stuck switch needs both, but they answer different questions and a host can legitimately want only one.";
+        description = ''
+          Should a bootloader-install failure during switch-to-configuration
+          be a warning instead of aborting the switch? Kept separate from
+          efiVariables on purpose -- a PULL-only host with no console to fix
+          a stuck switch needs both, but they answer different questions
+          and a host can legitimately want only one. Writes
+          `boot.loader.systemd-boot.graceful` -- systemd-boot/lanzaboote
+          only (asserted below): limine's own installer
+          (`limine-install.py`, shipped by nixpkgs) has no equivalent
+          "warn instead of abort" flag to wire this into.
+        '';
       };
 
       selfHeal = lib.mkOption {
@@ -280,6 +362,15 @@ in
           --graceful install`, `SuccessExitStatus = "0 1"`, guarded by
           `ConditionPathIsMountPoint=<esp.mountPoint>` so it is a no-op
           before the ESP is mounted rather than a boot-blocking failure.
+
+          Hardcodes `bootctl` -- systemd-boot/lanzaboote only (asserted
+          below). Running `bootctl install` against an ESP limine owns
+          would not merely no-op: it would write systemd-boot's OWN
+          `\EFI\systemd\systemd-bootx64.efi` and `loader.conf` onto that
+          ESP, actively contending with whatever limine already placed
+          there for the removable/NVRAM boot path -- the exact
+          two-managers-one-knob failure this whole module exists to
+          prevent, not a merely inert setting.
         '';
       };
     };
@@ -706,7 +797,7 @@ in
             sealing the initrd-SSH host key? nixboot does NOT own TPM2
             configuration -- the real enable/pcrs/device policy for the
             DATA unlock is a disk-layout+crypto concern that stays with
-            whoever declares it (on the fleet this module was ported
+            whoever declares it (in the configuration this module was ported
             from, nixnas's `crypto.tpm2.enable`,
             nixnas/modules/options.nix:285). This option exists ONLY so
             `sealHostKey` has something honest to read instead of
@@ -844,850 +935,935 @@ in
     # do -- it can never collide with a host's own list, only add to it.
     {
       boot.initrd.availableKernelModules = lib.mkIf cfg.media.usb.enable [
-        "usb_storage" "uas" "xhci_pci" "ehci_pci"
+        "usb_storage"
+        "uas"
+        "xhci_pci"
+        "ehci_pci"
       ];
     }
 
     (lib.mkIf cfg.enable (lib.mkMerge [
-    {
-    assertions = [
       {
-        assertion = cfg.bootCounting.tries == null || cfg.loader.program == "lanzaboote";
-        message = "nixboot.bootCounting.tries is set but loader.program != \"lanzaboote\" -- boot counting is a lanzaboote-stub-only mechanism and would silently do nothing on any other loader. Either drop bootCounting.tries or switch loader.program.";
-      }
-      {
-        assertion = !cfg.secureBoot.enable || (cfg.loader.program == "lanzaboote" && cfg.secureBoot.pkiBundle != null);
-        message = "nixboot.secureBoot.enable = true requires loader.program = \"lanzaboote\" (the only loader that signs and verifies what it boots) and secureBoot.pkiBundle set (a signed chain with nowhere to keep its keys is not a real chain).";
-      }
-      {
-        # Mirrors nixnas/modules/boot/remote-unlock.nix:97-113's first
-        # assertion: enabling the surface with NEITHER a working seal path
-        # NOR a plaintext fallback leaves the initrd with no host key at
-        # all, not a graceful default -- sshd would come up keyless and
-        # loop-crash ("no hostkeys available").
-        assertion = !ru.enable || sealActive || ru.hostKeyPath != null;
-        message = ''
-          nixboot.remoteUnlock.enable is set but no initrd-SSH host key is configured. Either:
-            - Set remoteUnlock.tpm2.enable = true to the SAME value as this host's real TPM2-backed
-              unlock policy (keeps sealHostKey = true, the default): the key is generated + sealed on
-              first boot, and every boot after that the initrd unseals it. The very first boot still
-              serves initrd-SSH -- with a loudly-flagged EPHEMERAL, RAM-only host key (fingerprint
-              changes once the sealed identity exists) -- no monitor or IPMI needed even on boot #1.
-            - Or set remoteUnlock.sealHostKey = false and supply a plaintext key via
-              remoteUnlock.hostKeyPath (embedded in the initrd at build time, lands on the plaintext
-              ESP -- LAN/tailnet-only).
-            - Or set remoteUnlock.enable = false if this host is unlocked over IPMI-SOL / a physical
-              console instead.
-        '';
-      }
-      {
-        # Path A's delivery vehicle is the LANZABOOTE stub: it is what scans
-        # \loader\credentials\*.cred and packs the sealed key into the
-        # initrd. Plain systemd-boot boots kernel+initrd directly -- no
-        # stub, no credential, so the sealed key would never arrive and
-        # EVERY boot (not just the first) would instead serve a fresh
-        # ephemeral key with a bogus "first boot" banner. Fail the build
-        # instead of shipping a permanently-unpinnable unlock channel.
-        # (nixnas/modules/boot/remote-unlock.nix:114-129, same reasoning.)
-        assertion = !sealActive || cfg.secureBoot.enable;
-        message = ''
-          nixboot.remoteUnlock.sealHostKey = true (the default) with remoteUnlock.tpm2.enable
-          = true requires nixboot.secureBoot.enable: only the lanzaboote (UKI) stub delivers
-          the TPM2-sealed host-key credential into the initrd. Enable secureBoot, or set
-          remoteUnlock.sealHostKey = false with a plaintext hostKeyPath, or set remoteUnlock.tpm2.enable
-          = false / remoteUnlock.enable = false.
-        '';
-      }
-      {
-        # SSH is key-only in the initrd, same as the running system's own
-        # sshd -- an empty list here is a silently-inert remoteUnlock.enable,
-        # exactly the "setting requested, quietly not applied" class of bug
-        # this whole module exists to stop.
-        assertion = !ru.enable || ru.authorizedKeys != [ ];
-        message = "nixboot.remoteUnlock.enable is set but remoteUnlock.authorizedKeys is empty -- initrd sshd is key-only, so nothing could ever answer the unlock prompt over the network.";
-      }
-    ];
+        assertions = [
+          {
+            assertion = cfg.bootCounting.tries == null || cfg.loader.program == "lanzaboote";
+            message = "nixboot.bootCounting.tries is set but loader.program != \"lanzaboote\" -- boot counting is a lanzaboote-stub-only mechanism (it is the lanzaboote stub that decrements the +N suffix) and would silently do nothing on any other loader, including limine, which has no such counter at all. Either drop bootCounting.tries or switch loader.program.";
+          }
+          {
+            # limine's own Secure Boot model (sign the LOADER once, enroll a hash of the whole
+            # rendered config -- see loader.program's own doc) shares no mechanism with this
+            # subsystem, which is built entirely around per-UKI lanzaboote signing + sbctl. Reusing
+            # secureBoot.enable for limine would silently promise a guarantee (per-generation signed
+            # boot) it cannot deliver under that model -- refused outright rather than half-applied.
+            assertion = !cfg.secureBoot.enable || (cfg.loader.program == "lanzaboote" && cfg.secureBoot.pkiBundle != null);
+            message = "nixboot.secureBoot.enable = true requires loader.program = \"lanzaboote\" (the only loader that signs and verifies what it boots) and secureBoot.pkiBundle set (a signed chain with nowhere to keep its keys is not a real chain). limine's own Secure Boot model (whole-config-hash enrollment, not per-generation signing) is a different mechanism this subsystem does not cover -- see nixboot.limine.enrollConfig on the system-manager backend, or boot.loader.limine.secureBoot.* directly on a NixOS host.";
+          }
+          {
+            # See loader.consoleMode/graceful/selfHeal's own option docs for exactly what each
+            # writes and why limine has no equivalent to write it into. Grouped as one assertion
+            # (rather than three) because all three fail for the identical reason: a systemd-boot/
+            # bootctl-shaped knob has no meaning outside that family, and "requested but ignored" is
+            # precisely the bug class this module exists to refuse, not merely the lanzaboote-only
+            # mechanisms above.
+            assertion = isSystemdBootFamily || (cfg.loader.consoleMode == null && !cfg.loader.graceful && !cfg.loader.selfHeal);
+            message = "nixboot.loader.consoleMode / .graceful / .selfHeal are systemd-boot/lanzaboote-only (they write boot.loader.systemd-boot.* or hardcode bootctl) but loader.program = \"${cfg.loader.program}\". Drop whichever of consoleMode/graceful/selfHeal is set, or switch loader.program to \"systemd-boot\" or \"lanzaboote\".";
+          }
+          {
+            # Mirrors nixnas/modules/boot/remote-unlock.nix:97-113's first
+            # assertion: enabling the surface with NEITHER a working seal path
+            # NOR a plaintext fallback leaves the initrd with no host key at
+            # all, not a graceful default -- sshd would come up keyless and
+            # loop-crash ("no hostkeys available").
+            assertion = !ru.enable || sealActive || ru.hostKeyPath != null;
+            message = ''
+              nixboot.remoteUnlock.enable is set but no initrd-SSH host key is configured. Either:
+                - Set remoteUnlock.tpm2.enable = true to the SAME value as this host's real TPM2-backed
+                  unlock policy (keeps sealHostKey = true, the default): the key is generated + sealed on
+                  first boot, and every boot after that the initrd unseals it. The very first boot still
+                  serves initrd-SSH -- with a loudly-flagged EPHEMERAL, RAM-only host key (fingerprint
+                  changes once the sealed identity exists) -- no monitor or IPMI needed even on boot #1.
+                - Or set remoteUnlock.sealHostKey = false and supply a plaintext key via
+                  remoteUnlock.hostKeyPath (embedded in the initrd at build time, lands on the plaintext
+                  ESP -- LAN/tailnet-only).
+                - Or set remoteUnlock.enable = false if this host is unlocked over IPMI-SOL / a physical
+                  console instead.
+            '';
+          }
+          {
+            # Path A's delivery vehicle is the LANZABOOTE stub: it is what scans
+            # \loader\credentials\*.cred and packs the sealed key into the
+            # initrd. Plain systemd-boot boots kernel+initrd directly -- no
+            # stub, no credential, so the sealed key would never arrive and
+            # EVERY boot (not just the first) would instead serve a fresh
+            # ephemeral key with a bogus "first boot" banner. Fail the build
+            # instead of shipping a permanently-unpinnable unlock channel.
+            # (nixnas/modules/boot/remote-unlock.nix:114-129, same reasoning.)
+            assertion = !sealActive || cfg.secureBoot.enable;
+            message = ''
+              nixboot.remoteUnlock.sealHostKey = true (the default) with remoteUnlock.tpm2.enable
+              = true requires nixboot.secureBoot.enable: only the lanzaboote (UKI) stub delivers
+              the TPM2-sealed host-key credential into the initrd. Enable secureBoot, or set
+              remoteUnlock.sealHostKey = false with a plaintext hostKeyPath, or set remoteUnlock.tpm2.enable
+              = false / remoteUnlock.enable = false.
+            '';
+          }
+          {
+            # SSH is key-only in the initrd, same as the running system's own
+            # sshd -- an empty list here is a silently-inert remoteUnlock.enable,
+            # exactly the "setting requested, quietly not applied" class of bug
+            # this whole module exists to stop.
+            assertion = !ru.enable || ru.authorizedKeys != [ ];
+            message = "nixboot.remoteUnlock.enable is set but remoteUnlock.authorizedKeys is empty -- initrd sshd is key-only, so nothing could ever answer the unlock prompt over the network.";
+          }
+        ];
 
-    warnings =
-      lib.optional (cfg.esp.capacityMiB != null && espProjectedMiB * 100 > cfg.esp.capacityMiB * 75) ''
-        nixboot: projected ESP usage is ~${toString espProjectedMiB} MiB (${toString cfg.generations.keep} kept generation(s) at a rounded-up 1 MiB/stub, plus a 100 MiB floor for two in-flight kernel versions) against a declared esp.capacityMiB = ${toString cfg.esp.capacityMiB}, over the 75% line. This is only an eval-time estimate -- nixboot-verify's headroom check reads the real number after boot -- but an ESP resize is an image reprovision, not a deploy, so this is worth planning for before it becomes a live "no space left on device" failure during switch-to-configuration.
-      ''
-      ++ lib.optional (cfg.secureBoot.sbctlCompat && !cfg.tools.sbctl.enable) ''
-        nixboot: secureBoot.sbctlCompat writes /etc/sbctl/sbctl.conf, but tools.sbctl.enable is false, so the sbctl binary that file exists for is not installed on this host. Either turn tools.sbctl.enable on or drop sbctlCompat -- a config file for an absent tool is exactly the kind of setting-that-does-nothing this module exists to surface, not to ship quietly.
-      ''
-      ++ lib.optional (cfg.media.usb.enable && cfg.loader.efiVariables == "write") ''
-        nixboot: media.usb.enable is set (the initrd is wired to find a USB-attached boot device) but loader.efiVariables = "write" -- firmware then gets an NVRAM entry pointing at THIS specific device path, so a stick meant to move between boxes stops booting reliably the moment it is plugged into a different one (or even the same one after a port change that renumbers the USB topology). Set loader.efiVariables = "removable" unless this device is permanently, physically fixed to one machine.
-      '';
-
-    boot.loader = lib.mkMerge [
-      # nixboot never supports grub, on any host, regardless of loader.program
-      # -- always disable it so it cannot win by default (base.nix's
-      # `mkDefault true`) on a host that forgot to say so itself. mkOverride
-      # 500, never mkForce: see the priority-discipline note at the top of
-      # this file for exactly why.
-      { grub.enable = lib.mkOverride 500 false; }
-
-      (lib.mkIf (cfg.loader.program != "none") {
-        systemd-boot.enable = lib.mkOverride 500 (cfg.loader.program == "systemd-boot");
-        efi.canTouchEfiVariables = lib.mkOverride 500 (cfg.loader.efiVariables == "write");
-        systemd-boot.editor = lib.mkOverride 500 cfg.loader.editor;
-        systemd-boot.graceful = lib.mkOverride 500 cfg.loader.graceful;
-      })
-      (lib.mkIf (cfg.loader.program != "none" && cfg.loader.timeout != null) {
-        timeout = lib.mkOverride 500 cfg.loader.timeout;
-      })
-      (lib.mkIf (cfg.loader.program != "none" && cfg.loader.consoleMode != null) {
-        systemd-boot.consoleMode = lib.mkOverride 500 cfg.loader.consoleMode;
-      })
-      # generations.keep bounds the SAME configurationLimit for either loader
-      # -- lanzaboote's ESP garbage collection inherits systemd-boot's own
-      # option rather than defining a second one.
-      (lib.mkIf (cfg.loader.program != "none") {
-        systemd-boot.configurationLimit = lib.mkOverride 500 cfg.generations.keep;
-      })
-    ];
-
-    # boot.lanzaboote.* is defined by the external lanzaboote flake module,
-    # not by this one -- see the header note on why that module must be
-    # composed alongside nixboot on every host, including ones that leave
-    # it disabled.
-    boot.lanzaboote.enable = lib.mkOverride 500 (cfg.loader.program == "lanzaboote");
-    boot.lanzaboote.bootCounting.initialTries = lib.mkIf (cfg.bootCounting.tries != null) (
-      lib.mkOverride 500 cfg.bootCounting.tries
-    );
-
-    # boot.initrd.systemd.enable is DELIBERATELY NOT ported here, unlike the
-    # console= wiring below. nixnas's own comment for it gives TWO reasons in
-    # one line: "systemd in the initrd -- the supported path for the
-    # TPM2-LUKS unlock + lanzaboote" (nixnas/modules/boot/image.nix:22-23).
-    # The first reason -- TPM2-LUKS unlock -- is squarely the disk-layout/
-    # crypto appliance identity this module's SCOPE note at the top already
-    # excludes from this first cut ("LUKS members, ZFS pool import, the
-    # store/hot vs store/usb split ... NOT implemented in this first cut").
-    # nixboot already owns and writes the two lanzaboote options that matter
-    # to IT (enable, bootCounting.initialTries) without needing an opinion on
-    # stage-1's init system for the second reason to hold on its own -- if a
-    # host's own crypto/appliance config needs systemd in the initrd (as
-    # nixnas's does), that host sets `boot.initrd.systemd.enable` itself, the
-    # same way it will declare its own LUKS members itself. Judged appliance
-    # identity, not generic boot-chain wiring; left out.
-
-    # Console ordering: reorder, never drop. Both console= parameters are
-    # ALWAYS present when console.primary is managed -- carries nixnas's own
-    # invariant forward verbatim in spirit (nixnas/modules/boot/image.nix:
-    # 40-42: "INVARIANT: reorder, never drop. Removing console=ttyS0 would
-    # silence the serial LUKS prompt and the serial getty everywhere --
-    # headless boxes and the entire CI suite at once."). Only the LAST
-    # console= becomes /dev/console -- see console.primary's own description
-    # for the full reasoning. mkOverride 500, never mkForce: see the
-    # priority-discipline note at the top of this file.
-    boot.kernelParams = lib.mkIf (cfg.console.primary != null) (
-      lib.mkOverride 500 (
-        if cfg.console.primary == "serial" then
-          [
-            "console=tty0"
-            "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
-          ]
-        else
-          [
-            "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
-            "console=tty0"
-          ]
-      )
-    );
-
-    systemd.services.nixboot-self-heal = lib.mkIf cfg.loader.selfHeal {
-      description = "nixboot: re-assert the bootloader install on an ESP that was baked into an image and never ran `bootctl install`";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "local-fs.target" ];
-      unitConfig.ConditionPathIsMountPoint = cfg.esp.mountPoint;
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        ExecStart = "${pkgs.systemd}/bin/bootctl --esp-path=${cfg.esp.mountPoint} --no-variables --graceful install";
-        SuccessExitStatus = "0 1";
-      };
-    };
-
-    environment.etc."sbctl/sbctl.conf" = lib.mkIf cfg.secureBoot.sbctlCompat {
-      # NOTE: sbctl's config schema was not directly readable from the
-      # evidence this module was written against -- only that lanzaboote
-      # writes this file for keyless hosts and that its absence is what
-      # makes `sbctl status` report "not installed" on a keyed host. This
-      # is the minimal field nixboot-verify's sbctl check needs to be
-      # meaningful. Confirm the field name against the sbctl version
-      # actually installed before relying on this in place of the manual
-      # /var/lib/sbctl staging nixnas's enrollment script does today --
-      # if it is wrong, nixboot-verify's sbctl check will FAIL loudly
-      # rather than silently, which is the point of shipping both.
-      text = ''
-        keydir = "${cfg.secureBoot.pkiBundle}/keys"
-      '';
-    };
-
-    environment.systemPackages =
-      lib.optional cfg.tools.sbctl.enable pkgs.sbctl
-      ++ lib.optional cfg.tools.efitools.enable pkgs.efitools
-      ++ lib.optional cfg.tools.sbsigntool.enable pkgs.sbsigntool
-      ++ lib.optional (cfg.secureBoot.enrollTool.enable && cfg.secureBoot.enable) (
-        pkgs.writeShellApplication {
-          name = "nixboot-enroll-sb";
-          runtimeInputs = [
-            pkgs.sbctl
-            pkgs.util-linux
-            pkgs.coreutils
-          ];
-          text = ''
-            set -euo pipefail
-
-            if [ -z "${cfg.secureBoot.pkiBundle}" ]; then
-              echo "nixboot-enroll-sb: nixboot.secureBoot.pkiBundle is not set." >&2
-              exit 1
-            fi
-            pki="${cfg.secureBoot.pkiBundle}"
-
-            # Firmware must be in Setup Mode (PK cleared) before enrollment.
-            # SetupMode is efivarfs byte offset 4 -- bytes 0-3 are the
-            # variable's attributes flag, not part of the value.
-            setupmode_var="/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
-            if [ ! -r "$setupmode_var" ]; then
-              echo "nixboot-enroll-sb: cannot read $setupmode_var -- not a UEFI system, or efivarfs is not mounted." >&2
-              exit 1
-            fi
-            setupmode="$(od -An -tu1 -j4 -N1 "$setupmode_var" | tr -d ' ')"
-            if [ "$setupmode" != "1" ]; then
-              echo "nixboot-enroll-sb: firmware is NOT in Setup Mode (SetupMode=$setupmode). Clear the platform key (PK) from the UEFI setup menu first, then re-run this." >&2
-              exit 1
-            fi
-
-            # sbctl needs a stable owner GUID; mint one into the bundle once
-            # so re-enrollment (e.g. after a key rotation) is idempotent.
-            if [ ! -s "$pki/GUID" ]; then
-              uuidgen > "$pki/GUID"
-            fi
-
-            # Stage the bundle where sbctl looks by default, independent of
-            # sbctlCompat's /etc/sbctl/sbctl.conf redirect -- this mirrors
-            # what nixnas's original enrollment script did and is the path
-            # actually exercised at enrollment time.
-            install -d -m 0700 /var/lib/sbctl
-            cp -a "$pki/keys" /var/lib/sbctl/keys
-            cp -a "$pki/GUID" /var/lib/sbctl/GUID
-
-            oprom_flag=""
-            case "${cfg.secureBoot.opromPolicy}" in
-              tpm-eventlog) oprom_flag="--tpm-eventlog" ;;
-              microsoft)    oprom_flag="--microsoft" ;;
-              none)         oprom_flag="" ;;
-            esac
-
-            # shellcheck disable=SC2086
-            sbctl enroll-keys --disable-landlock $oprom_flag
-
-            echo "nixboot-enroll-sb: enrollment complete."
-            echo "PCR 7 changes ONCE, right now -- any TPM-sealed secret (e.g. an initrd unlock key) sealed BEFORE this enrollment will need to be re-sealed AFTER it, or it will fail to unseal on the next boot."
-            echo "Some boards latch SetupMode=1 in the efivar until the next reboot even though enrollment succeeded -- trust sbctl's exit status above, not a lingering SetupMode=1."
+        warnings =
+          lib.optional (cfg.esp.capacityMiB != null && espProjectedMiB * 100 > cfg.esp.capacityMiB * 75) ''
+            nixboot: projected ESP usage is ~${toString espProjectedMiB} MiB (${toString cfg.generations.keep} kept generation(s) at a rounded-up 1 MiB/stub, plus a 100 MiB floor for two in-flight kernel versions) against a declared esp.capacityMiB = ${toString cfg.esp.capacityMiB}, over the 75% line. This is only an eval-time estimate -- nixboot-verify's headroom check reads the real number after boot -- but an ESP resize is an image reprovision, not a deploy, so this is worth planning for before it becomes a live "no space left on device" failure during switch-to-configuration.
+          ''
+          ++ lib.optional (cfg.secureBoot.sbctlCompat && !cfg.tools.sbctl.enable) ''
+            nixboot: secureBoot.sbctlCompat writes /etc/sbctl/sbctl.conf, but tools.sbctl.enable is false, so the sbctl binary that file exists for is not installed on this host. Either turn tools.sbctl.enable on or drop sbctlCompat -- a config file for an absent tool is exactly the kind of setting-that-does-nothing this module exists to surface, not to ship quietly.
+          ''
+          ++ lib.optional (cfg.media.usb.enable && cfg.loader.efiVariables == "write") ''
+            nixboot: media.usb.enable is set (the initrd is wired to find a USB-attached boot device) but loader.efiVariables = "write" -- firmware then gets an NVRAM entry pointing at THIS specific device path, so a stick meant to move between boxes stops booting reliably the moment it is plugged into a different one (or even the same one after a port change that renumbers the USB topology). Set loader.efiVariables = "removable" unless this device is permanently, physically fixed to one machine.
           '';
-        }
-      );
 
-    systemd.services.nixboot-verify = lib.mkIf cfg.verify.enable {
-      description = "nixboot: read every managed boot knob back and report what actually took";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "multi-user.target" ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = ''
-        set -uo pipefail   # no -e: a failed readback is data, not an engine crash
-        fail=0
-        esp="${cfg.esp.mountPoint}"
+        boot.loader = lib.mkMerge [
+          # nixboot never supports grub, on any host, regardless of loader.program
+          # -- always disable it so it cannot win by default (base.nix's
+          # `mkDefault true`) on a host that forgot to say so itself. mkOverride
+          # 500, never mkForce: see the priority-discipline note at the top of
+          # this file for exactly why.
+          { grub.enable = lib.mkOverride 500 false; }
 
-        # ── Check 1: loader identity, the "masked/enabled loader state" check ──
-        # There is no systemd unit representing "which program owns the ESP"
-        # the way sleep targets represent sleep policy, so this reads the
-        # active stub identity straight off the ESP via bootctl. This is also
-        # what catches the wrong-mechanism-still-active case: if the stub
-        # bootctl reports does not match loader.program, the UNINTENDED
-        # loader silently kept (or regained) control of the ESP.
-        ${lib.optionalString (cfg.loader.program != "none") ''
-          if [ -d "$esp" ]; then
-            status="$(${pkgs.systemd}/bin/bootctl --esp-path="$esp" status 2>/dev/null || true)"
-            case "${cfg.loader.program}" in
-              lanzaboote)
-                if echo "$status" | grep -qi 'lanzastub'; then
-                  echo "PASS  loader.program = lanzaboote (lanzastub active on $esp)"
-                else
-                  echo "FAIL  loader.program = lanzaboote requested, but bootctl status on $esp shows no lanzastub entry"
-                  fail=1
-                fi
-                ;;
-              systemd-boot)
-                if echo "$status" | grep -Eq 'Product: *systemd-boot'; then
-                  echo "PASS  loader.program = systemd-boot ($esp)"
-                else
-                  echo "FAIL  loader.program = systemd-boot requested, but bootctl status on $esp shows no systemd-boot Product line"
-                  fail=1
-                fi
-                ;;
-            esac
-          else
-            echo "SKIP  loader.program: $esp does not exist yet"
-          fi
-        ''}
-        ${lib.optionalString (cfg.loader.program == "none") ''
-          echo "SKIP  loader.program = none, nothing to verify"
-        ''}
+          # `boot.loader.efi.canTouchEfiVariables` is the one write every real loader
+          # (systemd-boot, lanzaboote -- which never redefines it, and limine, which reads it
+          # directly to default its own `efiInstallAsRemovable`) shares unmodified -- see
+          # loader.efiVariables' own doc for the incident this exists to prevent.
+          (lib.mkIf (cfg.loader.program != "none") {
+            efi.canTouchEfiVariables = lib.mkOverride 500 (cfg.loader.efiVariables == "write");
+          })
+          (lib.mkIf (cfg.loader.program != "none" && cfg.loader.timeout != null) {
+            # `boot.loader.timeout` is ALSO a shared top-level option, read by systemd-boot,
+            # lanzaboote (via the same stub) and limine's own installer alike -- no per-family
+            # branch needed here, unlike every other write in this block.
+            timeout = lib.mkOverride 500 cfg.loader.timeout;
+          })
 
-        # ── Check 2: ESP mountpoint + label ──
-        if command -v findmnt >/dev/null 2>&1 && findmnt -n "$esp" >/dev/null 2>&1; then
-          echo "PASS  esp.mountPoint: $esp is mounted"
-          ${lib.optionalString (cfg.esp.byLabel != null) ''
-            label="$(findmnt -n -o LABEL "$esp" 2>/dev/null || true)"
-            if [ "$label" = "${cfg.esp.byLabel}" ]; then
-              echo "PASS  esp.byLabel = ${cfg.esp.byLabel}"
-            else
-              echo "FAIL  esp.byLabel: wanted '${cfg.esp.byLabel}', filesystem at $esp reports LABEL='$label'"
-              fail=1
-            fi
-          ''}
-        else
-          echo "FAIL  esp.mountPoint: $esp is not a mountpoint"
-          fail=1
-        fi
+          # ── systemd-boot / lanzaboote family: everything below writes into the
+          # `systemd-boot.*` namespace, which limine never reads at all (see isSystemdBootFamily's
+          # own binding comment, and loader.consoleMode/graceful/selfHeal's option docs) ──
+          (lib.mkIf isSystemdBootFamily {
+            systemd-boot.enable = lib.mkOverride 500 (cfg.loader.program == "systemd-boot");
+            systemd-boot.editor = lib.mkOverride 500 cfg.loader.editor;
+            systemd-boot.graceful = lib.mkOverride 500 cfg.loader.graceful;
+          })
+          (lib.mkIf (isSystemdBootFamily && cfg.loader.consoleMode != null) {
+            systemd-boot.consoleMode = lib.mkOverride 500 cfg.loader.consoleMode;
+          })
+          # generations.keep bounds the SAME configurationLimit for either loader
+          # -- lanzaboote's ESP garbage collection inherits systemd-boot's own
+          # option rather than defining a second one.
+          (lib.mkIf isSystemdBootFamily {
+            systemd-boot.configurationLimit = lib.mkOverride 500 cfg.generations.keep;
+          })
 
-        # ── Check 3: ESP free space vs esp.capacityMiB ──
-        ${lib.optionalString (cfg.esp.capacityMiB != null) ''
-          if [ -d "$esp" ]; then
-            pcent="$(df --output=pcent "$esp" 2>/dev/null | tail -n1 | tr -d ' %')"
-            sizeMiB="$(df --output=size -BM "$esp" 2>/dev/null | tail -n1 | tr -d ' M')"
-            if [ -n "$pcent" ]; then
-              if [ "$pcent" -ge 90 ]; then
-                echo "FAIL  esp.capacityMiB: $esp is $pcent% full (declared ${toString cfg.esp.capacityMiB} MiB)"
-                fail=1
-              elif [ "$pcent" -ge 75 ]; then
-                echo "WARN  esp.capacityMiB: $esp is $pcent% full (declared ${toString cfg.esp.capacityMiB} MiB) -- an ESP resize is an image reprovision, plan it now"
-              else
-                echo "PASS  esp.capacityMiB: $esp is $pcent% full"
-              fi
-            else
-              echo "SKIP  esp.capacityMiB: could not read df output for $esp"
-            fi
-            if [ -n "''${sizeMiB:-}" ] && [ "$sizeMiB" != "${toString cfg.esp.capacityMiB}" ]; then
-              echo "WARN  esp.capacityMiB: declared ${toString cfg.esp.capacityMiB} MiB, filesystem at $esp reports ~$sizeMiB MiB -- update the declaration or investigate the mismatch"
-            fi
-          fi
-        ''}
+          # ── limine: its OWN option tree, never systemd-boot's -- editor and generation-retention
+          # concepts exist here too, just under different names and with no graceful/consoleMode
+          # equivalent (asserted above). `efiInstallAsRemovable` needs no write of its own: its
+          # default already reads `!efi.canTouchEfiVariables`, set above, and NixOS module defaults
+          # are resolved against the FINAL merged config, not per-module snapshots, so it tracks
+          # loader.efiVariables correctly with no extra wiring. ──
+          (lib.mkIf isLimine {
+            limine.enable = lib.mkOverride 500 true;
+            limine.enableEditor = lib.mkOverride 500 cfg.loader.editor;
+            limine.maxGenerations = lib.mkOverride 500 cfg.generations.keep;
+          })
+        ];
 
-        # ── Check 4: foreign paths still present -- AND, for anything that
-        # looks like an EFI binary (a foreign fallback loader is the common
-        # case: EFI/BOOT/BOOTX64.EFI, a vendor rescue stub), actually intact,
-        # not merely present. Existence alone is a weaker claim than it
-        # looks: a `-e` check is satisfied equally by the real binary and by
-        # a zero-byte or truncated file left behind by some other write that
-        # failed partway -- present-but-corrupted is a real, closable gap an
-        # existence-only check silently misses. PE/COFF images (which every
-        # EFI binary is) start with the two bytes "MZ"; checking that plus a
-        # non-zero size catches gross corruption without needing a full
-        # parse of the executable.
-        ${lib.concatMapStringsSep "\n" (p: ''
-          if [ -e "$esp/${p}" ]; then
-            ${
-              if lib.hasSuffix ".efi" (lib.toLower p) then ''
-                sz="$(stat -c%s "$esp/${p}" 2>/dev/null || echo 0)"
-                magic="$(head -c2 "$esp/${p}" 2>/dev/null | tr -d '\0')"
-                if [ "$sz" -gt 0 ] && [ "$magic" = "MZ" ]; then
-                  echo "PASS  esp.foreignPaths: ${p} present and looks like an intact PE/EFI binary ($sz bytes)"
-                else
-                  echo "FAIL  esp.foreignPaths: ${p} exists but is not an intact EFI binary (size=$sz bytes, magic='$magic') -- present-but-corrupted is exactly what an existence-only check misses"
-                  fail=1
-                fi
-              '' else ''
-                echo "PASS  esp.foreignPaths: ${p} present"
-              ''
-            }
-          else
-            echo "FAIL  esp.foreignPaths: ${p} is MISSING -- something removed a path nixboot promised never to touch or garbage-collect"
-            fail=1
-          fi
-        '') cfg.esp.foreignPaths}
+        # boot.lanzaboote.* is defined by the external lanzaboote flake module,
+        # not by this one -- see the header note on why that module must be
+        # composed alongside nixboot on every host, including ones that leave
+        # it disabled.
+        boot.lanzaboote.enable = lib.mkOverride 500 (cfg.loader.program == "lanzaboote");
+        boot.lanzaboote.bootCounting.initialTries = lib.mkIf (cfg.bootCounting.tries != null) (
+          lib.mkOverride 500 cfg.bootCounting.tries
+        );
 
-        # ── Check 5: sbctl status, only meaningful once sbctlCompat exists ──
-        ${lib.optionalString cfg.secureBoot.sbctlCompat ''
-          if command -v sbctl >/dev/null 2>&1; then
-            sbctl_out="$(sbctl status 2>&1 || true)"
-            if echo "$sbctl_out" | grep -Eqi 'Installed:.*(true|yes|✓)'; then
-              echo "PASS  secureBoot.sbctlCompat: sbctl status reports installed"
-            else
-              echo "FAIL  secureBoot.sbctlCompat: sbctl status does not report installed -- check /etc/sbctl/sbctl.conf against secureBoot.pkiBundle"
-              echo "      sbctl status (first lines): $(echo "$sbctl_out" | head -n5 | tr '\n' ' ')"
-              fail=1
-            fi
-          else
-            echo "SKIP  secureBoot.sbctlCompat: sbctl is not on PATH (tools.sbctl.enable is off) -- nothing to check it with"
-          fi
-        ''}
+        # boot.initrd.systemd.enable is DELIBERATELY NOT ported here, unlike the
+        # console= wiring below. nixnas's own comment for it gives TWO reasons in
+        # one line: "systemd in the initrd -- the supported path for the
+        # TPM2-LUKS unlock + lanzaboote" (nixnas/modules/boot/image.nix:22-23).
+        # The first reason -- TPM2-LUKS unlock -- is squarely the disk-layout/
+        # crypto appliance identity this module's SCOPE note at the top already
+        # excludes from this first cut ("LUKS members, ZFS pool import, the
+        # store/hot vs store/usb split ... NOT implemented in this first cut").
+        # nixboot already owns and writes the two lanzaboote options that matter
+        # to IT (enable, bootCounting.initialTries) without needing an opinion on
+        # stage-1's init system for the second reason to hold on its own -- if a
+        # host's own crypto/appliance config needs systemd in the initrd (as
+        # nixnas's does), that host sets `boot.initrd.systemd.enable` itself, the
+        # same way it will declare its own LUKS members itself. Judged appliance
+        # identity, not generic boot-chain wiring; left out.
 
-        # ── Check 6: kept-generation count vs generations.keep ──
-        ${lib.optionalString (cfg.loader.program != "none") ''
-          count=0
-          case "${cfg.loader.program}" in
-            lanzaboote)
-              count="$(find "$esp/EFI/Linux" -maxdepth 1 -name 'nixos-generation-*.efi' 2>/dev/null | wc -l)"
-              ;;
-            systemd-boot)
-              count="$(find "$esp/loader/entries" -maxdepth 1 -name 'nixos-generation-*.conf' 2>/dev/null | wc -l)"
-              ;;
-          esac
-          if [ "$count" -gt 0 ]; then
-            if [ "$count" -le ${toString cfg.generations.keep} ]; then
-              echo "PASS  generations.keep: $count generation(s) on $esp, limit ${toString cfg.generations.keep}"
-            else
-              echo "FAIL  generations.keep: $count generation(s) on $esp, over the declared limit ${toString cfg.generations.keep} -- check for a plain-priority configurationLimit definition elsewhere beating nixboot's mkOverride 500"
-              fail=1
-            fi
-          else
-            echo "SKIP  generations.keep: no generation entries found under $esp yet"
-          fi
-        ''}
-
-        # ── Check 7: console ordering, i.e. what /dev/console actually IS ──
-        # A requested console.primary that silently did not take is worse
-        # here than anywhere else in this file to miss: the only OTHER way
-        # to notice is an initrd prompt (or the emergency shell) landing on
-        # the wrong physical port at the NEXT boot -- see console.primary's
-        # own description. /proc/cmdline is read back from the RUNNING
-        # kernel, not from any config file, so this catches a plain-priority
-        # boot.kernelParams definition elsewhere beating this module's own
-        # mkOverride 500 just as surely as it catches a typo. Checks the
-        # LAST console= token specifically (not literally the end of the
-        # line -- other, non-console kernel params may follow it), because
-        # it is the last console= that the kernel makes /dev/console.
-        ${lib.optionalString (cfg.console.primary != null) (
-          let
-            expectedLast =
-              if cfg.console.primary == "serial" then
+        # Console ordering: reorder, never drop. Both console= parameters are
+        # ALWAYS present when console.primary is managed -- carries nixnas's own
+        # invariant forward verbatim in spirit (nixnas/modules/boot/image.nix:
+        # 40-42: "INVARIANT: reorder, never drop. Removing console=ttyS0 would
+        # silence the serial LUKS prompt and the serial getty everywhere --
+        # headless boxes and the entire CI suite at once."). Only the LAST
+        # console= becomes /dev/console -- see console.primary's own description
+        # for the full reasoning. mkOverride 500, never mkForce: see the
+        # priority-discipline note at the top of this file.
+        boot.kernelParams = lib.mkIf (cfg.console.primary != null) (
+          lib.mkOverride 500 (
+            if cfg.console.primary == "serial" then
+              [
+                "console=tty0"
                 "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
-              else
-                "console=tty0";
-          in
-          ''
-            cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
-            actualLast="$(echo "$cmdline" | tr ' ' '\n' | grep '^console=' | tail -n1)"
-            if [ "$actualLast" = "${expectedLast}" ]; then
-              echo "PASS  console.primary = ${cfg.console.primary}: /proc/cmdline's last console= is ${expectedLast}"
+              ]
             else
-              echo "FAIL  console.primary = ${cfg.console.primary}: wanted the LAST console= on /proc/cmdline to be '${expectedLast}', got '$actualLast'"
-              fail=1
-            fi
-          ''
-        )}
-        ${lib.optionalString (cfg.console.primary == null) ''
-          echo "SKIP  console.primary: not managed by nixboot"
-        ''}
+              [
+                "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
+                "console=tty0"
+              ]
+          )
+        );
 
-        # ── Check 8: the sealed initrd-SSH host key, i.e. what the NEXT
-        # boot's initrd will actually present ── Nothing on the running
-        # system records which fingerprint THIS boot's initrd actually
-        # served (the ephemeral-vs-sealed choice is made, and the ephemeral
-        # key thrown away, in stage 1, before nixboot-verify exists) -- so
-        # this checks the only thing that honestly IS verifiable post-boot
-        # without reaching into TPM internals: does the credential
-        # nixboot-seal-hostkey left on the ESP still decrypt against the
-        # LIVE TPM/PCR state (the exact self-test that service itself runs
-        # -- reusing it here is not a new TPM operation, just reading the
-        # same answer back, ordered `after` that service so it always runs
-        # against a freshly-(re)sealed .cred), and does the decrypted key's
-        # fingerprint match the PUBLIC one published for operators to pin.
-        # A mismatch there means an operator pinning `${pubEspPath}` would
-        # trust the WRONG key on their NEXT initrd-SSH connection --
-        # exactly the class of bug this module exists to catch before the
-        # next boot, not after.
-        ${lib.optionalString (ru.enable && sealActive) ''
-          cred="${credEspPath}"
-          pub="${pubEspPath}"
-          if [ -f "$cred" ]; then
-            tmpkey="$(mktemp -t nixboot-verify-hostkey-XXXXXX)"
-            if ${pkgs.systemd}/bin/systemd-creds decrypt --tpm2-device=${ru.tpm2.device} --name=${credName} "$cred" "$tmpkey" >/dev/null 2>&1; then
-              if [ -f "$pub" ]; then
-                sealed_fp="$(${sshPackage}/bin/ssh-keygen -y -f "$tmpkey" 2>/dev/null | ${sshPackage}/bin/ssh-keygen -lf - 2>/dev/null)"
-                published_fp="$(${sshPackage}/bin/ssh-keygen -lf "$pub" 2>/dev/null)"
-                if [ -n "$sealed_fp" ] && [ "$sealed_fp" = "$published_fp" ]; then
-                  echo "PASS  remoteUnlock: sealed initrd SSH host key decrypts and matches the published fingerprint at $pub"
-                else
-                  echo "FAIL  remoteUnlock: sealed credential decrypts, but its fingerprint ('$sealed_fp') does not match the published $pub ('$published_fp') -- an operator pinning $pub would trust the WRONG key on their next initrd-SSH connect"
-                  fail=1
-                fi
-              else
-                echo "WARN  remoteUnlock: $cred decrypts fine but $pub is missing -- an operator has no fingerprint to pin for the next initrd-SSH connect"
-              fi
-            else
-              echo "WARN  remoteUnlock: $cred does not decrypt against the CURRENT TPM/PCR state -- EXPECTED exactly once, right after Secure Boot key enrollment (PCR 7 changes then); nixboot-seal-hostkey runs before this check and should already have re-sealed it THIS boot -- if this persists across a SECOND boot in a row, investigate rather than assume self-heal"
-            fi
-            shred -u "$tmpkey" 2>/dev/null || rm -f "$tmpkey"
-          else
-            echo "SKIP  remoteUnlock: $cred does not exist yet -- genuine first boot, or nixboot-seal-hostkey has not run; initrd-SSH is currently serving the EPHEMERAL fallback key instead"
-          fi
-        ''}
-        ${lib.optionalString (ru.enable && !sealActive) ''
-          echo "SKIP  remoteUnlock: sealHostKey = false (or tpm2.enable = false) -- the plaintext hostKeyPath fingerprint is fixed at build time, nothing to verify post-boot"
-        ''}
-        ${lib.optionalString (!ru.enable) ''
-          echo "SKIP  remoteUnlock: not managed by nixboot"
-        ''}
+        systemd.services.nixboot-self-heal = lib.mkIf cfg.loader.selfHeal {
+          description = "nixboot: re-assert the bootloader install on an ESP that was baked into an image and never ran `bootctl install`";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "local-fs.target" ];
+          unitConfig.ConditionPathIsMountPoint = cfg.esp.mountPoint;
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${pkgs.systemd}/bin/bootctl --esp-path=${cfg.esp.mountPoint} --no-variables --graceful install";
+            SuccessExitStatus = "0 1";
+          };
+        };
 
-        # ── Check 9: extraEntries -- the placed UKI exists under its
-        # declared name, and, if signed, verifies against the enrolled db
-        # key. This is the same "requesting a setting is not evidence it
-        # took" contract Check 1-8 already enforce, applied to
-        # nixboot.extraEntries: the maintainer unit ran on a TIMER (never a
-        # boot/switch dependency, see modules/extra-entries.nix), so nothing
-        # else in this system ever confirms it actually succeeded.
-        ${lib.concatStringsSep "\n" (lib.mapAttrsToList (extraName: entry: ''
-          ef="$esp/EFI/Linux/${entry.espFileName}"
-          if [ -f "$ef" ]; then
-            echo "PASS  extraEntries.${extraName}: $ef exists"
-            ${lib.optionalString entry.sign.enable ''
-              if command -v sbverify >/dev/null 2>&1; then
-                if sbverify --cert "${lib.escapeShellArg (if entry.sign.pkiBundle != null then "${entry.sign.pkiBundle}/keys/db/db.pem" else "/dev/null")}" "$ef" >/dev/null 2>&1; then
-                  echo "PASS  extraEntries.${extraName}: signature verifies against the enrolled db key"
-                else
-                  echo "FAIL  extraEntries.${extraName}: $ef does NOT verify against ${lib.escapeShellArg (if entry.sign.pkiBundle != null then "${entry.sign.pkiBundle}/keys/db/db.pem" else "(no pkiBundle declared)")}"
-                  fail=1
+        environment.etc."sbctl/sbctl.conf" = lib.mkIf cfg.secureBoot.sbctlCompat {
+          # NOTE: sbctl's config schema was not directly readable from the
+          # evidence this module was written against -- only that lanzaboote
+          # writes this file for keyless hosts and that its absence is what
+          # makes `sbctl status` report "not installed" on a keyed host. This
+          # is the minimal field nixboot-verify's sbctl check needs to be
+          # meaningful. Confirm the field name against the sbctl version
+          # actually installed before relying on this in place of the manual
+          # /var/lib/sbctl staging nixnas's enrollment script does today --
+          # if it is wrong, nixboot-verify's sbctl check will FAIL loudly
+          # rather than silently, which is the point of shipping both.
+          text = ''
+            keydir = "${cfg.secureBoot.pkiBundle}/keys"
+          '';
+        };
+
+        environment.systemPackages =
+          lib.optional cfg.tools.sbctl.enable pkgs.sbctl
+          ++ lib.optional cfg.tools.efitools.enable pkgs.efitools
+          ++ lib.optional cfg.tools.sbsigntool.enable pkgs.sbsigntool
+          ++ lib.optional (cfg.secureBoot.enrollTool.enable && cfg.secureBoot.enable) (
+            pkgs.writeShellApplication {
+              name = "nixboot-enroll-sb";
+              runtimeInputs = [
+                pkgs.sbctl
+                pkgs.util-linux
+                pkgs.coreutils
+              ];
+              text = ''
+                set -euo pipefail
+
+                if [ -z "${cfg.secureBoot.pkiBundle}" ]; then
+                  echo "nixboot-enroll-sb: nixboot.secureBoot.pkiBundle is not set." >&2
+                  exit 1
                 fi
+                pki="${cfg.secureBoot.pkiBundle}"
+
+                # Firmware must be in Setup Mode (PK cleared) before enrollment.
+                # SetupMode is efivarfs byte offset 4 -- bytes 0-3 are the
+                # variable's attributes flag, not part of the value.
+                setupmode_var="/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+                if [ ! -r "$setupmode_var" ]; then
+                  echo "nixboot-enroll-sb: cannot read $setupmode_var -- not a UEFI system, or efivarfs is not mounted." >&2
+                  exit 1
+                fi
+                setupmode="$(od -An -tu1 -j4 -N1 "$setupmode_var" | tr -d ' ')"
+                if [ "$setupmode" != "1" ]; then
+                  echo "nixboot-enroll-sb: firmware is NOT in Setup Mode (SetupMode=$setupmode). Clear the platform key (PK) from the UEFI setup menu first, then re-run this." >&2
+                  exit 1
+                fi
+
+                # sbctl needs a stable owner GUID; mint one into the bundle once
+                # so re-enrollment (e.g. after a key rotation) is idempotent.
+                if [ ! -s "$pki/GUID" ]; then
+                  uuidgen > "$pki/GUID"
+                fi
+
+                # Stage the bundle where sbctl looks by default, independent of
+                # sbctlCompat's /etc/sbctl/sbctl.conf redirect -- this mirrors
+                # what nixnas's original enrollment script did and is the path
+                # actually exercised at enrollment time.
+                install -d -m 0700 /var/lib/sbctl
+                cp -a "$pki/keys" /var/lib/sbctl/keys
+                cp -a "$pki/GUID" /var/lib/sbctl/GUID
+
+                oprom_flag=""
+                case "${cfg.secureBoot.opromPolicy}" in
+                  tpm-eventlog) oprom_flag="--tpm-eventlog" ;;
+                  microsoft)    oprom_flag="--microsoft" ;;
+                  none)         oprom_flag="" ;;
+                esac
+
+                # shellcheck disable=SC2086
+                sbctl enroll-keys --disable-landlock $oprom_flag
+
+                echo "nixboot-enroll-sb: enrollment complete."
+                echo "PCR 7 changes ONCE, right now -- any TPM-sealed secret (e.g. an initrd unlock key) sealed BEFORE this enrollment will need to be re-sealed AFTER it, or it will fail to unseal on the next boot."
+                echo "Some boards latch SetupMode=1 in the efivar until the next reboot even though enrollment succeeded -- trust sbctl's exit status above, not a lingering SetupMode=1."
+              '';
+            }
+          );
+
+        systemd.services.nixboot-verify = lib.mkIf cfg.verify.enable {
+          description = "nixboot: read every managed boot knob back and report what actually took";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "multi-user.target" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          script = ''
+            set -uo pipefail   # no -e: a failed readback is data, not an engine crash
+            fail=0
+            esp="${cfg.esp.mountPoint}"
+
+            # ── Check 1: loader identity, the "masked/enabled loader state" check ──
+            # There is no systemd unit representing "which program owns the ESP"
+            # the way sleep targets represent sleep policy, so this reads the
+            # active stub identity straight off the ESP via bootctl. This is also
+            # what catches the wrong-mechanism-still-active case: if the stub
+            # bootctl reports does not match loader.program, the UNINTENDED
+            # loader silently kept (or regained) control of the ESP.
+            #
+            # limine is NOT a `bootctl`-family loader at all (see isSystemdBootFamily's own
+            # comment), so it gets its own branch below instead of a third `case` arm here: `bootctl
+            # status` on a limine-owned ESP reports whatever it finds (nothing limine-related, since
+            # limine never touches bootctl's own on-disk state) and would only ever produce a
+            # confusing FAIL, not a meaningful one.
+            ${lib.optionalString isSystemdBootFamily ''
+              if [ -d "$esp" ]; then
+                status="$(${pkgs.systemd}/bin/bootctl --esp-path="$esp" status 2>/dev/null || true)"
+                case "${cfg.loader.program}" in
+                  lanzaboote)
+                    if echo "$status" | grep -qi 'lanzastub'; then
+                      echo "PASS  loader.program = lanzaboote (lanzastub active on $esp)"
+                    else
+                      echo "FAIL  loader.program = lanzaboote requested, but bootctl status on $esp shows no lanzastub entry"
+                      fail=1
+                    fi
+                    ;;
+                  systemd-boot)
+                    if echo "$status" | grep -Eq 'Product: *systemd-boot'; then
+                      echo "PASS  loader.program = systemd-boot ($esp)"
+                    else
+                      echo "FAIL  loader.program = systemd-boot requested, but bootctl status on $esp shows no systemd-boot Product line"
+                      fail=1
+                    fi
+                    ;;
+                esac
               else
-                echo "SKIP  extraEntries.${extraName}: sbverify not on PATH (tools.sbsigntool.enable is off) -- cannot check the signature"
+                echo "SKIP  loader.program: $esp does not exist yet"
               fi
             ''}
-          else
-            echo "FAIL  extraEntries.${extraName}: declared UKI $ef is MISSING"
-            fail=1
-          fi
-        '') cfg.extraEntries)}
-        ${lib.optionalString (cfg.extraEntries == { }) ''
-          echo "SKIP  extraEntries: none declared"
-        ''}
+            # limine's config search order is FIXED and not configurable: of the two paths this
+            # module knows about, "$esp/limine/limine.conf" (where nixpkgs' own installer places it)
+            # wins over "$esp/limine.conf", and the loser is ignored SILENTLY -- see loader.program's
+            # own doc for the full trap. PASS/FAIL on the winning path's presence; separately WARN
+            # (never FAIL -- it is inert today) if the shadowed loser also exists, since it would
+            # become the ACTIVE config the instant the winning file ever disappears, with zero
+            # warning from limine itself at that moment.
+            ${lib.optionalString isLimine ''
+              if [ -f "$esp/limine/limine.conf" ]; then
+                echo "PASS  loader.program = limine ($esp/limine/limine.conf exists)"
+              else
+                echo "FAIL  loader.program = limine requested, but $esp/limine/limine.conf is missing"
+                fail=1
+              fi
+              if [ -f "$esp/limine.conf" ]; then
+                echo "WARN  loader.program = limine: $esp/limine.conf ALSO exists -- limine's fixed search order means $esp/limine/limine.conf (checked above) wins today, but this shadowed file would become the ACTIVE config the moment that one disappears, with no warning from limine itself. Remove it."
+              fi
+            ''}
+            ${lib.optionalString (cfg.loader.program == "none") ''
+              echo "SKIP  loader.program = none, nothing to verify"
+            ''}
 
-        if [ "$fail" -ne 0 ]; then
-          echo "nixboot-verify: at least one boot knob did not take. The setting was requested correctly and something declined or overrode it -- see the FAIL lines above. On this fleet the next real evidence of a wrong boot setting is the NEXT boot, so treat any FAIL here as urgent, not cosmetic."
-          exit 1
-        fi
-        echo "nixboot-verify: every managed boot knob verified against the live system."
-      '';
-    };
-    }
-
-    ## ── Remote unlock: common initrd wiring (NIC up + sshd, either path) ──
-    (lib.mkIf ru.enable {
-      # Bring networking up in the initrd, then run sshd there for the
-      # unlock hand-off. Neither of these is a `boot.loader.*` write, so
-      # the priority-discipline note at the top of this file (mkOverride
-      # 500 for loader options) does not apply -- plain `=` is correct
-      # here the same way it already is for boot.kernelParams's sibling
-      # console.primary wiring above... except boot.kernelParams DOES use
-      # mkOverride 500 because a profile can set kernelParams too. Nothing
-      # else in this module or a typical base profile sets
-      # boot.initrd.network.* or boot.initrd.systemd.network.*, so plain
-      # `=` is the honest priority here -- see the Restart override further
-      # down for the one case in this whole feature where that stops being
-      # true and mkForce becomes genuinely necessary.
-      boot.initrd.network.enable = true;
-      boot.initrd.network.ssh = {
-        enable = true;
-        port = 22;
-        authorizedKeys = ru.authorizedKeys;
-      };
-      # With systemd-initrd the classic udhcpc path is off; networkd
-      # handles the link, but `network.enable` alone declares no
-      # `.network` unit, so the NIC would get no lease. DHCP every
-      # ethernet link explicitly so the box is reachable for the unlock.
-      boot.initrd.systemd.network = {
-        enable = true;
-        networks."10-uplink" = {
-          matchConfig.Name = "en* eth*";
-          networkConfig.DHCP = "yes";
-        };
-      };
-
-      # The NIC drivers the initrd must load to get on the network.
-      boot.initrd.availableKernelModules = [
-        "virtio_net"                                    # VM testing
-        "e1000e" "igb" "igc" "r8169" "tg3" "atlantic"   # common server/desktop NICs
-      ];
-
-      # ── CROSS-MODULE COUPLING nixboot cannot see, let alone fix ──
-      # Everything above only gets an operator AS FAR AS a live sshd
-      # session in the initrd. Whether that operator then has time to type
-      # the secret at all is decided by disk-layout config this module
-      # deliberately does not own (see the header SCOPE note): systemd's
-      # own DefaultDeviceTimeoutSec (90s) kills the DEVICE JOB behind a
-      # neededForBoot LUKS mount independently of the crypttab password
-      # PROMPT's own "wait forever" default -- a slow-POST server plus an
-      # unanswered prompt hits this even though initrd-SSH itself is up
-      # and reachable the whole time. nixnas's fix lives entirely in its
-      # own disk-layout module, one `x-systemd.device-timeout=0` on the
-      # crypttab entry and one on the neededForBoot mount's fileSystems
-      # options (nixnas/modules/boot/disk.nix:40-79, field-proven incident
-      # dated 2026-07-04) -- NOT ported here, because nixboot has no LUKS
-      # member list to attach it to. Whoever composes remoteUnlock.enable
-      # = true alongside their own initrd LUKS config on THIS flake must
-      # carry that same fix themselves, or remote-unlock's entire "wait
-      # forever for a human" promise is false past 90 seconds.
-    })
-
-    ## ── Path B: sealHostKey = false -- embed the plaintext key in the initrd.
-    (lib.mkIf (ru.enable && !sealActive && ru.hostKeyPath != null) {
-      # A non-store STRING destination (NixOS uses it verbatim as the
-      # in-initrd HostKey path).
-      boot.initrd.network.ssh.hostKeys = [ hostKeyDest ];
-      # Override the auto-derived secret SOURCE with the real, tracked key
-      # so it is copied into the initrd during the image build. mkForce,
-      # not mkOverride 500: `boot.initrd.secrets` is an attrsOf where THIS
-      # module's own auto-derivation (from `boot.initrd.network.ssh.hostKeys`
-      # above, via the nixpkgs initrd-ssh module) would otherwise supply a
-      # plain-priority (100) default source for the same destination path --
-      # not a `boot.loader.*` write, so the top-of-file priority-discipline
-      # note does not constrain it, and mkOverride 500 (priority 500) would
-      # simply lose to that plain-priority default silently.
-      boot.initrd.secrets.${hostKeyDest} = lib.mkForce hostKeySource;
-    })
-
-    ## ── Path A: sealHostKey = true + remoteUnlock.tpm2.enable -- TPM2-sealed
-    ## key, delivered as a systemd CREDENTIAL (no bespoke unseal service).
-    ## See the remoteUnlock.sealHostKey option doc for the bootstrap story.
-    (lib.mkIf (ru.enable && sealActive) {
-
-      # No static key in the initrd. sshd itself loads the TPM2-sealed
-      # credential the stub delivered and systemd decrypts it during
-      # activation -- the plaintext lands in the unit's
-      # $CREDENTIALS_DIRECTORY, which the first HostKey points at. The
-      # second HostKey is the first-boot EPHEMERAL fallback (generated by
-      # the preStart below); on every other boot that file simply does not
-      # exist -- sshd logs "Unable to load host key" for the absent one
-      # and carries on with whichever is present (verified against a live
-      # sshd on the source fleet). The Banner file is only written on the
-      # ephemeral path; when it is absent sshd sends no banner.
-      # ignoreEmptyHostKeys silences the NixOS empty-hostKeys assertion.
-      # No ESP mount of its own here, no vfat/codepage modules, no
-      # bespoke unseal unit -- systemd's credential machinery does it all.
-      boot.initrd.network.ssh.ignoreEmptyHostKeys = true;
-      boot.initrd.network.ssh.extraConfig = ''
-        HostKey ${hostKeyCredPath}
-        HostKey ${ephemeralKeyPath}
-        Banner ${bannerPath}
-      '';
-
-      # sshd inherits the stub-provided credential by name and TPM2-decrypts
-      # it (`--with-key=auto-initrd`, sealed below). Failure semantics
-      # (systemd's exec-credential.c) are load-bearing here:
-      #   - credential DELIVERED + decrypts        -> boot 2+ normal path,
-      #     stable identity.
-      #   - credential DELIVERED + decrypt FAILS    -> tampered chain / PCR
-      #     mismatch: the unit hard-fails during credential setup, BEFORE
-      #     any ExecStartPre -- NO ephemeral fallback, the box stays locked
-      #     (intentional: a stolen stick cannot present a plausible unlock
-      #     prompt).
-      #   - credential MISSING (genuine first boot)  -> an ID-only
-      #     LoadCredentialEncrypted= is "missing_ok": non-fatal, the unit
-      #     starts with an empty $CREDENTIALS_DIRECTORY and the preStart
-      #     below generates the ephemeral key + warning banner.
-      boot.initrd.systemd.services.sshd.serviceConfig.LoadCredentialEncrypted = [ credName ];
-
-      # ── BOUND THE FAILED-UNSEAL HAMMER (the DA-lockout defense) ──
-      # nixpkgs' initrd-ssh module (nixos/modules/system/boot/initrd-ssh.nix,
-      # its `services.sshd.serviceConfig.Restart = "on-failure";`) sets this
-      # at PLAIN priority (100), not `lib.mkDefault` -- so, unlike every
-      # `boot.loader.*` write elsewhere in this file (which only ever needs
-      # to beat a profile's `mkDefault` at 1000), `lib.mkOverride 500` here
-      # would LOSE to nixpkgs' own definition and silently do nothing: 500
-      # is a higher (weaker) priority number than 100, and NixOS keeps the
-      # LOWEST-priority-number definition. This is the one write in this
-      # whole file that genuinely needs `lib.mkForce`, verified by reading
-      # nixpkgs' own module rather than assumed -- the top-of-file priority
-      # discipline note is scoped to `boot.loader.*`, where the competing
-      # definitions really are all `mkDefault`; it was never a blanket ban
-      # on ever beating a plain-priority nixpkgs default, only on reaching
-      # for `mkForce` where `mkOverride 500` already does the job.
-      #
-      # On the ONE post-Secure-Boot-enrollment boot, the delivered .cred no
-      # longer decrypts against the new PCR 7, so credential setup
-      # hard-fails -- and with `on-failure` systemd RETRIES the whole
-      # activation, each retry firing another TPM2 unseal attempt. Those
-      # repeated failed unseals are exactly what drove an fTPM into
-      # dictionary-attack lockout (TPM_RC_LOCKOUT) in the field on the
-      # source fleet, which then defeats the stage-2 self-heal too (its own
-      # `systemd-creds encrypt` also needs the TPM). Force NO restart
-      # instead: a stale cred costs exactly ONE failed unseal, sshd stays
-      # down for that single boot (the console prompt, if this host has
-      # one, is still there -- Secure Boot enrollment is a
-      # physically-present step anyway), and `nixboot-seal-hostkey`
-      # RE-SEALS in stage 2 so the NEXT boot's initrd-SSH comes up clean.
-      # The intentional anti-downgrade semantics stay UNCHANGED: still no
-      # ephemeral fallback for a credential that WAS delivered.
-      # (nixnas/modules/boot/remote-unlock.nix:199-210, same incident.)
-      boot.initrd.systemd.services.sshd.serviceConfig.Restart = lib.mkForce "no";
-
-      # make-initrd-ng copies listed objects + ELF library deps only -- it
-      # does NOT chase store references inside script text, so the
-      # ssh-keygen the preStart calls must be listed explicitly (same
-      # pattern the nixpkgs module itself uses for the sshd binaries).
-      boot.initrd.systemd.storePaths = [ "${sshPackage}/bin/ssh-keygen" ];
-
-      # ── First-boot fallback: serve an EPHEMERAL host key rather than not
-      # serving at all. A host with `remoteUnlock.enable = true` must be
-      # unlockable without IPMI and without a monitor even on the very
-      # first boot, before any credential has ever been sealed. The key
-      # lives on the initrd's RAM rootfs; nothing survives switch-root.
-      # Loud, honest UX: the SSH banner (shown before authentication) says
-      # the fingerprint is a throwaway and where to verify the real one
-      # from boot #2 on.
-      boot.initrd.systemd.services.sshd.preStart = ''
-        # Boot 2+: systemd decrypted the sealed credential -- stable
-        # identity, nothing to do.
-        if [ -s "''${CREDENTIALS_DIRECTORY:-/run/credentials/sshd.service}/${credName}" ]; then
-          exit 0
-        fi
-        # GENUINE first boot: no credential was delivered by the stub. (A
-        # delivered-but-undecryptable credential never reaches this script
-        # -- see the Restart comment above: that case hard-fails earlier.)
-        if [ ! -s ${ephemeralKeyPath} ] || [ ! -s ${ephemeralKeyPath}.pub ]; then
-          rm -f ${ephemeralKeyPath} ${ephemeralKeyPath}.pub
-          ${sshPackage}/bin/ssh-keygen -t ed25519 -N "" -C "nixboot-ephemeral-first-boot" \
-            -f ${ephemeralKeyPath} -q
-        fi
-        fp="$(${sshPackage}/bin/ssh-keygen -lf ${ephemeralKeyPath}.pub)"
-        {
-          echo "=================================================================="
-          echo " nixboot FIRST BOOT: initrd SSH is using an EPHEMERAL host key"
-          echo "   $fp"
-          echo " RAM-only, thrown away at switch-root. The fingerprint WILL"
-          echo " CHANGE once the TPM-sealed identity is created later this boot"
-          echo " (nixboot-seal-hostkey, right after you unlock). From the NEXT"
-          echo " boot on, verify the new fingerprint against"
-          echo "   ${pubEspPath}"
-          echo " (also printed on console+journal by the seal service) and expect"
-          echo " a one-time ssh known-hosts change warning -- that one is expected."
-          echo "=================================================================="
-        } > ${bannerPath}
-        echo "nixboot: FIRST BOOT - initrd sshd is serving an EPHEMERAL host key: $fp"
-      '';
-
-      # ── Stage-2 seal service (SELF-HEALING) ──────────────────────────────
-      # Generates the ed25519 key and TPM2-seals it into the ESP's
-      # loader/credentials/ dir with `--with-key=auto-initrd` (TPM2-only key
-      # derivation -- the /var credential secret is not available in the
-      # initrd) bound to `remoteUnlock.tpm2.pcrs`. `esp.mountPoint` is
-      # already mounted in stage 2 (nixboot never mounts it itself, but a
-      # host with remoteUnlock.enable = true necessarily has it up by
-      # multi-user.target), so this is a plain file write. From here on the
-      # lanzaboote stub auto-delivers it to every initrd.
-      #
-      # Runs on EVERY boot (`wantedBy = multi-user.target`, no
-      # ConditionPathExists gate) and decides idempotency IN THE SCRIPT with
-      # a real DECRYPT self-test: if the .cred exists AND still decrypts
-      # against the LIVE TPM/PCR state, it does nothing (fingerprint
-      # unchanged); if the .cred is MISSING or FAILS to decrypt, it
-      # (re)generates + (re)seals. This is what makes the one-time PCR 7
-      # change from Secure Boot key enrollment SELF-HEAL on the next boot
-      # instead of leaving a permanently-undecryptable .cred -- the field
-      # incident this exists to prevent: a pre-enrollment seal plus an
-      # existence-only gate left the initrd-SSH host key NEVER re-sealed,
-      # bricking remote unlock, while the repeated failed-unseal retries
-      # (see the Restart comment above) drove the fTPM into DA lockout on
-      # top of it. Correctness: firmware extends PCR 7 before the
-      # bootloader and does NOT re-extend it between stage 1 and stage 2, so
-      # a stage-2 decrypt success here GUARANTEES the stage-1 initrd-sshd
-      # unseal succeeds next boot.
-      # (nixnas/modules/boot/remote-unlock.nix:251-340, same design and the
-      # same incident; PCR-extension-timing correctness claim unchanged.)
-      systemd.services.nixboot-seal-hostkey = {
-        description = "nixboot: generate + TPM2-seal the initrd SSH host key credential (self-healing across PCR changes)";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "local-fs.target" "sysinit.target" ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          StandardOutput = "journal+console";
-          StandardError = "journal+console";
-        };
-        path = [ pkgs.systemd sshPackage pkgs.coreutils ];
-        script = ''
-          echo "=== NIXBOOT-SEAL-START ==="
-
-          # ── Self-healing idempotency: gate the reseal on a REAL decrypt
-          # self-test against the live TPM/PCR state -- NOT on the .cred
-          # merely existing (the exact gate that bricked the source
-          # fleet's first implementation). `-` writes the decrypted
-          # plaintext to stdout, discarded to /dev/null so the key never
-          # hits the journal. A successful unseal does NOT touch the TPM
-          # dictionary-attack counter, so this per-boot self-test is free;
-          # a STALE cred costs exactly one failed unseal (one DA
-          # increment) and then heals below -- never a retry loop.
-          if [ -f "${credEspPath}" ]; then
-            if systemd-creds decrypt --tpm2-device=${ru.tpm2.device} --name=${credName} "${credEspPath}" - >/dev/null 2>&1; then
-              echo "nixboot: sealed initrd SSH host key still decrypts against the current TPM/PCR state -- no reseal."
-              ssh-keygen -lf "${pubEspPath}" 2>/dev/null || true
-              echo "=== NIXBOOT-SEAL-END ==="
-              exit 0
+            # ── Check 2: ESP mountpoint + label ──
+            if command -v findmnt >/dev/null 2>&1 && findmnt -n "$esp" >/dev/null 2>&1; then
+              echo "PASS  esp.mountPoint: $esp is mounted"
+              ${lib.optionalString (cfg.esp.byLabel != null) ''
+                label="$(findmnt -n -o LABEL "$esp" 2>/dev/null || true)"
+                if [ "$label" = "${cfg.esp.byLabel}" ]; then
+                  echo "PASS  esp.byLabel = ${cfg.esp.byLabel}"
+                else
+                  echo "FAIL  esp.byLabel: wanted '${cfg.esp.byLabel}', filesystem at $esp reports LABEL='$label'"
+                  fail=1
+                fi
+              ''}
+            else
+              echo "FAIL  esp.mountPoint: $esp is not a mountpoint"
+              fail=1
             fi
-            echo "!! nixboot: the sealed initrd SSH host key credential no longer decrypts against the"
-            echo "!! current TPM / PCR state. EXPECTED exactly once -- right after Secure Boot key"
-            echo "!! enrollment (nixboot-enroll-sb) changed PCR 7. RE-SEALING now; the initrd host-key"
-            echo "!! FINGERPRINT WILL CHANGE this once -- re-pin it on your next initrd-SSH connect."
-          fi
 
-          # (Re)generate + (re)seal. Temp DIRECTORY so the key file does not
-          # pre-exist (ssh-keygen -f would prompt). A stale .cred/.pub from
-          # a pre-enrollment seal is OVERWRITTEN below.
-          tmpdir="$(mktemp -d -t nixboot-initrd-hostkey-XXXXXX)"
-          tmpkey="$tmpdir/key"
-          cleanup() { find "$tmpdir" -type f -exec shred -u {} \; 2>/dev/null || true; rm -rf "$tmpdir"; }
-          trap cleanup EXIT
-          ssh-keygen -t ed25519 -N "" -C "${credName}" -f "$tmpkey" -q
-          mkdir -p "$(dirname "${credEspPath}")"
-          # --with-key=auto-initrd: seal to the TPM2 only (no /var secret),
-          # so the initrd can decrypt it; --name must match sshd's
-          # LoadCredentialEncrypted= name; --tpm2-pcrs anchors it.
-          # Remove any stale blob first -- systemd-creds encrypt refuses to
-          # clobber an existing output file, and on the self-heal path the
-          # old .cred is still present.
-          rm -f "${credEspPath}"
-          if ! systemd-creds encrypt \
-              --with-key=auto-initrd \
-              --tpm2-device=${ru.tpm2.device} \
-              --tpm2-pcrs=${tpm2PcrsArg} \
-              --name=${credName} \
-              "$tmpkey" \
-              "${credEspPath}"; then
-            echo "!! nixboot: FAILED to TPM2-seal the initrd SSH host key. If the TPM is in"
-            echo "!! dictionary-attack lockout (TPM_RC_LOCKOUT), clear it and re-run this service:"
-            echo "!!   tpm2_dictionarylockout --clear-lockout && systemctl start nixboot-seal-hostkey"
-            echo "=== NIXBOOT-SEAL-END ==="
-            exit 1
-          fi
-          chmod 600 "${credEspPath}"
-          # Surface the PUBLIC half (it is public -- plaintext ESP is fine)
-          # so the operator can VERIFY the initrd-SSH connection instead of
-          # TOFU-accepting it, and so nixboot-verify's Check 8 (below) has
-          # something to compare the sealed credential against. Overwrites
-          # any stale .pub. Without this the fingerprint would be destroyed
-          # with the tmpdir and the channel unverifiable.
-          install -m 0644 "$tmpkey.pub" "${pubEspPath}"
-          echo "nixboot: initrd SSH host key fingerprint (verify this on your next initrd-SSH connect):"
-          ssh-keygen -lf "$tmpkey.pub"
-          echo "nixboot: initrd SSH host key sealed to ${credEspPath} (public key beside it)"
-          echo "=== NIXBOOT-SEAL-END ==="
+            # ── Check 3: ESP free space vs esp.capacityMiB ──
+            ${lib.optionalString (cfg.esp.capacityMiB != null) ''
+              if [ -d "$esp" ]; then
+                pcent="$(df --output=pcent "$esp" 2>/dev/null | tail -n1 | tr -d ' %')"
+                sizeMiB="$(df --output=size -BM "$esp" 2>/dev/null | tail -n1 | tr -d ' M')"
+                if [ -n "$pcent" ]; then
+                  if [ "$pcent" -ge 90 ]; then
+                    echo "FAIL  esp.capacityMiB: $esp is $pcent% full (declared ${toString cfg.esp.capacityMiB} MiB)"
+                    fail=1
+                  elif [ "$pcent" -ge 75 ]; then
+                    echo "WARN  esp.capacityMiB: $esp is $pcent% full (declared ${toString cfg.esp.capacityMiB} MiB) -- an ESP resize is an image reprovision, plan it now"
+                  else
+                    echo "PASS  esp.capacityMiB: $esp is $pcent% full"
+                  fi
+                else
+                  echo "SKIP  esp.capacityMiB: could not read df output for $esp"
+                fi
+                if [ -n "''${sizeMiB:-}" ] && [ "$sizeMiB" != "${toString cfg.esp.capacityMiB}" ]; then
+                  echo "WARN  esp.capacityMiB: declared ${toString cfg.esp.capacityMiB} MiB, filesystem at $esp reports ~$sizeMiB MiB -- update the declaration or investigate the mismatch"
+                fi
+              fi
+            ''}
+
+            # ── Check 4: foreign paths still present -- AND, for anything that
+            # looks like an EFI binary (a foreign fallback loader is the common
+            # case: EFI/BOOT/BOOTX64.EFI, a vendor rescue stub), actually intact,
+            # not merely present. Existence alone is a weaker claim than it
+            # looks: a `-e` check is satisfied equally by the real binary and by
+            # a zero-byte or truncated file left behind by some other write that
+            # failed partway -- present-but-corrupted is a real, closable gap an
+            # existence-only check silently misses. PE/COFF images (which every
+            # EFI binary is) start with the two bytes "MZ"; checking that plus a
+            # non-zero size catches gross corruption without needing a full
+            # parse of the executable.
+            ${lib.concatMapStringsSep "\n" (p: ''
+              if [ -e "$esp/${p}" ]; then
+                ${
+                  if lib.hasSuffix ".efi" (lib.toLower p) then ''
+                    sz="$(stat -c%s "$esp/${p}" 2>/dev/null || echo 0)"
+                    magic="$(head -c2 "$esp/${p}" 2>/dev/null | tr -d '\0')"
+                    if [ "$sz" -gt 0 ] && [ "$magic" = "MZ" ]; then
+                      echo "PASS  esp.foreignPaths: ${p} present and looks like an intact PE/EFI binary ($sz bytes)"
+                    else
+                      echo "FAIL  esp.foreignPaths: ${p} exists but is not an intact EFI binary (size=$sz bytes, magic='$magic') -- present-but-corrupted is exactly what an existence-only check misses"
+                      fail=1
+                    fi
+                  '' else ''
+                    echo "PASS  esp.foreignPaths: ${p} present"
+                  ''
+                }
+              else
+                echo "FAIL  esp.foreignPaths: ${p} is MISSING -- something removed a path nixboot promised never to touch or garbage-collect"
+                fail=1
+              fi
+            '') cfg.esp.foreignPaths}
+
+            # ── Check 5: sbctl status, only meaningful once sbctlCompat exists ──
+            ${lib.optionalString cfg.secureBoot.sbctlCompat ''
+              if command -v sbctl >/dev/null 2>&1; then
+                sbctl_out="$(sbctl status 2>&1 || true)"
+                if echo "$sbctl_out" | grep -Eqi 'Installed:.*(true|yes|✓)'; then
+                  echo "PASS  secureBoot.sbctlCompat: sbctl status reports installed"
+                else
+                  echo "FAIL  secureBoot.sbctlCompat: sbctl status does not report installed -- check /etc/sbctl/sbctl.conf against secureBoot.pkiBundle"
+                  echo "      sbctl status (first lines): $(echo "$sbctl_out" | head -n5 | tr '\n' ' ')"
+                  fail=1
+                fi
+              else
+                echo "SKIP  secureBoot.sbctlCompat: sbctl is not on PATH (tools.sbctl.enable is off) -- nothing to check it with"
+              fi
+            ''}
+
+            # ── Check 6: kept-generation count vs generations.keep ──
+            ${lib.optionalString (cfg.loader.program != "none") ''
+              count=0
+              case "${cfg.loader.program}" in
+                lanzaboote)
+                  count="$(find "$esp/EFI/Linux" -maxdepth 1 -name 'nixos-generation-*.efi' 2>/dev/null | wc -l)"
+                  ;;
+                systemd-boot)
+                  count="$(find "$esp/loader/entries" -maxdepth 1 -name 'nixos-generation-*.conf' 2>/dev/null | wc -l)"
+                  ;;
+                limine)
+                  # limine has no per-generation FILE to `find` at all -- systemd-boot and
+                  # lanzaboote each write one file per kept generation, limine writes ONE
+                  # limine.conf containing every generation as a menu entry instead (see
+                  # nixpkgs' own limine-install.py, `generate_config_entry`). Count menu-entry
+                  # title lines instead: each generation renders as "/+...Generation <N>" at
+                  # whatever menu depth that generation's own specialisation count puts it at
+                  # (1-3 leading slashes, an optional "+" marking the default), always ending
+                  # the line in "Generation <N>" with nothing after it -- a specialisation's own
+                  # "Default"/"+Default" sub-entries never match this pattern, so this counts
+                  # generations, not every menu line.
+                  count="$(grep -cE '^/+\+?Generation [0-9]+$' "$esp/limine/limine.conf" 2>/dev/null || true)"
+                  ;;
+              esac
+              if [ "$count" -gt 0 ]; then
+                if [ "$count" -le ${toString cfg.generations.keep} ]; then
+                  echo "PASS  generations.keep: $count generation(s) on $esp, limit ${toString cfg.generations.keep}"
+                else
+                  echo "FAIL  generations.keep: $count generation(s) on $esp, over the declared limit ${toString cfg.generations.keep} -- check for a plain-priority configurationLimit definition elsewhere beating nixboot's mkOverride 500"
+                  fail=1
+                fi
+              else
+                echo "SKIP  generations.keep: no generation entries found under $esp yet"
+              fi
+            ''}
+
+            # ── Check 7: console ordering, i.e. what /dev/console actually IS ──
+            # A requested console.primary that silently did not take is worse
+            # here than anywhere else in this file to miss: the only OTHER way
+            # to notice is an initrd prompt (or the emergency shell) landing on
+            # the wrong physical port at the NEXT boot -- see console.primary's
+            # own description. /proc/cmdline is read back from the RUNNING
+            # kernel, not from any config file, so this catches a plain-priority
+            # boot.kernelParams definition elsewhere beating this module's own
+            # mkOverride 500 just as surely as it catches a typo. Checks the
+            # LAST console= token specifically (not literally the end of the
+            # line -- other, non-console kernel params may follow it), because
+            # it is the last console= that the kernel makes /dev/console.
+            ${lib.optionalString (cfg.console.primary != null) (
+              let
+                expectedLast =
+                  if cfg.console.primary == "serial" then
+                    "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
+                  else
+                    "console=tty0";
+              in
+              ''
+                cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+                actualLast="$(echo "$cmdline" | tr ' ' '\n' | grep '^console=' | tail -n1)"
+                if [ "$actualLast" = "${expectedLast}" ]; then
+                  echo "PASS  console.primary = ${cfg.console.primary}: /proc/cmdline's last console= is ${expectedLast}"
+                else
+                  echo "FAIL  console.primary = ${cfg.console.primary}: wanted the LAST console= on /proc/cmdline to be '${expectedLast}', got '$actualLast'"
+                  fail=1
+                fi
+              ''
+            )}
+            ${lib.optionalString (cfg.console.primary == null) ''
+              echo "SKIP  console.primary: not managed by nixboot"
+            ''}
+
+            # ── Check 8: the sealed initrd-SSH host key, i.e. what the NEXT
+            # boot's initrd will actually present ── Nothing on the running
+            # system records which fingerprint THIS boot's initrd actually
+            # served (the ephemeral-vs-sealed choice is made, and the ephemeral
+            # key thrown away, in stage 1, before nixboot-verify exists) -- so
+            # this checks the only thing that honestly IS verifiable post-boot
+            # without reaching into TPM internals: does the credential
+            # nixboot-seal-hostkey left on the ESP still decrypt against the
+            # LIVE TPM/PCR state (the exact self-test that service itself runs
+            # -- reusing it here is not a new TPM operation, just reading the
+            # same answer back, ordered `after` that service so it always runs
+            # against a freshly-(re)sealed .cred), and does the decrypted key's
+            # fingerprint match the PUBLIC one published for operators to pin.
+            # A mismatch there means an operator pinning `${pubEspPath}` would
+            # trust the WRONG key on their NEXT initrd-SSH connection --
+            # exactly the class of bug this module exists to catch before the
+            # next boot, not after.
+            ${lib.optionalString (ru.enable && sealActive) ''
+              cred="${credEspPath}"
+              pub="${pubEspPath}"
+              if [ -f "$cred" ]; then
+                tmpkey="$(mktemp -t nixboot-verify-hostkey-XXXXXX)"
+                if ${pkgs.systemd}/bin/systemd-creds decrypt --tpm2-device=${ru.tpm2.device} --name=${credName} "$cred" "$tmpkey" >/dev/null 2>&1; then
+                  if [ -f "$pub" ]; then
+                    sealed_fp="$(${sshPackage}/bin/ssh-keygen -y -f "$tmpkey" 2>/dev/null | ${sshPackage}/bin/ssh-keygen -lf - 2>/dev/null)"
+                    published_fp="$(${sshPackage}/bin/ssh-keygen -lf "$pub" 2>/dev/null)"
+                    if [ -n "$sealed_fp" ] && [ "$sealed_fp" = "$published_fp" ]; then
+                      echo "PASS  remoteUnlock: sealed initrd SSH host key decrypts and matches the published fingerprint at $pub"
+                    else
+                      echo "FAIL  remoteUnlock: sealed credential decrypts, but its fingerprint ('$sealed_fp') does not match the published $pub ('$published_fp') -- an operator pinning $pub would trust the WRONG key on their next initrd-SSH connect"
+                      fail=1
+                    fi
+                  else
+                    echo "WARN  remoteUnlock: $cred decrypts fine but $pub is missing -- an operator has no fingerprint to pin for the next initrd-SSH connect"
+                  fi
+                else
+                  echo "WARN  remoteUnlock: $cred does not decrypt against the CURRENT TPM/PCR state -- EXPECTED exactly once, right after Secure Boot key enrollment (PCR 7 changes then); nixboot-seal-hostkey runs before this check and should already have re-sealed it THIS boot -- if this persists across a SECOND boot in a row, investigate rather than assume self-heal"
+                fi
+                shred -u "$tmpkey" 2>/dev/null || rm -f "$tmpkey"
+              else
+                echo "SKIP  remoteUnlock: $cred does not exist yet -- genuine first boot, or nixboot-seal-hostkey has not run; initrd-SSH is currently serving the EPHEMERAL fallback key instead"
+              fi
+            ''}
+            ${lib.optionalString (ru.enable && !sealActive) ''
+              echo "SKIP  remoteUnlock: sealHostKey = false (or tpm2.enable = false) -- the plaintext hostKeyPath fingerprint is fixed at build time, nothing to verify post-boot"
+            ''}
+            ${lib.optionalString (!ru.enable) ''
+              echo "SKIP  remoteUnlock: not managed by nixboot"
+            ''}
+
+            # ── Check 9: extraEntries -- the placed UKI exists under its
+            # declared name, and, if signed, verifies against the enrolled db
+            # key. This is the same "requesting a setting is not evidence it
+            # took" contract Check 1-8 already enforce, applied to
+            # nixboot.extraEntries: the maintainer unit ran on a TIMER (never a
+            # boot/switch dependency, see modules/extra-entries.nix), so nothing
+            # else in this system ever confirms it actually succeeded.
+            ${lib.concatStringsSep "\n" (lib.mapAttrsToList (extraName: entry: ''
+              ef="$esp/EFI/Linux/${entry.espFileName}"
+              if [ -f "$ef" ]; then
+                echo "PASS  extraEntries.${extraName}: $ef exists"
+                ${lib.optionalString entry.sign.enable ''
+                  if command -v sbverify >/dev/null 2>&1; then
+                    if sbverify --cert "${lib.escapeShellArg (if entry.sign.pkiBundle != null then "${entry.sign.pkiBundle}/keys/db/db.pem" else "/dev/null")}" "$ef" >/dev/null 2>&1; then
+                      echo "PASS  extraEntries.${extraName}: signature verifies against the enrolled db key"
+                    else
+                      echo "FAIL  extraEntries.${extraName}: $ef does NOT verify against ${lib.escapeShellArg (if entry.sign.pkiBundle != null then "${entry.sign.pkiBundle}/keys/db/db.pem" else "(no pkiBundle declared)")}"
+                      fail=1
+                    fi
+                  else
+                    echo "SKIP  extraEntries.${extraName}: sbverify not on PATH (tools.sbsigntool.enable is off) -- cannot check the signature"
+                  fi
+                ''}
+              else
+                echo "FAIL  extraEntries.${extraName}: declared UKI $ef is MISSING"
+                fail=1
+              fi
+            '') cfg.extraEntries)}
+            ${lib.optionalString (cfg.extraEntries == { }) ''
+              echo "SKIP  extraEntries: none declared"
+            ''}
+
+            if [ "$fail" -ne 0 ]; then
+              echo "nixboot-verify: at least one boot knob did not take. The setting was requested correctly and something declined or overrode it -- see the FAIL lines above. On this host the next real evidence of a wrong boot setting is the NEXT boot, so treat any FAIL here as urgent, not cosmetic."
+              exit 1
+            fi
+            echo "nixboot-verify: every managed boot knob verified against the live system."
+          '';
+        };
+      }
+
+      ## ── Remote unlock: common initrd wiring (NIC up + sshd, either path) ──
+      (lib.mkIf ru.enable {
+        # Bring networking up in the initrd, then run sshd there for the
+        # unlock hand-off. Neither of these is a `boot.loader.*` write, so
+        # the priority-discipline note at the top of this file (mkOverride
+        # 500 for loader options) does not apply -- plain `=` is correct
+        # here the same way it already is for boot.kernelParams's sibling
+        # console.primary wiring above... except boot.kernelParams DOES use
+        # mkOverride 500 because a profile can set kernelParams too. Nothing
+        # else in this module or a typical base profile sets
+        # boot.initrd.network.* or boot.initrd.systemd.network.*, so plain
+        # `=` is the honest priority here -- see the Restart override further
+        # down for the one case in this whole feature where that stops being
+        # true and mkForce becomes genuinely necessary.
+        boot.initrd.network.enable = true;
+        boot.initrd.network.ssh = {
+          enable = true;
+          port = 22;
+          authorizedKeys = ru.authorizedKeys;
+        };
+        # With systemd-initrd the classic udhcpc path is off; networkd
+        # handles the link, but `network.enable` alone declares no
+        # `.network` unit, so the NIC would get no lease. DHCP every
+        # ethernet link explicitly so the box is reachable for the unlock.
+        boot.initrd.systemd.network = {
+          enable = true;
+          networks."10-uplink" = {
+            matchConfig.Name = "en* eth*";
+            networkConfig.DHCP = "yes";
+          };
+        };
+
+        # The NIC drivers the initrd must load to get on the network.
+        boot.initrd.availableKernelModules = [
+          "virtio_net" # VM testing
+          "e1000e"
+          "igb"
+          "igc"
+          "r8169"
+          "tg3"
+          "atlantic" # common server/desktop NICs
+        ];
+
+        # ── CROSS-MODULE COUPLING nixboot cannot see, let alone fix ──
+        # Everything above only gets an operator AS FAR AS a live sshd
+        # session in the initrd. Whether that operator then has time to type
+        # the secret at all is decided by disk-layout config this module
+        # deliberately does not own (see the header SCOPE note): systemd's
+        # own DefaultDeviceTimeoutSec (90s) kills the DEVICE JOB behind a
+        # neededForBoot LUKS mount independently of the crypttab password
+        # PROMPT's own "wait forever" default -- a slow-POST server plus an
+        # unanswered prompt hits this even though initrd-SSH itself is up
+        # and reachable the whole time. nixnas's fix lives entirely in its
+        # own disk-layout module, one `x-systemd.device-timeout=0` on the
+        # crypttab entry and one on the neededForBoot mount's fileSystems
+        # options (nixnas/modules/boot/disk.nix:40-79, field-proven incident
+        # dated 2026-07-04) -- NOT ported here, because nixboot has no LUKS
+        # member list to attach it to. Whoever composes remoteUnlock.enable
+        # = true alongside their own initrd LUKS config on THIS flake must
+        # carry that same fix themselves, or remote-unlock's entire "wait
+        # forever for a human" promise is false past 90 seconds.
+      })
+
+      ## ── Path B: sealHostKey = false -- embed the plaintext key in the initrd.
+      (lib.mkIf (ru.enable && !sealActive && ru.hostKeyPath != null) {
+        # A non-store STRING destination (NixOS uses it verbatim as the
+        # in-initrd HostKey path).
+        boot.initrd.network.ssh.hostKeys = [ hostKeyDest ];
+        # Override the auto-derived secret SOURCE with the real, tracked key
+        # so it is copied into the initrd during the image build. mkForce,
+        # not mkOverride 500: `boot.initrd.secrets` is an attrsOf where THIS
+        # module's own auto-derivation (from `boot.initrd.network.ssh.hostKeys`
+        # above, via the nixpkgs initrd-ssh module) would otherwise supply a
+        # plain-priority (100) default source for the same destination path --
+        # not a `boot.loader.*` write, so the top-of-file priority-discipline
+        # note does not constrain it, and mkOverride 500 (priority 500) would
+        # simply lose to that plain-priority default silently.
+        boot.initrd.secrets.${hostKeyDest} = lib.mkForce hostKeySource;
+      })
+
+      ## ── Path A: sealHostKey = true + remoteUnlock.tpm2.enable -- TPM2-sealed
+      ## key, delivered as a systemd CREDENTIAL (no bespoke unseal service).
+      ## See the remoteUnlock.sealHostKey option doc for the bootstrap story.
+      (lib.mkIf (ru.enable && sealActive) {
+
+        # No static key in the initrd. sshd itself loads the TPM2-sealed
+        # credential the stub delivered and systemd decrypts it during
+        # activation -- the plaintext lands in the unit's
+        # $CREDENTIALS_DIRECTORY, which the first HostKey points at. The
+        # second HostKey is the first-boot EPHEMERAL fallback (generated by
+        # the preStart below); on every other boot that file simply does not
+        # exist -- sshd logs "Unable to load host key" for the absent one
+        # and carries on with whichever is present (verified against a live
+        # sshd on the source host). The Banner file is only written on the
+        # ephemeral path; when it is absent sshd sends no banner.
+        # ignoreEmptyHostKeys silences the NixOS empty-hostKeys assertion.
+        # No ESP mount of its own here, no vfat/codepage modules, no
+        # bespoke unseal unit -- systemd's credential machinery does it all.
+        boot.initrd.network.ssh.ignoreEmptyHostKeys = true;
+        boot.initrd.network.ssh.extraConfig = ''
+          HostKey ${hostKeyCredPath}
+          HostKey ${ephemeralKeyPath}
+          Banner ${bannerPath}
         '';
-      };
 
-      # nixboot-verify reads the sealed credential back (Check 8, in its
-      # script) -- order it after this so a normal boot always reads a
-      # freshly-(re)sealed .cred rather than racing it. `after`, not
-      # `requires`/`wants`: a failed seal should still let the rest of
-      # verify's checks run, not vanish along with this unit.
-      systemd.services.nixboot-verify.after = lib.mkIf cfg.verify.enable [ "nixboot-seal-hostkey.service" ];
-    })
+        # sshd inherits the stub-provided credential by name and TPM2-decrypts
+        # it (`--with-key=auto-initrd`, sealed below). Failure semantics
+        # (systemd's exec-credential.c) are load-bearing here:
+        #   - credential DELIVERED + decrypts        -> boot 2+ normal path,
+        #     stable identity.
+        #   - credential DELIVERED + decrypt FAILS    -> tampered chain / PCR
+        #     mismatch: the unit hard-fails during credential setup, BEFORE
+        #     any ExecStartPre -- NO ephemeral fallback, the box stays locked
+        #     (intentional: a stolen stick cannot present a plausible unlock
+        #     prompt).
+        #   - credential MISSING (genuine first boot)  -> an ID-only
+        #     LoadCredentialEncrypted= is "missing_ok": non-fatal, the unit
+        #     starts with an empty $CREDENTIALS_DIRECTORY and the preStart
+        #     below generates the ephemeral key + warning banner.
+        boot.initrd.systemd.services.sshd.serviceConfig.LoadCredentialEncrypted = [ credName ];
+
+        # ── BOUND THE FAILED-UNSEAL HAMMER (the DA-lockout defense) ──
+        # nixpkgs' initrd-ssh module (nixos/modules/system/boot/initrd-ssh.nix,
+        # its `services.sshd.serviceConfig.Restart = "on-failure";`) sets this
+        # at PLAIN priority (100), not `lib.mkDefault` -- so, unlike every
+        # `boot.loader.*` write elsewhere in this file (which only ever needs
+        # to beat a profile's `mkDefault` at 1000), `lib.mkOverride 500` here
+        # would LOSE to nixpkgs' own definition and silently do nothing: 500
+        # is a higher (weaker) priority number than 100, and NixOS keeps the
+        # LOWEST-priority-number definition. This is the one write in this
+        # whole file that genuinely needs `lib.mkForce`, verified by reading
+        # nixpkgs' own module rather than assumed -- the top-of-file priority
+        # discipline note is scoped to `boot.loader.*`, where the competing
+        # definitions really are all `mkDefault`; it was never a blanket ban
+        # on ever beating a plain-priority nixpkgs default, only on reaching
+        # for `mkForce` where `mkOverride 500` already does the job.
+        #
+        # On the ONE post-Secure-Boot-enrollment boot, the delivered .cred no
+        # longer decrypts against the new PCR 7, so credential setup
+        # hard-fails -- and with `on-failure` systemd RETRIES the whole
+        # activation, each retry firing another TPM2 unseal attempt. Those
+        # repeated failed unseals are exactly what drove an fTPM into
+        # dictionary-attack lockout (TPM_RC_LOCKOUT) in the field on the
+        # source host, which then defeats the stage-2 self-heal too (its own
+        # `systemd-creds encrypt` also needs the TPM). Force NO restart
+        # instead: a stale cred costs exactly ONE failed unseal, sshd stays
+        # down for that single boot (the console prompt, if this host has
+        # one, is still there -- Secure Boot enrollment is a
+        # physically-present step anyway), and `nixboot-seal-hostkey`
+        # RE-SEALS in stage 2 so the NEXT boot's initrd-SSH comes up clean.
+        # The intentional anti-downgrade semantics stay UNCHANGED: still no
+        # ephemeral fallback for a credential that WAS delivered.
+        # (nixnas/modules/boot/remote-unlock.nix:199-210, same incident.)
+        boot.initrd.systemd.services.sshd.serviceConfig.Restart = lib.mkForce "no";
+
+        # make-initrd-ng copies listed objects + ELF library deps only -- it
+        # does NOT chase store references inside script text, so the
+        # ssh-keygen the preStart calls must be listed explicitly (same
+        # pattern the nixpkgs module itself uses for the sshd binaries).
+        boot.initrd.systemd.storePaths = [ "${sshPackage}/bin/ssh-keygen" ];
+
+        # ── First-boot fallback: serve an EPHEMERAL host key rather than not
+        # serving at all. A host with `remoteUnlock.enable = true` must be
+        # unlockable without IPMI and without a monitor even on the very
+        # first boot, before any credential has ever been sealed. The key
+        # lives on the initrd's RAM rootfs; nothing survives switch-root.
+        # Loud, honest UX: the SSH banner (shown before authentication) says
+        # the fingerprint is a throwaway and where to verify the real one
+        # from boot #2 on.
+        boot.initrd.systemd.services.sshd.preStart = ''
+          # Boot 2+: systemd decrypted the sealed credential -- stable
+          # identity, nothing to do.
+          if [ -s "''${CREDENTIALS_DIRECTORY:-/run/credentials/sshd.service}/${credName}" ]; then
+            exit 0
+          fi
+          # GENUINE first boot: no credential was delivered by the stub. (A
+          # delivered-but-undecryptable credential never reaches this script
+          # -- see the Restart comment above: that case hard-fails earlier.)
+          if [ ! -s ${ephemeralKeyPath} ] || [ ! -s ${ephemeralKeyPath}.pub ]; then
+            rm -f ${ephemeralKeyPath} ${ephemeralKeyPath}.pub
+            ${sshPackage}/bin/ssh-keygen -t ed25519 -N "" -C "nixboot-ephemeral-first-boot" \
+              -f ${ephemeralKeyPath} -q
+          fi
+          fp="$(${sshPackage}/bin/ssh-keygen -lf ${ephemeralKeyPath}.pub)"
+          {
+            echo "=================================================================="
+            echo " nixboot FIRST BOOT: initrd SSH is using an EPHEMERAL host key"
+            echo "   $fp"
+            echo " RAM-only, thrown away at switch-root. The fingerprint WILL"
+            echo " CHANGE once the TPM-sealed identity is created later this boot"
+            echo " (nixboot-seal-hostkey, right after you unlock). From the NEXT"
+            echo " boot on, verify the new fingerprint against"
+            echo "   ${pubEspPath}"
+            echo " (also printed on console+journal by the seal service) and expect"
+            echo " a one-time ssh known-hosts change warning -- that one is expected."
+            echo "=================================================================="
+          } > ${bannerPath}
+          echo "nixboot: FIRST BOOT - initrd sshd is serving an EPHEMERAL host key: $fp"
+        '';
+
+        # ── Stage-2 seal service (SELF-HEALING) ──────────────────────────────
+        # Generates the ed25519 key and TPM2-seals it into the ESP's
+        # loader/credentials/ dir with `--with-key=auto-initrd` (TPM2-only key
+        # derivation -- the /var credential secret is not available in the
+        # initrd) bound to `remoteUnlock.tpm2.pcrs`. `esp.mountPoint` is
+        # already mounted in stage 2 (nixboot never mounts it itself, but a
+        # host with remoteUnlock.enable = true necessarily has it up by
+        # multi-user.target), so this is a plain file write. From here on the
+        # lanzaboote stub auto-delivers it to every initrd.
+        #
+        # Runs on EVERY boot (`wantedBy = multi-user.target`, no
+        # ConditionPathExists gate) and decides idempotency IN THE SCRIPT with
+        # a real DECRYPT self-test: if the .cred exists AND still decrypts
+        # against the LIVE TPM/PCR state, it does nothing (fingerprint
+        # unchanged); if the .cred is MISSING or FAILS to decrypt, it
+        # (re)generates + (re)seals. This is what makes the one-time PCR 7
+        # change from Secure Boot key enrollment SELF-HEAL on the next boot
+        # instead of leaving a permanently-undecryptable .cred -- the field
+        # incident this exists to prevent: a pre-enrollment seal plus an
+        # existence-only gate left the initrd-SSH host key NEVER re-sealed,
+        # bricking remote unlock, while the repeated failed-unseal retries
+        # (see the Restart comment above) drove the fTPM into DA lockout on
+        # top of it. Correctness: firmware extends PCR 7 before the
+        # bootloader and does NOT re-extend it between stage 1 and stage 2, so
+        # a stage-2 decrypt success here GUARANTEES the stage-1 initrd-sshd
+        # unseal succeeds next boot.
+        # (nixnas/modules/boot/remote-unlock.nix:251-340, same design and the
+        # same incident; PCR-extension-timing correctness claim unchanged.)
+        systemd.services.nixboot-seal-hostkey = {
+          description = "nixboot: generate + TPM2-seal the initrd SSH host key credential (self-healing across PCR changes)";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "local-fs.target" "sysinit.target" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            StandardOutput = "journal+console";
+            StandardError = "journal+console";
+          };
+          path = [ pkgs.systemd sshPackage pkgs.coreutils ];
+          script = ''
+            echo "=== NIXBOOT-SEAL-START ==="
+
+            # ── Self-healing idempotency: gate the reseal on a REAL decrypt
+            # self-test against the live TPM/PCR state -- NOT on the .cred
+            # merely existing (the exact gate that bricked the source
+            # host's first implementation). `-` writes the decrypted
+            # plaintext to stdout, discarded to /dev/null so the key never
+            # hits the journal. A successful unseal does NOT touch the TPM
+            # dictionary-attack counter, so this per-boot self-test is free;
+            # a STALE cred costs exactly one failed unseal (one DA
+            # increment) and then heals below -- never a retry loop.
+            if [ -f "${credEspPath}" ]; then
+              if systemd-creds decrypt --tpm2-device=${ru.tpm2.device} --name=${credName} "${credEspPath}" - >/dev/null 2>&1; then
+                echo "nixboot: sealed initrd SSH host key still decrypts against the current TPM/PCR state -- no reseal."
+                ssh-keygen -lf "${pubEspPath}" 2>/dev/null || true
+                echo "=== NIXBOOT-SEAL-END ==="
+                exit 0
+              fi
+              echo "!! nixboot: the sealed initrd SSH host key credential no longer decrypts against the"
+              echo "!! current TPM / PCR state. EXPECTED exactly once -- right after Secure Boot key"
+              echo "!! enrollment (nixboot-enroll-sb) changed PCR 7. RE-SEALING now; the initrd host-key"
+              echo "!! FINGERPRINT WILL CHANGE this once -- re-pin it on your next initrd-SSH connect."
+            fi
+
+            # (Re)generate + (re)seal. Temp DIRECTORY so the key file does not
+            # pre-exist (ssh-keygen -f would prompt). A stale .cred/.pub from
+            # a pre-enrollment seal is OVERWRITTEN below.
+            tmpdir="$(mktemp -d -t nixboot-initrd-hostkey-XXXXXX)"
+            tmpkey="$tmpdir/key"
+            cleanup() { find "$tmpdir" -type f -exec shred -u {} \; 2>/dev/null || true; rm -rf "$tmpdir"; }
+            trap cleanup EXIT
+            ssh-keygen -t ed25519 -N "" -C "${credName}" -f "$tmpkey" -q
+            mkdir -p "$(dirname "${credEspPath}")"
+            # --with-key=auto-initrd: seal to the TPM2 only (no /var secret),
+            # so the initrd can decrypt it; --name must match sshd's
+            # LoadCredentialEncrypted= name; --tpm2-pcrs anchors it.
+            # Remove any stale blob first -- systemd-creds encrypt refuses to
+            # clobber an existing output file, and on the self-heal path the
+            # old .cred is still present.
+            rm -f "${credEspPath}"
+            if ! systemd-creds encrypt \
+                --with-key=auto-initrd \
+                --tpm2-device=${ru.tpm2.device} \
+                --tpm2-pcrs=${tpm2PcrsArg} \
+                --name=${credName} \
+                "$tmpkey" \
+                "${credEspPath}"; then
+              echo "!! nixboot: FAILED to TPM2-seal the initrd SSH host key. If the TPM is in"
+              echo "!! dictionary-attack lockout (TPM_RC_LOCKOUT), clear it and re-run this service:"
+              echo "!!   tpm2_dictionarylockout --clear-lockout && systemctl start nixboot-seal-hostkey"
+              echo "=== NIXBOOT-SEAL-END ==="
+              exit 1
+            fi
+            chmod 600 "${credEspPath}"
+            # Surface the PUBLIC half (it is public -- plaintext ESP is fine)
+            # so the operator can VERIFY the initrd-SSH connection instead of
+            # TOFU-accepting it, and so nixboot-verify's Check 8 (below) has
+            # something to compare the sealed credential against. Overwrites
+            # any stale .pub. Without this the fingerprint would be destroyed
+            # with the tmpdir and the channel unverifiable.
+            install -m 0644 "$tmpkey.pub" "${pubEspPath}"
+            echo "nixboot: initrd SSH host key fingerprint (verify this on your next initrd-SSH connect):"
+            ssh-keygen -lf "$tmpkey.pub"
+            echo "nixboot: initrd SSH host key sealed to ${credEspPath} (public key beside it)"
+            echo "=== NIXBOOT-SEAL-END ==="
+          '';
+        };
+
+        # nixboot-verify reads the sealed credential back (Check 8, in its
+        # script) -- order it after this so a normal boot always reads a
+        # freshly-(re)sealed .cred rather than racing it. `after`, not
+        # `requires`/`wants`: a failed seal should still let the rest of
+        # verify's checks run, not vanish along with this unit.
+        systemd.services.nixboot-verify.after = lib.mkIf cfg.verify.enable [ "nixboot-seal-hostkey.service" ];
+      })
     ]))
   ];
 }
