@@ -48,6 +48,9 @@ let
       enable = lib.mkOption { type = lib.types.bool; default = false; };
       pkiBundle = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
       bootCounting.initialTries = lib.mkOption { type = lib.types.nullOr lib.types.int; default = null; };
+      # autoGenerateKeys.enable: added alongside pkiBundle/keySource actually reaching
+      # boot.lanzaboote.* (modules/nixboot.nix) -- see the secureBoot fixtures below.
+      autoGenerateKeys.enable = lib.mkOption { type = lib.types.bool; default = false; };
     };
   };
 
@@ -172,6 +175,44 @@ let
     nixboot.loader.editor = true;
     nixboot.loader.efiVariables = "removable";
     boot.loader.systemd-boot.editor = lib.mkDefault false;
+  };
+
+  # ── secureBoot.pkiBundle / keySource actually reaching boot.lanzaboote.* ──────────────
+  # loader.program = "lanzaboote" needs fakeLanzabooteModule's option surface to exist (this
+  # flake carries no real lanzaboote input -- see this file's own header), which is exactly why
+  # no earlier fixture in this suite used it. These four do, now that fakeLanzabooteModule
+  # declares autoGenerateKeys.enable too.
+  cfg-sb-stable = evalFor {
+    nixboot.loader.program = "lanzaboote";
+    nixboot.secureBoot.enable = true;
+    nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
+    nixboot.secureBoot.keySource = "stable";
+  };
+
+  cfg-sb-autogenerate = evalFor {
+    nixboot.loader.program = "lanzaboote";
+    nixboot.secureBoot.enable = true;
+    nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
+    nixboot.secureBoot.keySource = "autogenerate";
+  };
+
+  # ── remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set ──────
+  cfg-remoteunlock-tpm2 = evalFor {
+    nixboot.remoteUnlock.enable = true;
+    nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
+    nixboot.remoteUnlock.tpm2.enable = true;
+    nixboot.secureBoot.enable = true;
+    nixboot.loader.program = "lanzaboote";
+    nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
+  };
+
+  # Flip side: remoteUnlock enabled but the sealed/TPM2 path is NOT in use (plaintext
+  # hostKeyPath instead) -- the driver modules must NOT appear.
+  cfg-remoteunlock-no-tpm2 = evalFor {
+    nixboot.remoteUnlock.enable = true;
+    nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
+    nixboot.remoteUnlock.sealHostKey = false;
+    nixboot.remoteUnlock.hostKeyPath = ./default.nix; # any real path; content is irrelevant here
   };
 
   results = [
@@ -478,6 +519,49 @@ let
         })
       )
       "expected forcing system.build.toplevel to succeed (a clean limine config touches none of the refused knobs) but it failed")
+
+    # --- secureBoot.pkiBundle / keySource actually reach boot.lanzaboote.* -----------------
+    (check "secureboot/pkiBundle-reaches-lanzaboote-stable"
+      (cfg-sb-stable.boot.lanzaboote.pkiBundle == "/nix/lanzaboote/pki")
+      "got boot.lanzaboote.pkiBundle = ${builtins.toJSON cfg-sb-stable.boot.lanzaboote.pkiBundle}, expected it to match nixboot.secureBoot.pkiBundle")
+
+    (check "secureboot/keySource-stable-leaves-autoGenerateKeys-off"
+      (cfg-sb-stable.boot.lanzaboote.autoGenerateKeys.enable == false)
+      "got: ${builtins.toJSON cfg-sb-stable.boot.lanzaboote.autoGenerateKeys.enable}")
+
+    (check "secureboot/keySource-stable-does-not-touch-generate-sb-keys"
+      (!(cfg-sb-stable.systemd.services ? "generate-sb-keys"))
+      "systemd.services keys: ${builtins.toJSON (builtins.attrNames cfg-sb-stable.systemd.services)} -- the landlock workaround must be inert on a stable-keyed host, since lanzaboote itself never creates this unit there")
+
+    (check "secureboot/keySource-autogenerate-turns-on-lanzaboote-autoGenerateKeys"
+      (cfg-sb-autogenerate.boot.lanzaboote.autoGenerateKeys.enable == true)
+      "got: ${builtins.toJSON cfg-sb-autogenerate.boot.lanzaboote.autoGenerateKeys.enable}")
+
+    (check "secureboot/keySource-autogenerate-applies-the-landlock-workaround"
+      (lib.hasInfix "--disable-landlock" (cfg-sb-autogenerate.systemd.services.generate-sb-keys.serviceConfig.ExecStart or ""))
+      "generate-sb-keys ExecStart: ${builtins.toJSON (cfg-sb-autogenerate.systemd.services.generate-sb-keys.serviceConfig.ExecStart or null)}")
+
+    (check "secureboot/pkiBundle-inert-when-secureBoot-disabled"
+      (
+        let cfg = evalFor { nixboot.loader.program = "systemd-boot"; nixboot.loader.efiVariables = "removable"; };
+        in cfg.boot.lanzaboote.pkiBundle == null
+      )
+      "secureBoot.enable = false must never force boot.lanzaboote.pkiBundle away from lanzaboote's own default")
+
+    # --- remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set -----
+    (check "remoteunlock/tpm2-enable-adds-tpm-driver-modules"
+      (
+        let mods = cfg-remoteunlock-tpm2.boot.initrd.availableKernelModules;
+        in lib.elem "tpm_crb" mods && lib.elem "tpm_tis" mods
+      )
+      "boot.initrd.availableKernelModules: ${builtins.toJSON cfg-remoteunlock-tpm2.boot.initrd.availableKernelModules}")
+
+    (check "remoteunlock/no-tpm2-means-no-tpm-driver-modules"
+      (
+        let mods = cfg-remoteunlock-no-tpm2.boot.initrd.availableKernelModules;
+        in !(lib.elem "tpm_crb" mods) && !(lib.elem "tpm_tis" mods)
+      )
+      "boot.initrd.availableKernelModules: ${builtins.toJSON cfg-remoteunlock-no-tpm2.boot.initrd.availableKernelModules}")
   ];
 
   failed = builtins.filter (r: !r.ok) results;

@@ -1090,6 +1090,47 @@ in
           lib.mkOverride 500 cfg.bootCounting.tries
         );
 
+        # ── secureBoot.pkiBundle / keySource actually reach lanzaboote's own knobs ──
+        # THE GAP THIS CLOSES: every OTHER piece of this module that touches Secure Boot keys
+        # (sbctlCompat's /etc/sbctl/sbctl.conf, nixboot-enroll-sb, tools.sbctl's default,
+        # extraEntries.*.sign.pkiBundle's own default) reads `cfg.secureBoot.pkiBundle` as THE
+        # bundle location -- but until this write existed, lanzaboote's OWN `lzbt install` hook
+        # (the thing that actually SIGNS every UKI) was never told about it and would fall back to
+        # ITS OWN default key location instead, completely decoupled from every other piece of
+        # this module that assumes `cfg.secureBoot.pkiBundle` is where the real keys live. A host
+        # setting `secureBoot.pkiBundle` got a config file, an enrollment tool, and a signing
+        # default that all agreed with each other and NONE of which lanzaboote itself ever read --
+        # `secureBoot.enable = true` would build, boot, and PRODUCE UKIs, just never verify them
+        # against the keys the rest of this module thought were in charge. `keySource` had the same
+        # problem: declared, described in prose, never once read. Ported from nixnas's own
+        # `modules/boot/secureboot.nix` (`provideStableKeys = cfg.boot.secureBoot.keysSops != null`
+        # there; `keySource` here is the same DECISION restated as an explicit enum rather than an
+        # implicit "is a key file set" inference -- see `keySource`'s own option doc).
+        boot.lanzaboote.pkiBundle = lib.mkIf cfg.secureBoot.enable (
+          lib.mkOverride 500 cfg.secureBoot.pkiBundle
+        );
+        boot.lanzaboote.autoGenerateKeys.enable = lib.mkIf cfg.secureBoot.enable (
+          lib.mkOverride 500 (cfg.secureBoot.keySource == "autogenerate")
+        );
+
+        # ── generate-sb-keys landlock/ENOENT workaround (autogenerate path only) ──
+        # CONFIRMED BY DIRECT REPRODUCTION on the source host (nixnas/modules/boot/secureboot.nix):
+        # lanzaboote's `generate-sb-keys.service` runs plain `sbctl create-keys` with its landlock
+        # sandbox left on. `sbctl create-keys` adds a Landlock RWDirs rule for the GRANDPARENT of
+        # `keydir` (`dirname(pkiBundle)`) WITHOUT `IgnoreIfMissing()`. On a genuine first boot that
+        # parent does not exist yet -- nothing pre-creates it -- so Landlock's `open(O_PATH)` on
+        # that path fails with ENOENT and `sbctl create-keys` exits 1 BEFORE creating any directory
+        # or writing any key: the service fails silently and `<pkiBundle>/keys/db/db.key` never
+        # appears. `--disable-landlock` skips the landlock setup entirely and succeeds. Gated on
+        # the SAME condition lanzaboote itself gates the unit's existence on
+        # (`autoGenerateKeys.enable`, written just above) -- this override is inert, not merely
+        # absent, on a "stable" host, since the unit itself does not exist there.
+        systemd.services.generate-sb-keys = lib.mkIf (
+          cfg.secureBoot.enable && cfg.secureBoot.keySource == "autogenerate"
+        ) {
+          serviceConfig.ExecStart = lib.mkForce "${pkgs.sbctl}/bin/sbctl create-keys --disable-landlock";
+        };
+
         # boot.initrd.systemd.enable is DELIBERATELY NOT ported here, unlike the
         # console= wiring below. nixnas's own comment for it gives TWO reasons in
         # one line: "systemd in the initrd -- the supported path for the
@@ -1590,7 +1631,23 @@ in
           "r8169"
           "tg3"
           "atlantic" # common server/desktop NICs
-        ];
+        ]
+        # ── TPM2 driver, only when the sealed-host-key path needs to talk to a chip ──
+        # THE GAP THIS CLOSES: `remoteUnlock.tpm2.enable = true` makes sshd's
+        # LoadCredentialEncrypted= run `systemd-creds decrypt --tpm2-device=...` INSIDE THE
+        # INITRD (see nixboot-seal-hostkey/the sshd credential wiring above) -- which needs the
+        # kernel to already be talking to the TPM chip (/dev/tpmrm0) by then. Without the driver
+        # in the initrd's own module set, that decrypt simply cannot reach the chip at all,
+        # regardless of whether the PCR/passphrase side of things is otherwise correct.
+        # `remoteUnlock.tpm2.enable` is documented (see that option's own doc) as a value nixboot
+        # only READS, never a policy it owns -- but a driver MODULE is mechanics, not policy, and
+        # nixboot is the one module that actually knows the sealed-key path needs it; nixnas's own
+        # `crypto/tpm2.nix` adds the identical two modules as a side effect of its OWN
+        # `crypto.tpm2.enable`, but a host that composes nixboot's remoteUnlock WITHOUT nixnas (the
+        # explicitly-supported "usable on hosts generically" case this module's own header claims)
+        # got no driver at all until this line. Additive-only (a list-type option merges), so this
+        # can never collide with a host that already lists these some other way.
+        ++ lib.optionals ru.tpm2.enable [ "tpm_crb" "tpm_tis" ];
 
         # ── CROSS-MODULE COUPLING nixboot cannot see, let alone fix ──
         # Everything above only gets an operator AS FAR AS a live sshd
