@@ -197,6 +197,11 @@ let
   };
 
   # ── remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set ──────
+  # boot.initrd.systemd.enable = true is REQUIRED here (see the new assertion this task
+  # added): the sealed path (Path A) writes entirely into boot.initrd.systemd.services.*,
+  # which the classic initrd builder never renders. A representative valid sealed-path host
+  # sets it, exactly as nixnas's own crypto.tpm2.enable does as a side effect
+  # (nixnas/modules/boot/image.nix:22-23).
   cfg-remoteunlock-tpm2 = evalFor {
     nixboot.remoteUnlock.enable = true;
     nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
@@ -204,6 +209,7 @@ let
     nixboot.secureBoot.enable = true;
     nixboot.loader.program = "lanzaboote";
     nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
+    boot.initrd.systemd.enable = true;
   };
 
   # Flip side: remoteUnlock enabled but the sealed/TPM2 path is NOT in use (plaintext
@@ -562,6 +568,78 @@ let
         in !(lib.elem "tpm_crb" mods) && !(lib.elem "tpm_tis" mods)
       )
       "boot.initrd.availableKernelModules: ${builtins.toJSON cfg-remoteunlock-no-tpm2.boot.initrd.availableKernelModules}")
+
+    # --- remoteUnlock (either host-key path) requires boot.initrd.systemd.enable, proved
+    # both ways: the common NIC/DHCP block both paths share writes
+    # boot.initrd.systemd.network.enable = true unconditionally, which nixpkgs' own
+    # resolved.nix then refuses outside systemd stage 1 (this was discovered by testing
+    # a first, narrower draft of this assertion that scoped only to the sealed path --
+    # the plaintext-path fixture below failed too, just for an unrelated, unasserted
+    # nixpkgs error instead of an actionable nixboot one) ------------------------------
+    (check "remoteunlock/sealed-without-systemd-initrd/eval-fails"
+      (evalFailsBuild {
+        nixboot.remoteUnlock.enable = true;
+        nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
+        nixboot.remoteUnlock.tpm2.enable = true;
+        nixboot.secureBoot.enable = true;
+        nixboot.loader.program = "lanzaboote";
+        nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
+        # boot.initrd.systemd.enable EXPLICITLY false -- current nixpkgs defaults this
+        # to true (systemd stage-1 is the default initrd today), so leaving it unset
+        # would not exercise this assertion at all; a host (or an OLDER nixpkgs pin)
+        # that turns it back off is exactly the case B23 exists to catch.
+        boot.initrd.systemd.enable = false;
+      })
+      "expected forcing system.build.toplevel to fail (Path A's systemd-credential writes are silently discarded without boot.initrd.systemd.enable) but it succeeded")
+
+    (check "remoteunlock/sealed-with-systemd-initrd/eval-succeeds"
+      (
+        !(evalFailsBuild {
+          nixboot.remoteUnlock.enable = true;
+          nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
+          nixboot.remoteUnlock.tpm2.enable = true;
+          nixboot.secureBoot.enable = true;
+          nixboot.loader.program = "lanzaboote";
+          nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
+          boot.initrd.systemd.enable = true;
+        })
+      )
+      "expected forcing system.build.toplevel to succeed (boot.initrd.systemd.enable = true satisfies Path A's requirement) but it failed")
+
+    (check "remoteunlock/plaintext-path-b-without-systemd-initrd/eval-fails"
+      (evalFailsBuild {
+        nixboot.remoteUnlock.enable = true;
+        nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
+        nixboot.remoteUnlock.sealHostKey = false;
+        nixboot.remoteUnlock.hostKeyPath = ./default.nix;
+        # boot.initrd.systemd.enable EXPLICITLY false -- proves the COMMON block's
+        # unconditional boot.initrd.systemd.network.enable write requires systemd
+        # stage 1 even on the plaintext path, which never touches a credential at all.
+        boot.initrd.systemd.enable = false;
+      })
+      "expected forcing system.build.toplevel to fail (the common NIC/DHCP block's boot.initrd.systemd.network.enable write is refused by nixpkgs' own resolved.nix outside systemd stage 1, regardless of which host-key path is in use) but it succeeded")
+
+    (check "remoteunlock/plaintext-path-b-with-systemd-initrd/eval-succeeds"
+      (
+        !(evalFailsBuild {
+          nixboot.remoteUnlock.enable = true;
+          nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
+          nixboot.remoteUnlock.sealHostKey = false;
+          nixboot.remoteUnlock.hostKeyPath = ./default.nix;
+          boot.initrd.systemd.enable = true;
+        })
+      )
+      "expected forcing system.build.toplevel to succeed (boot.initrd.systemd.enable = true satisfies the shared requirement, and Path B needs no credential machinery on top of it) but it failed")
+
+    # --- nixboot-enroll-sb is exposed as a system.build output, like extraEntries' own
+    # maintainer derivations, so CI forces + shellchecks it even when no host currently
+    # turns on secureBoot.enrollTool.enable && secureBoot.enable -----------------------
+    (check "secureboot/nixbootEnrollSb-exposed-unconditionally"
+      (
+        let cfg = evalFor { }; # nixboot.enable = true (fixture default), secureBoot untouched
+        in cfg.system.build ? "nixbootEnrollSb"
+      )
+      "system.build keys did not include nixbootEnrollSb")
   ];
 
   failed = builtins.filter (r: !r.ok) results;
@@ -722,12 +800,18 @@ let
     let
       unsigned = cfg-none-unsigned.system.build.extraEntryMaintainers.rescue;
       signedWithBootEntry = cfg-signed-decoupled.system.build.extraEntryMaintainers.bmc;
+      # Same "reference it to force the build, not just prove the attribute exists"
+      # technique, now covering nixboot-enroll-sb too (added alongside the
+      # boot.initrd.systemd.enable assertion above) -- forces its own
+      # writeShellApplication shellcheck pass under `nix flake check`.
+      enrollSbTool = (evalFor { }).system.build.nixbootEnrollSb;
     in
     pkgs.runCommand "nixboot-extra-entry-maintainers-build-check"
       { }
       ''
         echo "unsigned maintainer built: ${unsigned}"
         echo "signed + bootEntry maintainer built: ${signedWithBootEntry}"
+        echo "nixboot-enroll-sb built: ${enrollSbTool}"
         touch $out
       '';
 in

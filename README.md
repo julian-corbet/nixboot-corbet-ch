@@ -135,11 +135,40 @@ Pre-alpha. The module is complete and was extracted verbatim from a private
 operator's boot-stance audit (see the header of
 [`modules/nixboot.nix`](modules/nixboot.nix) for the extraction story), but
 this standalone flake has not yet been re-verified live as its own input —
-only as an in-tree module in the configuration it came from. Two real, evidenced
-pieces of the source contract are deliberately **not** implemented in this
-first cut: the `extraEntries` UKI-build mechanism for a durable rescue/BMC
-boot entry, and the initrd unlock/SSH-unlock/console-keymap surface. Both
-are noted in the module's own SCOPE block rather than silently missing.
+only as an in-tree module in the configuration it came from, and — as of
+this revision — as a normalised eval-level comparison against that source
+configuration's own boot glue, not yet a live cutover on real hardware (see
+the note at the end of this section).
+
+Two pieces of the source contract that an earlier revision of this file
+called out as deliberately deferred are now implemented: `extraEntries.*`
+(the `ukify`+`sbsign`+place+rotate pipeline for a durable rescue/BMC boot
+entry — [`modules/extra-entries.nix`](modules/extra-entries.nix)), and
+`remoteUnlock.*` (headless in-initrd SSH, both the TPM2-sealed and
+plaintext host-key paths — see `secureBoot.pkiBundle`/`keySource` and
+`remoteUnlock.*` in [`modules/nixboot.nix`](modules/nixboot.nix), and
+[CONTRACT.md](CONTRACT.md)'s B21–B24). What genuinely remains outside this
+module, stated as a ceiling rather than an oversight: the initrd-time
+LUKS/ZFS **unlock-member** surface belongs to whichever disk-layout module
+declares those members — [nixluks](https://github.com/julian-corbet/nixluks-corbet-ch)'s
+own `volumes.<name>.initrdUnlock.*`, not nixboot, which has no member list
+of its own to attach that mechanism to (see the "CROSS-MODULE COUPLING"
+comment on `remoteUnlock`'s common initrd-network block); and the initrd
+**console keymap** is real and evidenced from the same source audit but not
+yet implemented in this repo at all.
+
+**A note on "one declarative boot stance per host":** that generality is a
+property of this MODULE, not automatically of any given consumer. nixnas —
+the appliance this module was extracted out of — still owns its own
+loader/Secure-Boot/rollback wiring in-tree
+(`modules/boot/{disk,rollback,image,secureboot,remote-unlock}.nix`) and
+consumes only `extraEntries.*` and `media.usb.enable` from this flake today;
+the rest of its boot chain has been compared against this module's option
+surface (behaviour-for-behaviour, not merely name-for-name) but not yet
+cut over. Two repos owning parts of one boot chain is exactly the shape this
+module exists to end — see that repo's own commit history for the ordered
+cutover plan such a comparison produces, and CONTRACT.md's B21–B24 for what
+had to be added here first to make the comparison honest.
 
 ## Usage
 

@@ -18,7 +18,7 @@ mechanism — is [`CONTRACT.md`](../CONTRACT.md). The module itself, with
 every option's own description, is
 [`modules/nixboot.nix`](../modules/nixboot.nix).
 
-## The seven option groups
+## The option groups
 
 **`loader.*`** — which program installs to the ESP (`systemd-boot`,
 `lanzaboote`, `limine`, or `none` for a guest with no firmware of its own)
@@ -80,6 +80,37 @@ loader.program's own generations) and of `secureBoot.enable`/`loader.program`
 (a host that owns no primary boot chain at all, or runs one with Secure Boot
 off, can still carry a signed or unsigned extra entry) — see
 `modules/extra-entries.nix` and CONTRACT.md's B13–B16.
+
+**`remoteUnlock.*`** — a headless in-initrd secret prompt (most commonly a
+LUKS passphrase/PIN this host's own disk-layout config blocks on) answered
+over SSH: a NIC and sshd come up in the initrd, an operator connects with a
+key from `remoteUnlock.authorizedKeys`, and hands the secret to systemd's
+password agent. The host key defaults to a TPM2-sealed systemd CREDENTIAL
+(`sealHostKey = true`, folded with `remoteUnlock.tpm2.enable` — a value this
+module *reads*, never a TPM2 policy it owns itself, see that option's own
+doc) that `nixboot-seal-hostkey` generates on first boot and SELF-HEALS
+across the one PCR change a Secure Boot key enrollment causes, serving a
+loudly-flagged EPHEMERAL key before any seal exists so the very first boot
+is unlockable too; or a plaintext, build-time `hostKeyPath` (LAN/tailnet-only)
+when `sealHostKey = false`. Both require `boot.initrd.systemd.enable = true`
+(the common NIC/DHCP wiring depends on it regardless of which host-key path
+is chosen) — refused, not silently inert, if it is missing. See
+CONTRACT.md's B22–B23 for the full failure-mode reasoning, including the one
+`mkForce` this module needs to defend against a TPM dictionary-attack
+lockout.
+
+**`console.*`** — which `console=` kernel parameter is LAST on the command
+line (i.e. becomes `/dev/console`): the attached display, or a serial port
+for IPMI-SOL/BMC-administered boxes and QEMU CI. Both consoles always stay
+on the command line regardless — this only ever reorders, never drops one.
+
+**`secureBoot.pkiBundle` / `keySource`** — beyond the enrollment posture
+above, these two actually reach the thing that signs UKIs: `pkiBundle`
+becomes `boot.lanzaboote.pkiBundle`, and `keySource = "autogenerate"` turns
+on `boot.lanzaboote.autoGenerateKeys.enable` plus the landlock/ENOENT
+workaround `generate-sb-keys.service` needs on a genuine first boot. Ported
+from, and closing a real gap found in, the source configuration's own
+`secureboot.nix` — see CONTRACT.md's B21.
 
 ## Why a `*-verify` service at all
 

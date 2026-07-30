@@ -247,24 +247,111 @@ idempotent/self-healing NVRAM registrar the NixOS backend's `extraEntries`
 uses (`lib/register-boot-entry.nix`, extracted specifically so neither
 backend drifts from the other's copy of that logic).
 
+**B21 — `secureBoot.pkiBundle` / `keySource` actually reach the thing that
+signs UKIs, not just the tools that assume it did.**
+Every other Secure-Boot-adjacent write in this module (`sbctlCompat`'s
+`/etc/sbctl/sbctl.conf`, `nixboot-enroll-sb`, `tools.sbctl`'s default,
+`extraEntries.*.sign.pkiBundle`'s own default) reads `secureBoot.pkiBundle`
+as *the* bundle location — but `boot.lanzaboote.pkiBundle` and
+`boot.lanzaboote.autoGenerateKeys.enable` (the two lanzaboote-owned options
+that decide where `lzbt install` actually looks for keys, and whether it
+mints its own) are written from `secureBoot.pkiBundle`/`keySource` too, not
+left for lanzaboote's own defaults to disagree with everything else
+silently. `keySource = "autogenerate"` also carries the landlock/ENOENT
+workaround (`generate-sb-keys.service`'s `ExecStart` override) confirmed by
+direct reproduction on the source host, gated on the identical condition
+lanzaboote itself gates that unit's existence on
+(`modules/nixboot.nix`, the `boot.lanzaboote.pkiBundle` /
+`autoGenerateKeys.enable` writes and the `generate-sb-keys` override).
+
+**B22 — `remoteUnlock.*` delivers a headless in-initrd secret prompt over
+SSH, with the sealed host key as the default and a plaintext fallback,
+neither of which is allowed to silently fail to arrive.**
+Bringing a NIC + sshd up in the initrd is common to both paths
+(`remoteUnlock.enable`). Path A (`sealHostKey = true`, the default, folded
+with `remoteUnlock.tpm2.enable`) delivers the host key as a TPM2-sealed
+systemd CREDENTIAL that `nixboot-seal-hostkey` generates and re-seals
+SELF-HEALINGLY (a real decrypt self-test against the live TPM/PCR state,
+not mere file existence — the exact gate whose absence bricked the source
+host's first implementation across a Secure Boot key enrollment), serves an
+EPHEMERAL, loudly-banner-flagged key on a genuine first boot before any
+seal exists, and forces `Restart = "no"` on the initrd sshd unit (`mkForce`,
+the one write in this whole file that genuinely needs it rather than
+`mkOverride 500` — nixpkgs' own `initrd-ssh.nix` sets `Restart = "on-failure"`
+at *plain* priority, which `mkOverride 500` would lose to silently) so a
+single post-enrollment stale credential costs exactly one failed TPM2
+unseal instead of a retry storm that drove a real fTPM into dictionary-attack
+lockout. Path B (`sealHostKey = false`) embeds a plaintext, build-time
+`hostKeyPath` instead — LAN/tailnet-only, no TPM needed. Both paths are
+refused, not left silently inert, when they cannot possibly work: enabling
+`remoteUnlock` with neither a working seal path nor a plaintext key,
+sealing without `secureBoot.enable` (only the lanzaboote stub delivers the
+sealed credential into the initrd), or an empty `authorizedKeys` (initrd
+sshd is key-only) are each an assertion failure. `nixboot-verify`'s Check 8
+re-runs the seal service's own decrypt self-test post-boot and additionally
+confirms the decrypted key's fingerprint matches the one published for an
+operator to pin — a mismatch there would mean an operator trusting the
+wrong key on their next connection (`modules/nixboot.nix`, the
+`remoteUnlock` option group, the `ru.enable`-gated `config` blocks, and
+nixboot-verify Check 8).
+
+**B23 — Path A's systemd-credential writes cannot silently land nowhere.**
+Every write Path A makes — `LoadCredentialEncrypted`, the credential-aware
+`preStart`, `boot.initrd.systemd.storePaths` — lives entirely under
+`boot.initrd.systemd.services.*`, an option tree nixpkgs' own systemd-initrd
+module only renders into the actual initrd when
+`boot.initrd.systemd.enable = true` (verified against that module's own
+`config = mkIf (config.boot.initrd.enable && cfg.enable)` gate). Turning on
+`remoteUnlock.sealHostKey` (the default) together with `remoteUnlock.tpm2.enable`
+without also setting `boot.initrd.systemd.enable` is therefore an assertion
+failure, not a boot that quietly serves no host key at all — the same
+"setting requested, quietly not applied" bug class B4 already refuses for
+`bootCounting`. Path B needs no such assertion: `boot.initrd.network.ssh.hostKeys`
+and `boot.initrd.secrets` are rendered by the classic (non-systemd) initrd
+builder too (`modules/nixboot.nix`, the new assertion in the `ru.enable`
+block; proved both directions in `checks/default.nix`).
+
+**B24 — `nixboot-enroll-sb` is forced and shellchecked by `nix flake check`
+even when no host currently turns it on.**
+Exposed as `system.build.nixbootEnrollSb` (mirroring
+`system.build.extraEntryMaintainers` / `nixbootRegisterBootEntry` above, and
+the source host's own `system.build.sbEnroller`) rather than only ever
+constructed inline at its `environment.systemPackages` call site — a
+`writeShellApplication`'s shellcheck pass only runs when something actually
+builds the derivation, and reading `environment.systemPackages` alone does
+not (`modules/nixboot.nix`, the `enrollSb` binding; forced in
+`checks/default.nix`'s `extraEntryMaintainerBuilds`).
+
 ## Which behaviors become automated tests vs. stay observed
 
 - **Automatable** (a `pkgs.testers.nixosTest` VM can assert these directly):
-  B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16, B17, B18, B19.
+  B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16, B17, B18, B19, B22
+  (the real seal/reseal/ephemeral-fallback/DA-lockout-avoidance sequence
+  needs a real TPM2 — swtpm — and a real reboot to prove, not eval alone).
 - **Automated today, at the eval/build level, without a VM** (see
   `checks/default.nix` and `checks/system-manager.nix`): B13, B14, B17, B18,
   B19, B20 (the option-surface and rendering half — real system-manager
   enrollment enforcement is out of this repo's reach, see
-  `checks/system-manager.nix`'s own header), and B15's idempotency/self-heal
-  proof (a real invocation of the registrar against a faked `efibootmgr`
-  inside the Nix build sandbox — no VM, no KVM, no real firmware, but a
-  genuine execution rather than an eval-only assertion).
+  `checks/system-manager.nix`'s own header), B21 (pkiBundle/keySource reach
+  `boot.lanzaboote.*`, and the landlock workaround applies only on the
+  autogenerate path), B23 (the `boot.initrd.systemd.enable` requirement
+  fires when Path A is active and stays silent — proved in both
+  directions — when it is not, and Path B is proved unaffected either way),
+  B24 (`nixbootEnrollSb` is present in `system.build` and its derivation
+  builds/shellchecks cleanly), and B15's idempotency/self-heal proof (a real
+  invocation of the registrar against a faked `efibootmgr` inside the Nix
+  build sandbox — no VM, no KVM, no real firmware, but a genuine execution
+  rather than an eval-only assertion).
 - **Observed / operational** (need real firmware, a real TPM, or real NVRAM
   state that a disposable VM cannot faithfully reproduce): B6 (Setup Mode
   gating against real UEFI variables), B8 (a real ESP actually approaching
-  its declared capacity over many generations), and the REST of B15 (that a
+  its declared capacity over many generations), the REST of B15 (that a
   real firmware implementation accepts the entry and actually offers it at
-  POST — the registrar's own logic is proved, real firmware quirks are not).
+  POST — the registrar's own logic is proved, real firmware quirks are not),
+  and the REST of B22 (a real TPM2 dictionary-attack lockout, and a real
+  Secure Boot key enrollment actually changing PCR 7 on real firmware — the
+  source host's own field incidents, not reproducible in a disposable VM
+  suite without swtpm PCR-extension support this repo does not yet drive).
 
 `checks/default.nix` is this repo's first automated test suite — eval-level
 assertions plus the one build-level idempotency proof described above. A

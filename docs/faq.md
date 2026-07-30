@@ -67,14 +67,27 @@ refusal rather than a silent partial enrollment. See
 
 ## What isn't implemented yet?
 
-The initrd-time surface beyond `remoteUnlock.*` — unlock members, the
-initrd console keymap — is real, evidenced, and deliberately deferred rather
-than guessed at, called out explicitly in the module's own SCOPE block
-rather than silently missing. See `modules/nixboot.nix`'s header.
+The **initrd console keymap** is real and evidenced from the same source
+audit `remoteUnlock.*` and `secureBoot.*` were ported from, but is not
+implemented in this repo at all yet — called out explicitly in the module's
+own SCOPE block rather than silently missing. See `modules/nixboot.nix`'s
+header.
 
-`extraEntries.*` (second, non-default UKIs on the same ESP) was the other
-deferred piece as of the previous revision of this page — it is now
-implemented in `modules/extra-entries.nix`. See the next question.
+The initrd-time **LUKS/ZFS unlock-member** surface (opening the disks that
+back the root/data filesystems, in stage 1) is NOT this module's job at
+all, and never will be — nixboot has no member list of its own to attach
+that mechanism to (see `remoteUnlock`'s own "CROSS-MODULE COUPLING" comment
+in `modules/nixboot.nix`). That mechanism now lives in
+[nixluks](https://github.com/julian-corbet/nixluks-corbet-ch)'s
+`volumes.<name>.initrdUnlock.*` — a previous revision of this page listed
+it as a nixboot gap; it was actually a gap between two repos each pointing
+at the other, now closed on nixluks's side.
+
+`extraEntries.*` (second, non-default UKIs on the same ESP) and
+`remoteUnlock.*` (headless in-initrd SSH, sealed or plaintext host key) were
+the other deferred pieces as of earlier revisions of this page — both are
+now implemented, in `modules/extra-entries.nix` and `modules/nixboot.nix`
+respectively. See the next question, and CONTRACT.md's B21–B24.
 
 ## What is `nixboot.extraEntries`, and how is it different from a normal
 generation?

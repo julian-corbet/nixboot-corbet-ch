@@ -236,6 +236,108 @@ let
   # feeds a value into -- see that option's doc for why this is NOT
   # necessarily the same PCR set as the data-unlock policy.
   tpm2PcrsArg = lib.concatMapStringsSep "," toString ru.tpm2.pcrs;
+
+  # ── nixboot-enroll-sb: the operator-run firmware key enrollment ─────────
+  # Bound here, rather than inline at its `environment.systemPackages` call
+  # site, so it can ALSO be exposed as `system.build.nixbootEnrollSb` below --
+  # the same "expose the derivation, not just the installed binary" shape
+  # `extraEntries.nix` already uses for `system.build.extraEntryMaintainers`
+  # and `system.build.nixbootRegisterBootEntry`. nixnas's own source tool
+  # (`modules/boot/secureboot.nix`'s `enrollSb`) is exposed the identical way,
+  # as `system.build.sbEnroller` -- CI there builds it un-conditionally so a
+  # broken script fails the build, not a first real enrollment attempt. This
+  # closes the same gap here: without a `system.build.*` handle, nothing but
+  # a live host with `secureBoot.enrollTool.enable && secureBoot.enable` ever
+  # forces this derivation, so `nix flake check` alone could not catch a
+  # shellcheck regression in it the way it already does for extraEntries.
+  enrollSb =
+    let
+      # EVAL SAFETY, the same technique `extra-entries.nix`'s own `dbKeyDir`
+      # uses (see its comment): `secureBoot.pkiBundle` is legitimately `null`
+      # whenever `secureBoot.enable = false` (its type is `nullOr str`, no
+      # default), and this derivation is now built UNCONDITIONALLY (exposed
+      # as `system.build.nixbootEnrollSb` regardless of `secureBoot.enable`,
+      # so `nix flake check` forces + shellchecks it on every fixture, not
+      # just ones that turn Secure Boot on). Interpolating a `null` straight
+      # into a Nix string throws "cannot coerce null to a string" at
+      # DERIVATION-CONSTRUCTION time -- discovered by this task's own build
+      # of `checks/default.nix`'s `extraEntryMaintainerBuilds`, not assumed.
+      # A poison placeholder keeps construction eval-safe either way; the
+      # real enforcement stays the runtime `[ -z "$pki" ]` check below, which
+      # still fires exactly the same friendly message on a genuinely-unset
+      # bundle at a host that actually runs this tool.
+      pkiBundleArg =
+        if cfg.secureBoot.pkiBundle != null
+        then cfg.secureBoot.pkiBundle
+        else "";
+      # `opromPolicy` is resolved at NIX eval time (a plain enum string, never a
+      # shell-runtime variable) -- computed here as a Nix-level mapping, the exact
+      # pattern nixnas's own source tool uses (`modules/boot/secureboot.nix`'s
+      # `policyFlag`), rather than as a shell `case` branching on an
+      # already-known-at-build-time literal. A `case "${...}"` over a Nix
+      # constant is not just redundant, it is a genuine shellcheck finding
+      # (SC2194, "this word is constant") that this task's own build of
+      # `checks/default.nix`'s `extraEntryMaintainerBuilds` surfaced -- this
+      # derivation had never actually been BUILT (only referenced inside a
+      # `lib.optional` whose condition was false in every fixture) until this
+      # task exposed it unconditionally via `system.build.nixbootEnrollSb`.
+      opromFlag = {
+        "tpm-eventlog" = "--tpm-eventlog";
+        "microsoft" = "--microsoft";
+        "none" = "";
+      }.${cfg.secureBoot.opromPolicy};
+    in
+    pkgs.writeShellApplication {
+      name = "nixboot-enroll-sb";
+      runtimeInputs = [
+        pkgs.sbctl
+        pkgs.util-linux
+        pkgs.coreutils
+      ];
+      text = ''
+        set -euo pipefail
+
+        pki="${pkiBundleArg}"
+        if [ -z "$pki" ]; then
+          echo "nixboot-enroll-sb: nixboot.secureBoot.pkiBundle is not set." >&2
+          exit 1
+        fi
+
+        # Firmware must be in Setup Mode (PK cleared) before enrollment.
+        # SetupMode is efivarfs byte offset 4 -- bytes 0-3 are the
+        # variable's attributes flag, not part of the value.
+        setupmode_var="/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+        if [ ! -r "$setupmode_var" ]; then
+          echo "nixboot-enroll-sb: cannot read $setupmode_var -- not a UEFI system, or efivarfs is not mounted." >&2
+          exit 1
+        fi
+        setupmode="$(od -An -tu1 -j4 -N1 "$setupmode_var" | tr -d ' ')"
+        if [ "$setupmode" != "1" ]; then
+          echo "nixboot-enroll-sb: firmware is NOT in Setup Mode (SetupMode=$setupmode). Clear the platform key (PK) from the UEFI setup menu first, then re-run this." >&2
+          exit 1
+        fi
+
+        # sbctl needs a stable owner GUID; mint one into the bundle once
+        # so re-enrollment (e.g. after a key rotation) is idempotent.
+        if [ ! -s "$pki/GUID" ]; then
+          uuidgen > "$pki/GUID"
+        fi
+
+        # Stage the bundle where sbctl looks by default, independent of
+        # sbctlCompat's /etc/sbctl/sbctl.conf redirect -- this mirrors
+        # what nixnas's original enrollment script did and is the path
+        # actually exercised at enrollment time.
+        install -d -m 0700 /var/lib/sbctl
+        cp -a "$pki/keys" /var/lib/sbctl/keys
+        cp -a "$pki/GUID" /var/lib/sbctl/GUID
+
+        sbctl enroll-keys --disable-landlock ${opromFlag}
+
+        echo "nixboot-enroll-sb: enrollment complete."
+        echo "PCR 7 changes ONCE, right now -- any TPM-sealed secret (e.g. an initrd unlock key) sealed BEFORE this enrollment will need to be re-sealed AFTER it, or it will fail to unseal on the next boot."
+        echo "Some boards latch SetupMode=1 in the efivar until the next reboot even though enrollment succeeded -- trust sbctl's exit status above, not a lingering SetupMode=1."
+      '';
+    };
 in
 {
   options.nixboot = {
@@ -1015,6 +1117,47 @@ in
             assertion = !ru.enable || ru.authorizedKeys != [ ];
             message = "nixboot.remoteUnlock.enable is set but remoteUnlock.authorizedKeys is empty -- initrd sshd is key-only, so nothing could ever answer the unlock prompt over the network.";
           }
+          {
+            # THE GAP THIS CLOSES -- WIDER THAN IT FIRST LOOKS: it is tempting to
+            # scope this to the sealed path only (Path A's `LoadCredentialEncrypted`
+            # / credential-aware `preStart` / `boot.initrd.systemd.storePaths` do
+            # live entirely under `boot.initrd.systemd.services.*`, a tree nixpkgs'
+            # own systemd-initrd module only ever renders when
+            # `config.boot.initrd.systemd.enable = true` -- verified against that
+            # module's own `config = mkIf (config.boot.initrd.enable && cfg.enable)`
+            # gate). But the COMMON block both paths share (just below) ALSO writes
+            # `boot.initrd.systemd.network.enable = true` UNCONDITIONALLY, for
+            # EITHER path -- and that option's own module
+            # (nixos/modules/system/boot/resolved.nix) defaults
+            # `boot.initrd.services.resolved.enable` to
+            # `config.boot.initrd.systemd.network.enable`, which that same module
+            # then asserts CANNOT be true without systemd stage 1 ("'boot.initrd.
+            # services.resolved.enable' can only be enabled with systemd stage 1").
+            # So `remoteUnlock.enable = true` ALONE -- Path A or Path B, sealed or
+            # plaintext -- already fails to EVALUATE at all without
+            # `boot.initrd.systemd.enable`, a fact this repo's own eval-tests
+            # exposed (a first, narrower draft of this assertion that scoped only
+            # to Path A left Path B's own fixture failing for an unrelated,
+            # unasserted reason instead of a clear message). Refused HERE, with an
+            # honest explanation, rather than left for nixpkgs' own unrelated
+            # resolved.nix assertion to surface with no mention of remoteUnlock at
+            # all.
+            assertion = !ru.enable || config.boot.initrd.systemd.enable;
+            message = ''
+              nixboot.remoteUnlock.enable requires boot.initrd.systemd.enable = true. The
+              common NIC/DHCP wiring this feature shares between both host-key paths writes
+              boot.initrd.systemd.network.enable = true unconditionally, which nixpkgs' own
+              resolved.nix then refuses outside systemd stage 1 -- and the sealed host-key
+              path (sealHostKey = true, the default, with remoteUnlock.tpm2.enable = true)
+              separately needs it for its systemd CREDENTIAL delivery
+              (LoadCredentialEncrypted), which the classic (non-systemd) initrd builder
+              silently discards instead of erroring. Set boot.initrd.systemd.enable = true
+              (nixnas's own crypto.tpm2.enable does this as a side effect of ITS OWN LUKS
+              TPM2 unlock wiring, nixnas/modules/boot/image.nix:22-23 -- a host composing
+              nixboot without nixnas must set it directly), or set remoteUnlock.enable = false
+              if this host is unlocked over IPMI-SOL / a physical console instead.
+            '';
+          }
         ];
 
         warnings =
@@ -1125,11 +1268,13 @@ in
         # the SAME condition lanzaboote itself gates the unit's existence on
         # (`autoGenerateKeys.enable`, written just above) -- this override is inert, not merely
         # absent, on a "stable" host, since the unit itself does not exist there.
-        systemd.services.generate-sb-keys = lib.mkIf (
-          cfg.secureBoot.enable && cfg.secureBoot.keySource == "autogenerate"
-        ) {
-          serviceConfig.ExecStart = lib.mkForce "${pkgs.sbctl}/bin/sbctl create-keys --disable-landlock";
-        };
+        systemd.services.generate-sb-keys = lib.mkIf
+          (
+            cfg.secureBoot.enable && cfg.secureBoot.keySource == "autogenerate"
+          )
+          {
+            serviceConfig.ExecStart = lib.mkForce "${pkgs.sbctl}/bin/sbctl create-keys --disable-landlock";
+          };
 
         # boot.initrd.systemd.enable is DELIBERATELY NOT ported here, unlike the
         # console= wiring below. nixnas's own comment for it gives TWO reasons in
@@ -1204,67 +1349,15 @@ in
           lib.optional cfg.tools.sbctl.enable pkgs.sbctl
           ++ lib.optional cfg.tools.efitools.enable pkgs.efitools
           ++ lib.optional cfg.tools.sbsigntool.enable pkgs.sbsigntool
-          ++ lib.optional (cfg.secureBoot.enrollTool.enable && cfg.secureBoot.enable) (
-            pkgs.writeShellApplication {
-              name = "nixboot-enroll-sb";
-              runtimeInputs = [
-                pkgs.sbctl
-                pkgs.util-linux
-                pkgs.coreutils
-              ];
-              text = ''
-                set -euo pipefail
+          ++ lib.optional (cfg.secureBoot.enrollTool.enable && cfg.secureBoot.enable) enrollSb;
 
-                if [ -z "${cfg.secureBoot.pkiBundle}" ]; then
-                  echo "nixboot-enroll-sb: nixboot.secureBoot.pkiBundle is not set." >&2
-                  exit 1
-                fi
-                pki="${cfg.secureBoot.pkiBundle}"
-
-                # Firmware must be in Setup Mode (PK cleared) before enrollment.
-                # SetupMode is efivarfs byte offset 4 -- bytes 0-3 are the
-                # variable's attributes flag, not part of the value.
-                setupmode_var="/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
-                if [ ! -r "$setupmode_var" ]; then
-                  echo "nixboot-enroll-sb: cannot read $setupmode_var -- not a UEFI system, or efivarfs is not mounted." >&2
-                  exit 1
-                fi
-                setupmode="$(od -An -tu1 -j4 -N1 "$setupmode_var" | tr -d ' ')"
-                if [ "$setupmode" != "1" ]; then
-                  echo "nixboot-enroll-sb: firmware is NOT in Setup Mode (SetupMode=$setupmode). Clear the platform key (PK) from the UEFI setup menu first, then re-run this." >&2
-                  exit 1
-                fi
-
-                # sbctl needs a stable owner GUID; mint one into the bundle once
-                # so re-enrollment (e.g. after a key rotation) is idempotent.
-                if [ ! -s "$pki/GUID" ]; then
-                  uuidgen > "$pki/GUID"
-                fi
-
-                # Stage the bundle where sbctl looks by default, independent of
-                # sbctlCompat's /etc/sbctl/sbctl.conf redirect -- this mirrors
-                # what nixnas's original enrollment script did and is the path
-                # actually exercised at enrollment time.
-                install -d -m 0700 /var/lib/sbctl
-                cp -a "$pki/keys" /var/lib/sbctl/keys
-                cp -a "$pki/GUID" /var/lib/sbctl/GUID
-
-                oprom_flag=""
-                case "${cfg.secureBoot.opromPolicy}" in
-                  tpm-eventlog) oprom_flag="--tpm-eventlog" ;;
-                  microsoft)    oprom_flag="--microsoft" ;;
-                  none)         oprom_flag="" ;;
-                esac
-
-                # shellcheck disable=SC2086
-                sbctl enroll-keys --disable-landlock $oprom_flag
-
-                echo "nixboot-enroll-sb: enrollment complete."
-                echo "PCR 7 changes ONCE, right now -- any TPM-sealed secret (e.g. an initrd unlock key) sealed BEFORE this enrollment will need to be re-sealed AFTER it, or it will fail to unseal on the next boot."
-                echo "Some boards latch SetupMode=1 in the efivar until the next reboot even though enrollment succeeded -- trust sbctl's exit status above, not a lingering SetupMode=1."
-              '';
-            }
-          );
+        # Exposed unconditionally (like `system.build.extraEntryMaintainers` /
+        # `nixbootRegisterBootEntry` above) so `nix flake check` forces and
+        # shellchecks this derivation even on a host, or a check fixture, that
+        # never turns on `secureBoot.enrollTool.enable && secureBoot.enable` --
+        # see the `enrollSb` binding's own comment for why this closes a real
+        # coverage gap nixnas's own `system.build.sbEnroller` already avoided.
+        system.build.nixbootEnrollSb = enrollSb;
 
         systemd.services.nixboot-verify = lib.mkIf cfg.verify.enable {
           description = "nixboot: read every managed boot knob back and report what actually took";
