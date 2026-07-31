@@ -174,13 +174,10 @@ let
   espProjectedMiB = cfg.generations.keep + (2 * 50);
 
   ## ── Remote unlock (initrd SSH) plumbing ─────────────────────────────────
-  ## Ported from the nixnas appliance distribution
-  ## (nixnas/modules/boot/remote-unlock.nix -- public FOSS, so that
-  ## repo's own path:line citations stay valid and are kept below).
   ## `ru` short-hands `cfg.remoteUnlock` the same way `cfg` short-hands
-  ## `config.nixboot` above -- both are read lazily, so binding
-  ## them here ahead of the options section they describe is the same
-  ## pattern `espProjectedMiB` already uses for `cfg.generations.keep`.
+  ## `config.nixboot` above -- both are read lazily, so binding them here
+  ## ahead of the options section they describe is the same pattern
+  ## `espProjectedMiB` already uses for `cfg.generations.keep`.
   ru = cfg.remoteUnlock;
 
   # Whether the TPM2-sealed-credential path (Path A) is actually active.
@@ -242,14 +239,10 @@ let
   # site, so it can ALSO be exposed as `system.build.nixbootEnrollSb` below --
   # the same "expose the derivation, not just the installed binary" shape
   # `extraEntries.nix` already uses for `system.build.extraEntryMaintainers`
-  # and `system.build.nixbootRegisterBootEntry`. nixnas's own source tool
-  # (`modules/boot/secureboot.nix`'s `enrollSb`) is exposed the identical way,
-  # as `system.build.sbEnroller` -- CI there builds it un-conditionally so a
-  # broken script fails the build, not a first real enrollment attempt. This
-  # closes the same gap here: without a `system.build.*` handle, nothing but
-  # a live host with `secureBoot.enrollTool.enable && secureBoot.enable` ever
-  # forces this derivation, so `nix flake check` alone could not catch a
-  # shellcheck regression in it the way it already does for extraEntries.
+  # and `system.build.nixbootRegisterBootEntry`. Without a `system.build.*`
+  # handle, nothing but a live host with `secureBoot.enrollTool.enable &&
+  # secureBoot.enable` ever forces this derivation, so `nix flake check`
+  # alone could not catch a shellcheck regression in it.
   enrollSb =
     let
       # EVAL SAFETY, the same technique `extra-entries.nix`'s own `dbKeyDir`
@@ -260,8 +253,7 @@ let
       # so `nix flake check` forces + shellchecks it on every fixture, not
       # just ones that turn Secure Boot on). Interpolating a `null` straight
       # into a Nix string throws "cannot coerce null to a string" at
-      # DERIVATION-CONSTRUCTION time -- discovered by this task's own build
-      # of `checks/default.nix`'s `extraEntryMaintainerBuilds`, not assumed.
+      # DERIVATION-CONSTRUCTION time, not merely at runtime.
       # A poison placeholder keeps construction eval-safe either way; the
       # real enforcement stays the runtime `[ -z "$pki" ]` check below, which
       # still fires exactly the same friendly message on a genuinely-unset
@@ -271,16 +263,10 @@ let
         then cfg.secureBoot.pkiBundle
         else "";
       # `opromPolicy` is resolved at NIX eval time (a plain enum string, never a
-      # shell-runtime variable) -- computed here as a Nix-level mapping, the exact
-      # pattern nixnas's own source tool uses (`modules/boot/secureboot.nix`'s
-      # `policyFlag`), rather than as a shell `case` branching on an
-      # already-known-at-build-time literal. A `case "${...}"` over a Nix
-      # constant is not just redundant, it is a genuine shellcheck finding
-      # (SC2194, "this word is constant") that this task's own build of
-      # `checks/default.nix`'s `extraEntryMaintainerBuilds` surfaced -- this
-      # derivation had never actually been BUILT (only referenced inside a
-      # `lib.optional` whose condition was false in every fixture) until this
-      # task exposed it unconditionally via `system.build.nixbootEnrollSb`.
+      # shell-runtime variable) -- computed here as a Nix-level mapping rather
+      # than as a shell `case` branching on an already-known-at-build-time
+      # literal. A `case "${...}"` over a Nix constant is not just redundant,
+      # it is a genuine shellcheck finding (SC2194, "this word is constant").
       opromFlag = {
         "tpm-eventlog" = "--tpm-eventlog";
         "microsoft" = "--microsoft";
@@ -303,12 +289,11 @@ let
           exit 1
         fi
 
-        # Readability check BEFORE touching firmware state, with a guided message -- ported
-        # from the nixnas appliance's own enrollment tool (the sole consumer this was first
-        # written for) after its cutover onto this one: a bundle path that resolves but whose
-        # key material was never actually staged (a fresh keydir before generate-sb-keys /
-        # the TUI's own staging step has run) previously reached `sbctl enroll-keys` and
-        # failed with a raw, unexplained sbctl error instead of naming the real cause.
+        # Readability check BEFORE touching firmware state, with a guided message: a bundle
+        # path that resolves but whose key material was never actually staged (a fresh keydir
+        # before generate-sb-keys / the TUI's own staging step has run) otherwise reaches
+        # `sbctl enroll-keys` and fails with a raw, unexplained sbctl error instead of naming
+        # the real cause.
         if [ ! -r "$pki/keys/db/db.key" ]; then
           echo "nixboot-enroll-sb: no Secure Boot key material at $pki/keys/db/db.key." >&2
           echo "  A stable-keyed host stages its PKI bundle onto this path BEFORE first boot" >&2
@@ -519,29 +504,23 @@ in
           leave `boot.kernelParams`'s console= entries to whatever else (or
           nothing) sets them.
 
-          Ported from nixnas's `nixnas.boot.consolePrimary`
-          (nixnas/modules/options.nix:51-76), which documents the ordering
-          rule this option exists to apply: BOTH consoles always stay on the
-          command line -- "This option only decides which one is
-          `/dev/console`" (nixnas/modules/options.nix:73-74). Dropping a
-          console= entry to demote it, instead of reordering, would silence
-          that console's kernel log, getty, and password-agent prompt
-          EVERYWHERE, not just stop it from being primary -- this option
-          only ever reorders, never drops (see the config-side comment
-          where the list is built).
+          Dropping a console= entry to demote it, instead of reordering,
+          would silence that console's kernel log, getty, and
+          password-agent prompt EVERYWHERE, not just stop it from being
+          primary -- this option only ever reorders, never drops (see the
+          config-side comment where the list is built).
 
             "video": `tty0` last -- the attached DISPLAY is `/dev/console`.
               Boot status messages, the emergency shell, and any
               interactive prompt (e.g. a LUKS passphrase, if the host's own
               crypto config wires one into the initrd) land on the monitor.
               Right for a human at the machine with a monitor + keyboard and
-              no IPMI (nixnas/modules/options.nix:58-63).
+              no IPMI.
 
             "serial": console.serialDevice last -- the SERIAL port is
               `/dev/console`. For headless boxes administered over
               IPMI-SOL/BMC serial, and for a QEMU CI suite that observes the
-              VM only through the serial port
-              (nixnas/modules/boot/image.nix:37-38).
+              VM only through the serial port.
 
           Left nullable rather than given a default (unlike nixnas, which
           always defaults to "video"): nixboot targets hosts generically,
@@ -563,8 +542,7 @@ in
           Which serial tty device is the "serial" half of console.primary's
           `console=` pair? Only read when console.primary != null. Default
           `ttyS0` is the first legacy UART -- what IPMI-SOL/BMC serial
-          redirection and QEMU's `-serial` both present by default
-          (nixnas/modules/boot/image.nix:43-50, same default).
+          redirection and QEMU's `-serial` both present by default.
         '';
       };
 
@@ -573,12 +551,10 @@ in
         default = 115200;
         description = ''
           Baud rate for console.serialDevice. Only read when console.primary
-          != null. Default 115200 matches nixnas's own choice, made for the
-          same reason: "Keep 115200 (the SOL/BMC and QEMU default rate)"
-          (nixnas/modules/boot/image.nix:42). Changing it without also
-          changing the far end (BMC config, `qemu -serial`, a physical
-          null-modem's own setting) turns the console into line noise, not a
-          slower prompt.
+          != null. Default 115200 is the SOL/BMC and QEMU default rate.
+          Changing it without also changing the far end (BMC config,
+          `qemu -serial`, a physical null-modem's own setting) turns the
+          console into line noise, not a slower prompt.
         '';
       };
     };
@@ -672,12 +648,6 @@ in
           stage-1 boot hangs waiting for a root device it can never see,
           since only what THIS list names ships in the initrd (the full
           stage-2 module tree is not available yet).
-
-          Ported from one appliance distribution's own
-          `boot.initrd.availableKernelModules` USB-controller entries
-          (nixnas/modules/boot/image.nix:52-59), which lived inline in
-          that host's boot glue with no reuse path for any other host that
-          also boots off a stick.
 
           DELIBERATELY INDEPENDENT of `loader.efiVariables`: a stick can
           rely on the removable-media EFI fallback path while the initrd
@@ -814,12 +784,9 @@ in
     };
 
     ## ── Remote unlock (initrd SSH for a headless in-initrd secret prompt) ──
-    ## Ported from the nixnas appliance distribution
-    ## (nixnas/modules/boot/remote-unlock.nix, nixnas/modules/options.nix:
-    ## 123-160 -- nixnas is itself public FOSS, so those path:line
-    ## citations below stay valid and are kept as-is). nixnas hangs this
-    ## off its own `crypto.tpm2.enable`; nixboot has no such option of its
-    ## own -- see remoteUnlock.tpm2.* for how the boundary is drawn.
+    ## nixnas hangs this off its own `crypto.tpm2.enable`; nixboot has no
+    ## such option of its own -- see remoteUnlock.tpm2.* for how the
+    ## boundary is drawn.
     remoteUnlock = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -836,8 +803,6 @@ in
           know a given host even blocks on an initrd secret in the first
           place. Where IPMI-SOL or a physical console covers the unlock
           instead, leave this off.
-          (nixnas/modules/boot/remote-unlock.nix:1-7, 132-148;
-          nixnas/modules/options.nix:124-135.)
         '';
       };
 
@@ -853,10 +818,9 @@ in
           nixboot alongside their own `services.openssh` /
           `users.users.root.openssh.authorizedKeys` is responsible for
           keeping the two lists in sync BY HAND, if that is even the
-          intent (nixnas instead reuses ONE list,
-          `nixnas.admin.authorizedKeys`, for both --
-          nixnas/modules/options.nix:541-552 -- because nixnas, unlike
-          nixboot, already owns that whole admin surface). Initrd sshd is
+          intent (nixnas instead reuses ONE list, `nixnas.admin.authorizedKeys`,
+          for both, because nixnas, unlike nixboot, already owns that whole
+          admin surface). Initrd sshd is
           key-only; leaving this empty while `remoteUnlock.enable = true`
           means literally nothing can ever answer the prompt over the
           network, asserted below.
@@ -894,8 +858,6 @@ in
 
           Set false to use a fixed plaintext key at `hostKeyPath`
           (LAN/tailnet-only: it lands on the plaintext ESP).
-          (nixnas/modules/boot/remote-unlock.nix:9-52, 114-128;
-          nixnas/modules/options.nix:136-150.)
         '';
       };
 
@@ -911,8 +873,6 @@ in
           unsigned) UKI, hence LAN/tailnet-only: anyone who reads the ESP
           reads this key. Ignored while `sealHostKey = true` (the
           default).
-          (nixnas/modules/boot/remote-unlock.nix:9-10, 49-52, 59-66,
-          157-165.)
         '';
       };
 
@@ -928,10 +888,8 @@ in
             sealing the initrd-SSH host key? nixboot does NOT own TPM2
             configuration -- the real enable/pcrs/device policy for the
             DATA unlock is a disk-layout+crypto concern that stays with
-            whoever declares it (in the configuration this module was ported
-            from, nixnas's `crypto.tpm2.enable`,
-            nixnas/modules/options.nix:285). This option exists ONLY so
-            `sealHostKey` has something honest to read instead of
+            whoever declares it (e.g. nixnas's `crypto.tpm2.enable`). This
+            option exists ONLY so `sealHostKey` has something honest to read instead of
             inventing its own TPM2 detection: set it to the SAME value as
             that real policy's own enable flag. This is the boundary the
             header SCOPE note promises -- nixboot READS a TPM2
@@ -946,11 +904,9 @@ in
             happen to share one physical chip: the host key uses
             `--with-key=auto-initrd` (TPM2-only key derivation, no PIN,
             because the initrd has no `/var` credential secret to combine
-            it with -- nixnas/modules/boot/remote-unlock.nix:311-312),
-            while the data keyslot may additionally require a PIN every
-            boot (`crypto.tpm2.requirePin`,
-            nixnas/modules/options.nix:286-297). Do not assume enabling
-            one says anything about the PIN policy of the other.
+            it with), while the data keyslot may additionally require a
+            PIN every boot (`crypto.tpm2.requirePin`). Do not assume
+            enabling one says anything about the PIN policy of the other.
           '';
         };
 
@@ -975,13 +931,11 @@ in
             still holds for whatever set you pick.
 
             This is a SEPARATE seal from any TPM2 policy guarding the
-            DATA unlock (nixnas's `crypto.tpm2.pcrs`,
-            nixnas/modules/options.nix:298-310, also defaults `[ 7 ]` but
-            is independently configurable there) -- nixnas itself never
+            DATA unlock (nixnas's `crypto.tpm2.pcrs`, also defaults `[ 7 ]`
+            but is independently configurable there) -- nixnas itself never
             reads that option for the host-key seal either, it hardcodes
-            `--tpm2-pcrs=7` (nixnas/modules/boot/remote-unlock.nix:319).
-            The two seals are structurally decoupled (a systemd credential
-            vs. a LUKS keyslot) and nixboot does not assert they agree;
+            `--tpm2-pcrs=7`. The two seals are structurally decoupled (a
+            systemd credential vs. a LUKS keyslot) and nixboot does not assert they agree;
             whatever composes nixboot alongside a real TPM2-backed data
             unlock is responsible for deciding whether they SHOULD.
           '';
@@ -1100,9 +1054,8 @@ in
             message = "nixboot.loader.consoleMode / .graceful / .selfHeal are systemd-boot/lanzaboote-only (they write boot.loader.systemd-boot.* or hardcode bootctl) but loader.program = \"${cfg.loader.program}\". Drop whichever of consoleMode/graceful/selfHeal is set, or switch loader.program to \"systemd-boot\" or \"lanzaboote\".";
           }
           {
-            # Mirrors nixnas/modules/boot/remote-unlock.nix:97-113's first
-            # assertion: enabling the surface with NEITHER a working seal path
-            # NOR a plaintext fallback leaves the initrd with no host key at
+            # Enabling the surface with NEITHER a working seal path NOR a
+            # plaintext fallback leaves the initrd with no host key at
             # all, not a graceful default -- sshd would come up keyless and
             # loop-crash ("no hostkeys available").
             assertion = !ru.enable || sealActive || ru.hostKeyPath != null;
@@ -1128,7 +1081,6 @@ in
             # EVERY boot (not just the first) would instead serve a fresh
             # ephemeral key with a bogus "first boot" banner. Fail the build
             # instead of shipping a permanently-unpinnable unlock channel.
-            # (nixnas/modules/boot/remote-unlock.nix:114-129, same reasoning.)
             assertion = !sealActive || cfg.secureBoot.enable;
             message = ''
               nixboot.remoteUnlock.sealHostKey = true (the default) with remoteUnlock.tpm2.enable
@@ -1181,9 +1133,9 @@ in
               separately needs it for its systemd CREDENTIAL delivery
               (LoadCredentialEncrypted), which the classic (non-systemd) initrd builder
               silently discards instead of erroring. Set boot.initrd.systemd.enable = true
-              (nixnas's own crypto.tpm2.enable does this as a side effect of ITS OWN LUKS
-              TPM2 unlock wiring, nixnas/modules/boot/image.nix:22-23 -- a host composing
-              nixboot without nixnas must set it directly), or set remoteUnlock.enable = false
+              (nixnas's own boot glue does this as a side effect of its LUKS TPM2 unlock
+              wiring -- a host composing nixboot without nixnas must set it directly), or
+              set remoteUnlock.enable = false
               if this host is unlocked over IPMI-SOL / a physical console instead.
             '';
           }
@@ -1274,10 +1226,7 @@ in
         # default that all agreed with each other and NONE of which lanzaboote itself ever read --
         # `secureBoot.enable = true` would build, boot, and PRODUCE UKIs, just never verify them
         # against the keys the rest of this module thought were in charge. `keySource` had the same
-        # problem: declared, described in prose, never once read. Ported from nixnas's own
-        # `modules/boot/secureboot.nix` (`provideStableKeys = cfg.boot.secureBoot.keysSops != null`
-        # there; `keySource` here is the same DECISION restated as an explicit enum rather than an
-        # implicit "is a key file set" inference -- see `keySource`'s own option doc).
+        # problem: declared, described in prose, never once read -- see `keySource`'s own option doc.
         boot.lanzaboote.pkiBundle = lib.mkIf cfg.secureBoot.enable (
           lib.mkOverride 500 cfg.secureBoot.pkiBundle
         );
@@ -1286,7 +1235,7 @@ in
         );
 
         # ── generate-sb-keys landlock/ENOENT workaround (autogenerate path only) ──
-        # CONFIRMED BY DIRECT REPRODUCTION on the source host (nixnas/modules/boot/secureboot.nix):
+        # CONFIRMED BY DIRECT REPRODUCTION on the source host:
         # lanzaboote's `generate-sb-keys.service` runs plain `sbctl create-keys` with its landlock
         # sandbox left on. `sbctl create-keys` adds a Landlock RWDirs rule for the GRANDPARENT of
         # `keydir` (`dirname(pkiBundle)`) WITHOUT `IgnoreIfMissing()`. On a genuine first boot that
@@ -1305,30 +1254,26 @@ in
             serviceConfig.ExecStart = lib.mkForce "${pkgs.sbctl}/bin/sbctl create-keys --disable-landlock";
           };
 
-        # boot.initrd.systemd.enable is DELIBERATELY NOT ported here, unlike the
-        # console= wiring below. nixnas's own comment for it gives TWO reasons in
-        # one line: "systemd in the initrd -- the supported path for the
-        # TPM2-LUKS unlock + lanzaboote" (nixnas/modules/boot/image.nix:22-23).
-        # The first reason -- TPM2-LUKS unlock -- is squarely the disk-layout/
-        # crypto appliance identity this module's SCOPE note at the top already
-        # excludes from this first cut ("LUKS members, ZFS pool import, the
-        # store/hot vs store/usb split ... NOT implemented in this first cut").
-        # nixboot already owns and writes the two lanzaboote options that matter
-        # to IT (enable, bootCounting.initialTries) without needing an opinion on
-        # stage-1's init system for the second reason to hold on its own -- if a
-        # host's own crypto/appliance config needs systemd in the initrd (as
-        # nixnas's does), that host sets `boot.initrd.systemd.enable` itself, the
-        # same way it will declare its own LUKS members itself. Judged appliance
-        # identity, not generic boot-chain wiring; left out.
+        # boot.initrd.systemd.enable is DELIBERATELY NOT owned here, unlike the
+        # console= wiring below, for two reasons: it is the supported path for
+        # TPM2-LUKS unlock, which is squarely the disk-layout/crypto appliance
+        # identity this module's SCOPE note at the top already excludes from
+        # this first cut ("LUKS members, ZFS pool import, the store/hot vs
+        # store/usb split ... NOT implemented in this first cut"); and nixboot
+        # already owns and writes the two lanzaboote options that matter to IT
+        # (enable, bootCounting.initialTries) without needing an opinion on
+        # stage-1's init system otherwise -- if a host's own crypto/appliance
+        # config needs systemd in the initrd (as nixnas's does), that host sets
+        # `boot.initrd.systemd.enable` itself, the same way it will declare its
+        # own LUKS members itself. Judged appliance identity, not generic
+        # boot-chain wiring; left out.
 
         # Console ordering: reorder, never drop. Both console= parameters are
-        # ALWAYS present when console.primary is managed -- carries nixnas's own
-        # invariant forward verbatim in spirit (nixnas/modules/boot/image.nix:
-        # 40-42: "INVARIANT: reorder, never drop. Removing console=ttyS0 would
-        # silence the serial LUKS prompt and the serial getty everywhere --
-        # headless boxes and the entire CI suite at once."). Only the LAST
-        # console= becomes /dev/console -- see console.primary's own description
-        # for the full reasoning.
+        # ALWAYS present when console.primary is managed -- removing
+        # console=ttyS0 would silence the serial LUKS prompt and the serial
+        # getty everywhere, headless boxes and the entire CI suite at once.
+        # Only the LAST console= becomes /dev/console -- see console.primary's
+        # own description for the full reasoning.
         #
         # PLAIN priority here -- DELIBERATELY NOT `mkOverride 500`, unlike every
         # `boot.loader.*` write in this file (see the priority-discipline note at
@@ -1928,7 +1873,6 @@ in
         # RE-SEALS in stage 2 so the NEXT boot's initrd-SSH comes up clean.
         # The intentional anti-downgrade semantics stay UNCHANGED: still no
         # ephemeral fallback for a credential that WAS delivered.
-        # (nixnas/modules/boot/remote-unlock.nix:199-210, same incident.)
         boot.initrd.systemd.services.sshd.serviceConfig.Restart = lib.mkForce "no";
 
         # make-initrd-ng copies listed objects + ELF library deps only -- it
@@ -2002,8 +1946,6 @@ in
         # bootloader and does NOT re-extend it between stage 1 and stage 2, so
         # a stage-2 decrypt success here GUARANTEES the stage-1 initrd-sshd
         # unseal succeeds next boot.
-        # (nixnas/modules/boot/remote-unlock.nix:251-340, same design and the
-        # same incident; PCR-extension-timing correctness claim unchanged.)
         systemd.services.nixboot-seal-hostkey = {
           description = "nixboot: generate + TPM2-seal the initrd SSH host key credential (self-healing across PCR changes)";
           wantedBy = [ "multi-user.target" ];

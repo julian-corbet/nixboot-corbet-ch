@@ -197,11 +197,10 @@ let
   };
 
   # ── remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set ──────
-  # boot.initrd.systemd.enable = true is REQUIRED here (see the new assertion this task
-  # added): the sealed path (Path A) writes entirely into boot.initrd.systemd.services.*,
-  # which the classic initrd builder never renders. A representative valid sealed-path host
-  # sets it, exactly as nixnas's own crypto.tpm2.enable does as a side effect
-  # (nixnas/modules/boot/image.nix:22-23).
+  # boot.initrd.systemd.enable = true is REQUIRED here: the sealed path (Path A) writes
+  # entirely into boot.initrd.systemd.services.*, which the classic initrd builder never
+  # renders. A representative valid sealed-path host sets it, exactly as nixnas's own
+  # boot glue does as a side effect of its LUKS TPM2 unlock wiring.
   cfg-remoteunlock-tpm2 = evalFor {
     nixboot.remoteUnlock.enable = true;
     nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
@@ -572,10 +571,7 @@ let
     # --- remoteUnlock (either host-key path) requires boot.initrd.systemd.enable, proved
     # both ways: the common NIC/DHCP block both paths share writes
     # boot.initrd.systemd.network.enable = true unconditionally, which nixpkgs' own
-    # resolved.nix then refuses outside systemd stage 1 (this was discovered by testing
-    # a first, narrower draft of this assertion that scoped only to the sealed path --
-    # the plaintext-path fixture below failed too, just for an unrelated, unasserted
-    # nixpkgs error instead of an actionable nixboot one) ------------------------------
+    # resolved.nix then refuses outside systemd stage 1 -----------------------------
     (check "remoteunlock/sealed-without-systemd-initrd/eval-fails"
       (evalFailsBuild {
         nixboot.remoteUnlock.enable = true;
@@ -793,9 +789,8 @@ let
   # never runs `writeShellApplication`'s own shellcheck pass. Referencing
   # these two derivations by string interpolation below forces Nix to
   # actually BUILD both branches `mkExtraEntryMaintainer` can generate
-  # (unsigned, and signed-with-bootEntry) -- exactly the class of bug the
-  # signing pipeline's own SC1003 finding (fixed during this work) would
-  # otherwise have slipped through silently.
+  # (unsigned, and signed-with-bootEntry) -- exactly the class of shellcheck
+  # regression that would otherwise slip through silently.
   extraEntryMaintainerBuilds =
     let
       unsigned = cfg-none-unsigned.system.build.extraEntryMaintainers.rescue;
