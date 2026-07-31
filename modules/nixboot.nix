@@ -303,6 +303,22 @@ let
           exit 1
         fi
 
+        # Readability check BEFORE touching firmware state, with a guided message -- ported
+        # from the nixnas appliance's own enrollment tool (the sole consumer this was first
+        # written for) after its cutover onto this one: a bundle path that resolves but whose
+        # key material was never actually staged (a fresh keydir before generate-sb-keys /
+        # the TUI's own staging step has run) previously reached `sbctl enroll-keys` and
+        # failed with a raw, unexplained sbctl error instead of naming the real cause.
+        if [ ! -r "$pki/keys/db/db.key" ]; then
+          echo "nixboot-enroll-sb: no Secure Boot key material at $pki/keys/db/db.key." >&2
+          echo "  A stable-keyed host stages its PKI bundle onto this path BEFORE first boot" >&2
+          echo "  (e.g. a build-machine step materialising sops-encrypted keys); an" >&2
+          echo "  autogenerate host's own generate-sb-keys.service creates it on first boot" >&2
+          echo "  instead -- if that unit exists and has not run yet, this is expected until" >&2
+          echo "  it does. Either way, there is nothing to enroll yet." >&2
+          exit 1
+        fi
+
         # Firmware must be in Setup Mode (PK cleared) before enrollment.
         # SetupMode is efivarfs byte offset 4 -- bytes 0-3 are the
         # variable's attributes flag, not part of the value.
@@ -311,9 +327,9 @@ let
           echo "nixboot-enroll-sb: cannot read $setupmode_var -- not a UEFI system, or efivarfs is not mounted." >&2
           exit 1
         fi
-        setupmode="$(od -An -tu1 -j4 -N1 "$setupmode_var" | tr -d ' ')"
-        if [ "$setupmode" != "1" ]; then
-          echo "nixboot-enroll-sb: firmware is NOT in Setup Mode (SetupMode=$setupmode). Clear the platform key (PK) from the UEFI setup menu first, then re-run this." >&2
+        setupmode() { od -An -tu1 -j4 -N1 "$setupmode_var" | tr -d '[:space:]'; }
+        if [ "$(setupmode)" != "1" ]; then
+          echo "nixboot-enroll-sb: firmware is NOT in Setup Mode (SetupMode=$(setupmode)). Clear the platform key (PK) from the UEFI setup menu first, then re-run this." >&2
           exit 1
         fi
 
@@ -333,9 +349,22 @@ let
 
         sbctl enroll-keys --disable-landlock ${opromFlag}
 
+        # VERIFY, don't just hope: re-read SetupMode after enrollment and say what firmware
+        # actually reports, rather than a static "you're done" regardless of outcome. Ported
+        # from the nixnas appliance's own tool (field-proven 2026-07-04 caveat): many boards
+        # keep REPORTING SetupMode=1 until the NEXT reboot even after a successful enrollment
+        # -- the efivar is latched. That is a note, not a failure; sbctl's own exit status
+        # above already aborted this script on a real failure.
+        if [ "$(setupmode)" = "0" ]; then
+          echo "nixboot-enroll-sb: firmware left Setup Mode -- keys are live."
+        else
+          echo "nixboot-enroll-sb: NOTE: SetupMode still reads 1. Many boards latch the reported value until the next reboot (field-proven); sbctl succeeded above, so proceed."
+        fi
+
         echo "nixboot-enroll-sb: enrollment complete."
         echo "PCR 7 changes ONCE, right now -- any TPM-sealed secret (e.g. an initrd unlock key) sealed BEFORE this enrollment will need to be re-sealed AFTER it, or it will fail to unseal on the next boot."
         echo "Some boards latch SetupMode=1 in the efivar until the next reboot even though enrollment succeeded -- trust sbctl's exit status above, not a lingering SetupMode=1."
+        echo "Next: reboot; verify with \`bootctl status\` (expect \"Secure Boot: enabled (user)\"); then set the firmware ADMIN PASSWORD -- without it, an evil maid can simply re-enter Setup Mode and swap the keys, undoing all of this."
       '';
     };
 in
@@ -1299,21 +1328,45 @@ in
         # silence the serial LUKS prompt and the serial getty everywhere --
         # headless boxes and the entire CI suite at once."). Only the LAST
         # console= becomes /dev/console -- see console.primary's own description
-        # for the full reasoning. mkOverride 500, never mkForce: see the
-        # priority-discipline note at the top of this file.
+        # for the full reasoning.
+        #
+        # PLAIN priority here -- DELIBERATELY NOT `mkOverride 500`, unlike every
+        # `boot.loader.*` write in this file (see the priority-discipline note at
+        # the top). THE GAP THIS CLOSES (found consuming this module on a real,
+        # otherwise-ordinary host): `boot.kernelParams` is a LIST-typed option,
+        # and NixOS's module system does not "concatenate regardless of
+        # priority" the way the top-of-file note's `boot.loader.*` reasoning
+        # assumes -- it picks ONE winning priority TIER for the option and
+        # merges only THAT tier's contributions, discarding every other tier
+        # WHOLESALE. `boot.loader.*` options are each a single SCALAR value, so
+        # `mkOverride 500` beating a profile's `mkDefault` (1000) while losing
+        # to a host's own plain `=` (100) is exactly "the more specific
+        # definition wins, cleanly" -- there is only ever one winning value
+        # either way. `boot.kernelParams` is different in kind: on any
+        # non-trivial host MULTIPLE unrelated modules each contribute their OWN
+        # plain-priority (100) kernel parameters that all need to coexist
+        # (kernel/security/power-management defaults, a board-specific
+        # `video=` fix, etc.) -- confirmed live: a host with nothing more exotic
+        # than its own plain `boot.kernelParams = [ "video=..." ];` line
+        # silently lost EVERY console= entry this module tried to add, because
+        # that plain-100 tier out-ranked (and therefore fully excluded) this
+        # write's `mkOverride 500` tier -- nixboot-verify's own Check 7 below
+        # exists specifically to catch this class of loss at runtime, but the
+        # right fix is to not manufacture the conflict in the first place. Once
+        # this is plain (100, the same tier basically everything else already
+        # uses for this option), it CONCATENATES with every sibling
+        # contributor instead of racing them for a tier that usually loses.
         boot.kernelParams = lib.mkIf (cfg.console.primary != null) (
-          lib.mkOverride 500 (
-            if cfg.console.primary == "serial" then
-              [
-                "console=tty0"
-                "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
-              ]
-            else
-              [
-                "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
-                "console=tty0"
-              ]
-          )
+          if cfg.console.primary == "serial" then
+            [
+              "console=tty0"
+              "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
+            ]
+          else
+            [
+              "console=${cfg.console.serialDevice},${toString cfg.console.serialBaud}"
+              "console=tty0"
+            ]
         );
 
         systemd.services.nixboot-self-heal = lib.mkIf cfg.loader.selfHeal {
@@ -1329,7 +1382,26 @@ in
           };
         };
 
-        environment.etc."sbctl/sbctl.conf" = lib.mkIf cfg.secureBoot.sbctlCompat {
+        # DELIBERATELY EXCLUDES the autogenerate keyset: lanzaboote's OWN module already
+        # writes this exact file whenever `boot.lanzaboote.autoGenerateKeys.enable` is true
+        # (`environment.etc."sbctl/sbctl.conf" = mkIf (cfg.autoGenerateKeys.enable ||
+        # cfg.autoEnrollKeys.enable) { source = sbctlConfigFile; }`, nix/modules/
+        # lanzaboote.nix) -- exactly the keyless host this option's own doc already names
+        # as the one class `sbctlCompat` is NOT for ("Fixes a live wart: lanzaboote only
+        # writes that file on KEYLESS (autogenerate) hosts... on a stable-keyed host sbctl
+        # status reports not-installed"). Before this exclusion, a host with BOTH
+        # `secureBoot.sbctlCompat = true` (the default) AND `secureBoot.keySource =
+        # "autogenerate"` had TWO real, same-priority definitions for the identical `/etc`
+        # file -- a genuine "The option ... has conflicting definition values" build failure
+        # discovered forcing `system.build.toplevel` (not merely `nix flake check`'s shallower
+        # NixOS-configuration check, which never instantiates the derivation strictly enough
+        # to hit it) the first time a real consumer actually turned `secureBoot.enable` on for
+        # a keyless/autogenerate host. `keySource != "autogenerate"` is the exact condition
+        # `autoGenerateKeys.enable` itself is derived from two writes above, so this can never
+        # drift out of sync with lanzaboote's own gate.
+        environment.etc."sbctl/sbctl.conf" = lib.mkIf
+          (cfg.secureBoot.sbctlCompat && cfg.secureBoot.keySource != "autogenerate")
+          {
           # NOTE: sbctl's config schema was not directly readable from the
           # evidence this module was written against -- only that lanzaboote
           # writes this file for keyless hosts and that its absence is what
@@ -1563,12 +1635,15 @@ in
             # to notice is an initrd prompt (or the emergency shell) landing on
             # the wrong physical port at the NEXT boot -- see console.primary's
             # own description. /proc/cmdline is read back from the RUNNING
-            # kernel, not from any config file, so this catches a plain-priority
-            # boot.kernelParams definition elsewhere beating this module's own
-            # mkOverride 500 just as surely as it catches a typo. Checks the
-            # LAST console= token specifically (not literally the end of the
-            # line -- other, non-console kernel params may follow it), because
-            # it is the last console= that the kernel makes /dev/console.
+            # kernel, not from any config file, so this catches a `mkForce`
+            # (or a same-tier but differently-ordered) boot.kernelParams
+            # definition elsewhere beating this module's own plain-priority
+            # write (see that write's own comment for why kernelParams stays
+            # plain rather than `mkOverride 500`) just as surely as it catches
+            # a typo. Checks the LAST console= token specifically (not
+            # literally the end of the line -- other, non-console kernel
+            # params may follow it), because it is the last console= that the
+            # kernel makes /dev/console.
             ${lib.optionalString (cfg.console.primary != null) (
               let
                 expectedLast =
@@ -1689,9 +1764,11 @@ in
         # unlock hand-off. Neither of these is a `boot.loader.*` write, so
         # the priority-discipline note at the top of this file (mkOverride
         # 500 for loader options) does not apply -- plain `=` is correct
-        # here the same way it already is for boot.kernelParams's sibling
-        # console.primary wiring above... except boot.kernelParams DOES use
-        # mkOverride 500 because a profile can set kernelParams too. Nothing
+        # here the same way it now is for boot.kernelParams's sibling
+        # console.primary wiring above (see that write's own comment: a
+        # LIST-typed option like kernelParams needs plain priority precisely
+        # so it concatenates with every other module's own contributions,
+        # rather than racing them for a tier that usually loses). Nothing
         # else in this module or a typical base profile sets
         # boot.initrd.network.* or boot.initrd.systemd.network.*, so plain
         # `=` is the honest priority here -- see the Restart override further
