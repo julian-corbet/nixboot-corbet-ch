@@ -87,6 +87,10 @@ let
 
   check = name: ok: detail: { inherit name ok detail; };
 
+  # Package derivations render to their store path's basename in a `path` list, not a
+  # human-readable name -- used only to make a failing check's `detail` line legible.
+  pathNames = cfg: map (p: p.pname or p.name or (builtins.toString p)) cfg.systemd.services.nixboot-verify.path;
+
   # ── Fixture 1: the minimal working case -- no primary chain owned at all. ──
   # loader.program = "none" is exactly nixrescue's own described scenario: an ESP nixboot
   # does not own, adding ONE unsigned entry.
@@ -304,6 +308,31 @@ let
         lib.hasInfix "intact EFI binary" cfg.systemd.services.nixboot-verify.script
       )
       "nixboot-verify script does not check foreign .efi paths for intactness, not just existence")
+
+    # --- nixboot-verify's OWN unit `path` must actually carry what its script resolves by bare
+    # name (2026-08-01 incident: findmnt was never on it, so Check 2 could not PASS on ANY
+    # consumer, ever -- it left zero trace anywhere, discovered only by hand on a live host).
+    # Reading `.systemd.services.nixboot-verify.path` back is a pure eval-time check (the SAME
+    # option NixOS actually renders Environment=PATH= from), so this catches the exact class of
+    # regression -- a check whose external dependency quietly falls off the unit's PATH -- before
+    # it ever reaches a real host, without needing a VM boot to prove it. util-linux (findmnt,
+    # Check 2) is unconditional, since Check 2 is never gated behind a tools.*.enable option;
+    # sbctl/sbsigntool (Checks 5/9) are asserted BOTH ways against the same tools.sbctl.enable /
+    # tools.sbsigntool.enable flags `environment.systemPackages` already gates them on above, so
+    # this also proves the two lists can't drift out of sync with each other again.
+    (check "verify-path-includes-util-linux-unconditionally"
+      (lib.elem pkgs.util-linux cfg-none-unsigned.systemd.services.nixboot-verify.path)
+      "nixboot-verify path: ${builtins.toJSON (pathNames cfg-none-unsigned)}")
+
+    (check "verify-path-excludes-sbctl-and-sbsigntool-when-secureBoot-disabled"
+      (!(lib.elem pkgs.sbctl cfg-none-unsigned.systemd.services.nixboot-verify.path)
+        && !(lib.elem pkgs.sbsigntool cfg-none-unsigned.systemd.services.nixboot-verify.path))
+      "nixboot-verify path: ${builtins.toJSON (pathNames cfg-none-unsigned)}")
+
+    (check "verify-path-includes-sbctl-and-sbsigntool-when-secureBoot-enabled"
+      (lib.elem pkgs.sbctl cfg-sb-stable.systemd.services.nixboot-verify.path
+        && lib.elem pkgs.sbsigntool cfg-sb-stable.systemd.services.nixboot-verify.path)
+      "nixboot-verify path: ${builtins.toJSON (pathNames cfg-sb-stable)}")
 
     # --- assertions fire, verified by actually forcing system.build.toplevel -----------
     (check "espFileName-nixos-prefix-collision/eval-fails"

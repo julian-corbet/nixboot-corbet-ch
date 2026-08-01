@@ -1384,6 +1384,38 @@ in
             Type = "oneshot";
             RemainAfterExit = true;
           };
+          # `path`, not left to systemd's own per-unit default -- MEASURED live 2026-08-01 on a
+          # real deployment: a plain `script = ...` service gets NixOS's baseline unit PATH
+          # (coreutils/findutils/gnugrep/gnused/systemd only, confirmed via `systemctl cat`),
+          # which does not include util-linux at all. Check 2 below shells out to a bare
+          # `command -v findmnt` / `findmnt -n "$esp"` -- with no util-linux on this unit's PATH,
+          # `command -v findmnt` ALWAYS fails, so Check 2 unconditionally takes its else branch
+          # and prints "FAIL esp.mountPoint: $esp is not a mountpoint", regardless of whether the
+          # ESP is actually mounted. It was: `findmnt /boot`, `mount`, and `/proc/self/mountinfo`
+          # all agreed the ESP was mounted the whole time, `boot.mount` was `active (mounted)`,
+          # and every OTHER check in the same run (generations.keep, extraEntries.*, remoteUnlock)
+          # read real files under $esp successfully -- impossible if $esp were actually unmounted.
+          # A check that can never pass on ANY consumer is worse than no check: it trains an
+          # operator to stop reading a red unit, exactly the failure mode this module exists to
+          # prevent. `pkgs.util-linux` fixes it unconditionally (findmnt is not behind any
+          # `tools.*.enable` gate -- Check 2 always runs).
+          #
+          # sbctl/sbsigntool have the SAME bug for a DIFFERENT reason: `environment.systemPackages`
+          # (above, gated on `cfg.tools.sbctl.enable` / `cfg.tools.sbsigntool.enable`) puts them on
+          # the system-wide interactive-shell PATH, but systemd services do NOT inherit
+          # `environment.systemPackages` -- so even with `tools.sbctl.enable = true`, Check 5's
+          # `command -v sbctl` would still fail and print "SKIP ... sbctl is not on PATH
+          # (tools.sbctl.enable is off)" while that option is actually ON, blaming the wrong
+          # cause. Mirrored here, conditionally, so the `command -v` gates stay meaningful:
+          # SKIP means the operator genuinely disabled the tool, not that this unit's PATH forgot
+          # about it. `pkgs.systemd`/`pkgs.openssh` are NOT needed here -- Checks 1 and 8 already
+          # call bootctl/systemd-creds/ssh-keygen via `${pkgs.X}/bin/Y` absolute interpolation
+          # (immune to PATH by construction), the same pattern nixboot-seal-hostkey below uses via
+          # its own `path` for systemd-creds/ssh-keygen. This `path` line only needs to cover the
+          # tools THIS script still resolves by bare name.
+          path = lib.optional cfg.tools.sbctl.enable pkgs.sbctl
+            ++ lib.optional cfg.tools.sbsigntool.enable pkgs.sbsigntool
+            ++ [ pkgs.util-linux ];
           script = ''
             set -uo pipefail   # no -e: a failed readback is data, not an engine crash
             fail=0
