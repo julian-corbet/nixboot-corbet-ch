@@ -148,6 +148,23 @@ let
   isSystemdBootFamily = cfg.loader.program == "systemd-boot" || cfg.loader.program == "lanzaboote";
   isLimine = cfg.loader.program == "limine";
 
+  # Does THIS host actually get an /etc/sbctl/sbctl.conf out of nixboot? Bound once because
+  # three separate things must agree on the answer -- the write itself, the "config file for
+  # an absent tool" warning, and nixboot-verify's key-material check -- and each of the three
+  # conditions is easy to forget in one place while remembering it in the others:
+  #   sbctlCompat      -- the operator asked for it (default TRUE),
+  #   keySource        -- lanzaboote's own module writes this identical /etc path on
+  #                       autogenerate hosts, and two definitions of one file is a build
+  #                       failure, not a merge (see the write's own comment),
+  #   pkiBundle        -- there is somewhere real to point at. The first two are BOTH
+  #                       satisfied by their own defaults, so without this the file got
+  #                       written on every host that merely enabled nixboot, naming the
+  #                       literal path "null/keys".
+  sbctlConfWritten =
+    cfg.secureBoot.sbctlCompat
+    && cfg.secureBoot.keySource != "autogenerate"
+    && cfg.secureBoot.pkiBundle != null;
+
   # ── nixstorage.layout: read defensively, see the ESP option block for why ──
   # Which layout image describes THIS host's medium cannot be guessed, so it is named by
   # esp.fromLayout. Absent that (or absent nixstorage entirely) every derived default
@@ -772,13 +789,20 @@ in
         description = ''
           Can a bare `sbctl status` / `sbctl verify` run on this box and
           actually find the PKI, rather than reporting "not installed"?
-          Writes /etc/sbctl/sbctl.conf pointing at secureBoot.pkiBundle.
+          Writes /etc/sbctl/sbctl.conf (YAML: `keydir:` and `guid:`)
+          pointing at secureBoot.pkiBundle.
           Fixes a live wart: lanzaboote only writes that file on KEYLESS
           (autogenerate) hosts, so on a "stable"-keyed host `sbctl status`
           reports not-installed and `sbctl verify` fails on every ESP
           file for a pure configuration reason, not a real signature
           problem -- and nixboot-verify cannot check real signatures
           until this file exists and is correct.
+
+          Inert unless secureBoot.pkiBundle is actually set: with no
+          bundle there is no path to point sbctl at, and writing the file
+          anyway would name a directory that cannot exist. Leaving this
+          at its default on a host that has no PKI is therefore harmless
+          rather than something to remember to turn off.
         '';
       };
     };
@@ -1145,7 +1169,7 @@ in
           lib.optional (cfg.esp.capacityMiB != null && espProjectedMiB * 100 > cfg.esp.capacityMiB * 75) ''
             nixboot: projected ESP usage is ~${toString espProjectedMiB} MiB (${toString cfg.generations.keep} kept generation(s) at a rounded-up 1 MiB/stub, plus a 100 MiB floor for two in-flight kernel versions) against a declared esp.capacityMiB = ${toString cfg.esp.capacityMiB}, over the 75% line. This is only an eval-time estimate -- nixboot-verify's headroom check reads the real number after boot -- but an ESP resize is an image reprovision, not a deploy, so this is worth planning for before it becomes a live "no space left on device" failure during switch-to-configuration.
           ''
-          ++ lib.optional (cfg.secureBoot.sbctlCompat && !cfg.tools.sbctl.enable) ''
+          ++ lib.optional (sbctlConfWritten && !cfg.tools.sbctl.enable) ''
             nixboot: secureBoot.sbctlCompat writes /etc/sbctl/sbctl.conf, but tools.sbctl.enable is false, so the sbctl binary that file exists for is not installed on this host. Either turn tools.sbctl.enable on or drop sbctlCompat -- a config file for an absent tool is exactly the kind of setting-that-does-nothing this module exists to surface, not to ship quietly.
           ''
           ++ lib.optional (cfg.media.usb.enable && cfg.loader.efiVariables == "write") ''
@@ -1344,22 +1368,47 @@ in
         # a keyless/autogenerate host. `keySource != "autogenerate"` is the exact condition
         # `autoGenerateKeys.enable` itself is derived from two writes above, so this can never
         # drift out of sync with lanzaboote's own gate.
-        environment.etc."sbctl/sbctl.conf" = lib.mkIf
-          (cfg.secureBoot.sbctlCompat && cfg.secureBoot.keySource != "autogenerate")
-          {
-          # NOTE: sbctl's config schema was not directly readable from the
-          # evidence this module was written against -- only that lanzaboote
-          # writes this file for keyless hosts and that its absence is what
-          # makes `sbctl status` report "not installed" on a keyed host. This
-          # is the minimal field nixboot-verify's sbctl check needs to be
-          # meaningful. Confirm the field name against the sbctl version
-          # actually installed before relying on this in place of the manual
-          # /var/lib/sbctl staging nixnas's enrollment script does today --
-          # if it is wrong, nixboot-verify's sbctl check will FAIL loudly
-          # rather than silently, which is the point of shipping both.
-          text = ''
-            keydir = "${cfg.secureBoot.pkiBundle}/keys"
-          '';
+        # `pkiBundle != null` is part of the gate, not merely part of the content: the
+        # other two conditions are BOTH satisfied by their own defaults (sbctlCompat =
+        # true, keySource = "stable"), so without it every host that merely turns
+        # `nixboot.enable` on -- Secure Boot disabled, no PKI anywhere, sbctl not even
+        # installed -- still got this file, containing the literal relative path
+        # "null/keys" interpolated straight out of the unset option. The assertion above
+        # only requires a pkiBundle when `secureBoot.enable` is true, so nothing else
+        # caught it. A config file naming a path that cannot exist is precisely the
+        # setting-that-does-nothing this module exists to refuse to ship quietly.
+        environment.etc."sbctl/sbctl.conf" = lib.mkIf sbctlConfWritten {
+          # sbctl.conf is YAML -- confirmed against sbctl.conf(5) as shipped by the sbctl
+          # this module actually puts on PATH ("The sbctl configuration file is a YAML
+          # file"), which documents `keydir:` (default /var/lib/sbctl/keys) and `guid:`
+          # (default /var/lib/sbctl/GUID) as the two fields that aim sbctl at an already
+          # existing PKI instead of the one it would have created itself.
+          #
+          # An earlier draft of this write guessed a TOML-shaped `keydir = "..."` instead.
+          # sbctl's YAML parser read that as a bare string where it wanted a mapping and
+          # bailed out of EVERY invocation -- `status`, `verify`, all of it -- and, because
+          # sbctl still exits 0 on a config parse error, it did so without a nonzero status
+          # for anything to trip over. nixboot-verify's Check 5 is what actually caught it,
+          # which is exactly why this file and that check ship together: the file is the
+          # part that can be wrong, the check is the part that says so.
+          #
+          # Rendered through builtins.toJSON rather than string interpolation. JSON is a
+          # strict subset of YAML, so this is valid input by construction rather than by
+          # having got the punctuation right, and it gets correct quoting and escaping for
+          # free on any pkiBundle path -- one containing a ':' or a leading '#' would
+          # silently reparse as something else entirely if these fields were pasted into a
+          # hand-written YAML template.
+          #
+          # `guid` names the same <bundle>/GUID file nixboot-enroll-sb mints and then stages
+          # into /var/lib/sbctl. Pointing at it is what makes a bare `sbctl status` report
+          # the real owner GUID rather than silently falling back to a /var/lib/sbctl/GUID
+          # default that need not exist; naming it before enrollment has created it is
+          # harmless (sbctl reports an empty GUID and carries on), so this needs no
+          # first-boot special case.
+          text = builtins.toJSON {
+            keydir = "${cfg.secureBoot.pkiBundle}/keys";
+            guid = "${cfg.secureBoot.pkiBundle}/GUID";
+          };
         };
 
         environment.systemPackages =
@@ -1554,20 +1603,64 @@ in
               fi
             '') cfg.esp.foreignPaths}
 
-            # ── Check 5: sbctl status, only meaningful once sbctlCompat exists ──
+            # ── Check 5: sbctlCompat -- does a bare `sbctl status` actually work here ──
+            # Reads `--json` rather than grepping the human table. The pretty output marks
+            # installed with a U+2713 inside an English sentence, so matching it holds the
+            # check hostage to both sbctl's phrasing and the unit's locale, whereas
+            # "installed": true is sbctl's own machine-readable interface.
+            #
+            # Three outcomes, deliberately NOT collapsed into one "not installed" branch,
+            # because they have three different causes and three different fixes:
+            #
+            #   no status at all -- /etc/sbctl/sbctl.conf is missing or unparseable. This is
+            #     the failure mode nothing else on the host can see, and the reason this
+            #     check is written against output rather than exit status: sbctl exits 0
+            #     after a config parse error, printing the parse error and no status, so
+            #     every other sbctl caller on the box silently gets nothing back and carries
+            #     on as if it had asked nothing. Field-proven, not hypothetical -- see the
+            #     sbctl.conf write above for the malformed file this branch caught.
+            #   installed: false -- the file parses, but the keydir it names does not exist.
+            #   installed: true  -- sbctl found the keydir. This is NOT the same claim as
+            #     "the PKI is usable": sbctl decides installed purely on the keydir PATH
+            #     existing, so an empty or half-populated bundle satisfies it exactly as
+            #     happily as a real one. Hence the separate key-material check below, rather
+            #     than treating usable key material as implied by this line.
             ${lib.optionalString cfg.secureBoot.sbctlCompat ''
               if command -v sbctl >/dev/null 2>&1; then
-                sbctl_out="$(sbctl status 2>&1 || true)"
-                if echo "$sbctl_out" | grep -Eqi 'Installed:.*(true|yes|✓)'; then
-                  echo "PASS  secureBoot.sbctlCompat: sbctl status reports installed"
+                sbctl_out="$(sbctl status --json 2>&1 || true)"
+                if ! echo "$sbctl_out" | grep -q '"installed"'; then
+                  echo "FAIL  secureBoot.sbctlCompat: sbctl returned no status at all -- /etc/sbctl/sbctl.conf is missing, unreadable, or not valid YAML. sbctl exits 0 on a config parse error, so this breaks every sbctl invocation on this host while still looking like success to anything that only checks exit status."
+                  echo "      sbctl status --json said: $(echo "$sbctl_out" | head -n3 | tr '\n' ' ')"
+                  fail=1
+                elif echo "$sbctl_out" | grep -Eq '"installed"[[:space:]]*:[[:space:]]*true'; then
+                  echo "PASS  secureBoot.sbctlCompat: sbctl parses /etc/sbctl/sbctl.conf and reports installed"
                 else
-                  echo "FAIL  secureBoot.sbctlCompat: sbctl status does not report installed -- check /etc/sbctl/sbctl.conf against secureBoot.pkiBundle"
-                  echo "      sbctl status (first lines): $(echo "$sbctl_out" | head -n5 | tr '\n' ' ')"
+                  echo "FAIL  secureBoot.sbctlCompat: sbctl parses its config but reports NOT installed -- the keydir that file names does not exist. Check /etc/sbctl/sbctl.conf against secureBoot.pkiBundle."
+                  echo "      sbctl status --json said: $(echo "$sbctl_out" | head -n3 | tr '\n' ' ')"
                   fail=1
                 fi
               else
                 echo "SKIP  secureBoot.sbctlCompat: sbctl is not on PATH (tools.sbctl.enable is off) -- nothing to check it with"
               fi
+            ''}
+            # The teeth the `installed` line above does not have. Gated identically to the
+            # /etc/sbctl/sbctl.conf write itself, so it only ever asserts against a bundle
+            # this module actually pointed sbctl at. Deliberately outside the `command -v
+            # sbctl` guard above: whether the declared key material exists is a fact about
+            # the bundle, not about the tool, and stays worth failing on even where
+            # tools.sbctl.enable is off. Both halves are checked -- db.key signs, db.pem
+            # verifies, and a bundle carrying one without the other is broken for exactly
+            # half of what this subsystem does, which is the harder half to notice.
+            ${lib.optionalString sbctlConfWritten ''
+              sbctl_pki=${lib.escapeShellArg cfg.secureBoot.pkiBundle}
+              for f in db/db.key db/db.pem; do
+                if [ -r "$sbctl_pki/keys/$f" ]; then
+                  echo "PASS  secureBoot.sbctlCompat: $sbctl_pki/keys/$f is present and readable"
+                else
+                  echo "FAIL  secureBoot.sbctlCompat: $sbctl_pki/keys/$f is MISSING -- sbctl still reports itself installed, because that only ever meant the keydir path exists, so an installed-only check sails straight past this: every signature made or checked against this bundle fails."
+                  fail=1
+                fi
+              done
             ''}
 
             # ── Check 6: kept-generation count vs generations.keep ──

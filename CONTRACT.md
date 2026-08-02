@@ -105,6 +105,17 @@ is false at the same time, that file exists for a binary that isn't
 installed. nixboot emits an explicit warning rather than shipping the
 mismatch quietly (`modules/nixboot.nix:386-388`).
 
+The same rule applied to the file's own contents. It is YAML
+(`sbctl.conf(5)`), rendered through `builtins.toJSON` so it is valid by
+construction rather than by having got the punctuation right, and it is
+written only where a `secureBoot.pkiBundle` actually exists to point at —
+`sbctlCompat` and `keySource` are both satisfied by their own defaults, so
+without that third condition every host enabling nixboot got a config file
+naming the literal path `null/keys`. A malformed file here is invisible from
+the outside (sbctl exits 0 on a config parse error and simply reports
+nothing), which is why `nixboot-verify` Check 5 asserts on sbctl's `--json`
+output and treats "no status at all" as its own distinct failure.
+
 **B10 — Every managed knob is read back after boot, not just requested.**
 `nixboot-verify` runs after boot, reads every managed knob straight off the
 live system, and logs `PASS`/`FAIL`/`SKIP` per check, exiting non-zero on
@@ -186,8 +197,7 @@ the same "usable without adopting this module's whole boot-stance
 ownership" shape `extraEntries.*`'s own unconditionally-exposed build
 outputs already use — because `nixboot.enable = true` pulls in a bundle of
 OTHER opinions (a required `loader.program`, `nixboot-verify`'s readback
-checks, `secureBoot.sbctlCompat`'s `/etc/sbctl/sbctl.conf` write, which
-crashes eval outright with no `secureBoot.pkiBundle` set) that a host which
+checks, `secureBoot.sbctlCompat`'s `/etc/sbctl/sbctl.conf` write) that a host which
 already owns its own primary boot chain should not have to take on, or
 carefully neutralize one knob at a time, just to reuse this one mechanism
 (`modules/nixboot.nix`, the `media` option group + the `config = lib.mkMerge

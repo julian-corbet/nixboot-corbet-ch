@@ -334,6 +334,96 @@ let
         && lib.elem pkgs.sbsigntool cfg-sb-stable.systemd.services.nixboot-verify.path)
       "nixboot-verify path: ${builtins.toJSON (pathNames cfg-sb-stable)}")
 
+    # --- secureBoot.sbctlCompat: the /etc/sbctl/sbctl.conf write, and the Check 5 branches
+    # that read it back. sbctl.conf is YAML (sbctl.conf(5)); an earlier draft of this write
+    # emitted a TOML-shaped `keydir = "..."` that sbctl could not parse at all -- and because
+    # sbctl exits 0 on a config parse error, the ONLY thing that ever noticed was
+    # nixboot-verify's own output grep, on a live host, after the fact. So both halves get
+    # pinned here: that the rendered file is machine-valid (parsed, not eyeballed) and that
+    # the runtime check still carries a distinct branch for each way it can be wrong. ---
+    (check "sbctl-conf-parses-as-json-and-names-the-declared-pkiBundle"
+      (
+        let
+          raw = cfg-sb-stable.environment.etc."sbctl/sbctl.conf".text;
+          # Parsed rather than string-compared: builtins.toJSON emits JSON, JSON is a strict
+          # subset of YAML, so a successful fromJSON is a machine proof that sbctl's YAML
+          # parser can read this file -- exactly the property the old hand-written template
+          # lacked. Comparing exact bytes instead would pin builtins.toJSON's spacing and key
+          # order, which is not the property under test.
+          #
+          # The shape guard is load-bearing and deliberately NOT builtins.tryEval: fromJSON's
+          # parse failure is a C++-level exception tryEval does not catch, so handing it the
+          # old TOML-shaped `keydir = "..."` aborts the entire suite with a raw
+          # json.exception.parse_error rather than reporting this one check red. Verified by
+          # reintroducing that exact text and watching it happen. `&&` short-circuits and
+          # `parsed` is lazy, so requiring a JSON object first keeps the realistic regression
+          # -- builtins.toJSON swapped back for a hand-rolled template -- a NAMED failure with
+          # the offending bytes in `detail`, which is the whole point of a check suite.
+          looksJson = lib.hasPrefix "{" raw && lib.hasSuffix "}" raw;
+          parsed = builtins.fromJSON raw;
+        in
+        looksJson
+          && parsed.keydir == "/nix/lanzaboote/pki/keys"
+          && parsed.guid == "/nix/lanzaboote/pki/GUID"
+      )
+      "rendered /etc/sbctl/sbctl.conf: ${cfg-sb-stable.environment.etc."sbctl/sbctl.conf".text}")
+
+    # The gate, both directions. sbctlCompat (true) and keySource ("stable") are BOTH
+    # satisfied by their own defaults, so before pkiBundle joined the condition, every host
+    # that merely enabled nixboot got this file containing the literal path "null/keys" --
+    # cfg-none-unsigned is exactly that host, and asserts the file is now absent entirely.
+    (check "sbctl-conf-not-written-without-a-pkiBundle"
+      (!(cfg-none-unsigned.environment.etc ? "sbctl/sbctl.conf"))
+      "a host with no secureBoot.pkiBundle still got /etc/sbctl/sbctl.conf")
+
+    (check "sbctl-conf-not-written-for-autogenerate-keys"
+      (!(cfg-sb-autogenerate.environment.etc ? "sbctl/sbctl.conf"))
+      "lanzaboote writes this file itself on autogenerate hosts -- two definitions of one /etc path is a build failure")
+
+    # B9's "config file for an absent tool" warning has to track the WRITE, not merely the
+    # sbctlCompat flag. Before the pkiBundle condition existed it fired on hosts that never
+    # got the file at all, announcing a write that does not happen -- a warning that cries
+    # wolf is the same class of bug as a check that does, just quieter.
+    (check "sbctlCompat-absent-tool-warning-fires-when-the-file-is-written"
+      (
+        let
+          cfg = evalFor {
+            nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
+            nixboot.tools.sbctl.enable = false;
+          };
+        in
+        lib.any (w: lib.hasInfix "tools.sbctl.enable is false" w) cfg.warnings
+      )
+      "no warning for a written /etc/sbctl/sbctl.conf whose sbctl binary is absent")
+
+    (check "sbctlCompat-absent-tool-warning-silent-when-no-file-is-written"
+      (!(lib.any (w: lib.hasInfix "tools.sbctl.enable is false" w) cfg-none-unsigned.warnings))
+      "warned about an /etc/sbctl/sbctl.conf that a host with no pkiBundle never receives")
+
+    (check "verify-script-has-a-branch-for-an-unparseable-sbctl-conf"
+      (lib.hasInfix "sbctl returned no status at all"
+        cfg-sb-stable.systemd.services.nixboot-verify.script)
+      "nixboot-verify has no branch for the one sbctl failure mode that exits 0 -- an unparseable /etc/sbctl/sbctl.conf")
+
+    # `installed` is decided by sbctl purely on the keydir PATH existing, so an empty or
+    # half-populated bundle satisfies it just as happily as a real one. Without this branch
+    # Check 5 would go green on a host whose signing key is simply gone.
+    (check "verify-script-checks-db-key-material-not-just-installed"
+      (lib.hasInfix "db/db.key" cfg-sb-stable.systemd.services.nixboot-verify.script)
+      "nixboot-verify trusts sbctl's 'installed' line without checking the bundle actually holds key material")
+
+    (check "verify-script-omits-db-key-material-check-without-a-pkiBundle"
+      (!(lib.hasInfix "db/db.key" cfg-none-unsigned.systemd.services.nixboot-verify.script))
+      "nixboot-verify asserts key material on a host that declared no pkiBundle to hold any")
+
+    # Guards the reason the check reads --json: the human table marks installed with a U+2713
+    # inside an English sentence, which makes matching it hostage to sbctl's phrasing and the
+    # unit's locale.
+    (check "verify-script-reads-sbctl-json-not-the-human-table"
+      (lib.hasInfix "sbctl status --json" cfg-sb-stable.systemd.services.nixboot-verify.script
+        && !(lib.hasInfix "Installed:" cfg-sb-stable.systemd.services.nixboot-verify.script))
+      "nixboot-verify is back to grepping sbctl's human-readable status output")
+
     # --- assertions fire, verified by actually forcing system.build.toplevel -----------
     (check "espFileName-nixos-prefix-collision/eval-fails"
       (evalFailsBuild {
