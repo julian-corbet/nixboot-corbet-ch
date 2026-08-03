@@ -334,6 +334,29 @@ let
         && lib.elem pkgs.sbsigntool cfg-sb-stable.systemd.services.nixboot-verify.path)
       "nixboot-verify path: ${builtins.toJSON (pathNames cfg-sb-stable)}")
 
+    # --- tools.* is three INDEPENDENT decisions, not one lumped toggle. sbctl and sbsigntool
+    # default from secureBoot.enable because a signing host always wants both; efitools does
+    # not, because it inspects the firmware's own NVRAM and is wanted (or not) for reasons a
+    # signing posture cannot predict -- see its option doc. That asymmetry is easy to
+    # "tidy up" into a single tools.enable by someone who reads the three options and not the
+    # reasons, so both halves are pinned: efitools stays OFF on a Secure Boot host that never
+    # asked for it, and a host that asks for ONLY efitools gets ONLY efitools -- no sbctl, no
+    # sbsigntool, and no need to turn on secureBoot.enable to reach an NVRAM-backup tool. ---
+    (check "efitools-stays-off-on-a-secureBoot-host-that-did-not-ask"
+      (!(lib.elem pkgs.efitools cfg-sb-stable.environment.systemPackages))
+      "efitools was installed by secureBoot.enable alone -- tools.efitools is its own decision")
+
+    (check "efitools-alone-installs-efitools-alone"
+      (
+        let
+          cfg = evalFor { nixboot.tools.efitools.enable = true; };
+        in
+        lib.elem pkgs.efitools cfg.environment.systemPackages
+        && !(lib.elem pkgs.sbctl cfg.environment.systemPackages)
+        && !(lib.elem pkgs.sbsigntool cfg.environment.systemPackages)
+      )
+      "tools.efitools.enable did not install efitools on its own, or dragged a signing tool along with it")
+
     # --- secureBoot.sbctlCompat: the /etc/sbctl/sbctl.conf write, and the Check 5 branches
     # that read it back. sbctl.conf is YAML (sbctl.conf(5)); an earlier draft of this write
     # emitted a TOML-shaped `keydir = "..."` that sbctl could not parse at all -- and because

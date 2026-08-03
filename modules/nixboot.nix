@@ -1003,6 +1003,35 @@ in
           F21 AFU update scripts, for example, pass `/n` (program NVRAM),
           which should be treated as "enrollment wiped", not merely
           "enrollment at risk".
+
+          efitools reads the firmware's CURRENT NVRAM variables directly,
+          independent of whichever tool enrolled them -- which is what makes
+          it worth carrying ALONGSIDE `tools.sbctl` rather than instead of
+          it. `sbctl status` answers "what does this host's own PKI say
+          should be enrolled"; `efi-readvar` answers "what is actually in
+          NVRAM", and only the second survives a firmware update as
+          evidence:
+
+            efi-readvar -v PK  -o pk.esl
+            efi-readvar -v KEK -o kek.esl
+            efi-readvar -v db  -o db.esl
+            efi-readvar -v dbx -o dbx.esl
+
+          Take those four before the flash, re-read them after, and compare.
+          Without the pre-flash copy there is nothing left to compare
+          against, so the only remaining evidence is the vendor's own
+          documentation of its update flags -- and a board that quietly kept
+          its keys is indistinguishable from one that quietly cleared them
+          until a boot fails to verify, by which point the enrollment that
+          would have proved it is already gone.
+
+          Deliberately NOT defaulted from `secureBoot.enable`, unlike
+          `tools.sbctl`/`tools.sbsigntool`: this is an inspect-and-back-up
+          tool for the firmware's own state, useful on a host that signs
+          nothing at all (someone auditing what a vendor shipped in db/dbx),
+          and pointless on a signing host that will never be flashed. Which
+          way round a given host is cannot be derived from its signing
+          posture, so it is asked rather than guessed.
         '';
       };
 
