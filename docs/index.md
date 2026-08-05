@@ -18,6 +18,12 @@ mechanism — is [`CONTRACT.md`](../CONTRACT.md). The module itself, with
 every option's own description, is
 [`modules/nixboot.nix`](../modules/nixboot.nix).
 
+The security posture and firmware-recovery decisions that guide a consumer's
+host values live in [Boot Security And Recovery](security-recovery.md). It
+records the passphrase-only data-unlock invariant, rescue boundary, key
+custody, and the different interactive and headless recovery paths without
+putting any private host values into this public repository.
+
 ## The option groups
 
 **`loader.*`** — which program installs to the ESP (`systemd-boot`,

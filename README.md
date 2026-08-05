@@ -75,6 +75,11 @@ nixpkgs itself.
 The full option-by-option contract, including every assertion and warning
 this module ships, lives in [CONTRACT.md](CONTRACT.md).
 
+The companion [Boot Security And Recovery](docs/security-recovery.md)
+decision record defines the passphrase-only data-unlock invariant, rescue
+boundary, private-key custody, and firmware-recovery procedure for consumers
+of this public module.
+
 ## The system-manager backend
 
 `systemManagerModules.nixboot` (`modules/system-manager-limine.nix`) is a
