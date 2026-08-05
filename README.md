@@ -108,6 +108,12 @@ or puts key material in the Nix store. A secure stage signs both its separate
 systemd-boot binary and its NixBoot-owned UKIs; it never signs or replaces the
 current fallback path before the separately reviewed cutover.
 
+`cutover.enable` is a second, independent manual gate. Its unit first reruns
+the stage verification, then uses `bootctl install` with EFI-variable writes
+enabled to replace the active fallback and create the systemd-boot firmware
+entry. It is never enabled automatically and a source declaration keeps it
+off until the staged loader has completed a physical boot test.
+
 ```nix
 {
   inputs.nixboot.url = "github:julian-corbet/nixboot-corbet-ch";

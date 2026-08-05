@@ -55,10 +55,17 @@ let
       };
     };
   });
+  cutover = evalBoot (lib.recursiveUpdate base {
+    nixboot.systemdBoot = {
+      stage.enable = true;
+      cutover.enable = true;
+    };
+  });
 
   check = name: ok: detail: { inherit name ok detail; };
   stage = "nixboot-systemd-boot-stage";
   verify = "nixboot-systemd-boot-verify";
+  cutoverUnit = "nixboot-systemd-boot-cutover";
   pacmanHook = "pacman.d/hooks/95-nixboot-systemd-boot.hook";
 
   results = [
@@ -84,6 +91,17 @@ let
     (check "stage/manual-stage-and-verify-units-exist"
       (staged.systemd.services ? "${stage}" && staged.systemd.services ? "${verify}")
       "units: ${builtins.toJSON (builtins.attrNames staged.systemd.services)}")
+
+    (check "cutover/manual-unit-verifies-stage-and-replaces-fallback"
+      (
+        cutover.systemd.services ? "${cutoverUnit}"
+        && !(cutover.systemd.services.${cutoverUnit} ? "wantedBy")
+        && lib.hasInfix "restart nixboot-systemd-boot-verify.service" cutover.systemd.services.${cutoverUnit}.script
+        && lib.hasInfix "--variables=yes" cutover.systemd.services.${cutoverUnit}.script
+        && lib.hasInfix "--efi-boot-option-description" cutover.systemd.services.${cutoverUnit}.script
+        && lib.hasInfix "EFI/BOOT/BOOTX64.EFI" cutover.systemd.services.${cutoverUnit}.script
+      )
+      "final cutover unit is missing a manual verification or firmware/fallback gate")
 
     (check "stage/does-not-auto-start-or-overwrite-fallback"
       (
@@ -129,6 +147,19 @@ let
         };
       })
       "expected secureBoot.enable without secureBoot.sbctlConfig to fail an assertion")
+
+    (check "secure-cutover-signs-the-final-fallback-loader"
+      (lib.hasInfix "sign -s \"$fallback_output\"" cutover.systemd.services.${cutoverUnit}.script)
+      "secure final cutover does not sign the active fallback loader")
+
+    (check "cutover-without-stage-asserts"
+      (assertionFails {
+        nixboot.systemdBoot = {
+          enable = true;
+          cutover.enable = true;
+        };
+      })
+      "expected cutover.enable without stage.enable to fail an assertion")
 
     (check "stage-without-explicit-kernel-cmdline-asserts"
       (assertionFails {

@@ -273,6 +273,10 @@ materializes or defaults a private-key location. The explicit stage signs its
 separate systemd-boot EFI binary and NixBoot-owned UKIs under that identity;
 it does not sign or replace the active fallback until the separately reviewed
 cutover.
+The optional `cutover.enable` renders a second manual unit only after staging
+is enabled. It reruns stage verification, uses `bootctl install` with EFI
+variables explicitly enabled, and then signs both final loader copies when
+Secure Boot is configured. It never has an automatic systemd dependency.
 
 **B21 — `secureBoot.pkiBundle` / `keySource` actually reach the thing that
 signs UKIs, not just the tools that assume it did.**

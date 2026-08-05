@@ -195,6 +195,50 @@ let
     fi
     echo "nixboot: staged loader and UKIs verified. Select EFI/systemd/systemd-bootx64.efi once from firmware before any cutover."
   '';
+
+  cutoverScript = ''
+    set -euo pipefail
+
+    esp=${lib.escapeShellArg cfg.esp.mountPoint}
+    secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
+    sbctl_config=${if cfg.secureBoot.sbctlConfig == null then "''" else lib.escapeShellArg cfg.secureBoot.sbctlConfig}
+
+    for command in /usr/bin/bootctl /usr/bin/findmnt /usr/bin/systemctl; do
+      [ -x "$command" ] || {
+        echo "nixboot: required native command is absent: $command" >&2
+        exit 1
+      }
+    done
+    [ "$(/usr/bin/findmnt -no FSTYPE --target "$esp")" = "vfat" ] || {
+      echo "nixboot: $esp is not the mounted FAT ESP; refusing final cutover." >&2
+      exit 1
+    }
+
+    # Restart is intentional: a successful oneshot verify unit may still describe an older stage.
+    /usr/bin/systemctl restart nixboot-systemd-boot-verify.service
+
+    # This is the one explicit point that replaces the active fallback and writes the firmware
+    # boot entry. Do not add `--graceful`: inability to write EFI variables is a failed cutover.
+    /usr/bin/bootctl --esp-path="$esp" --variables=yes \
+      --efi-boot-option-description=${lib.escapeShellArg cfg.cutover.efiBootOptionDescription} install
+
+    loader_output="$esp/EFI/systemd/systemd-bootx64.efi"
+    fallback_output="$esp/EFI/BOOT/BOOTX64.EFI"
+    if [ "$secure_boot" = yes ]; then
+      /usr/bin/sbctl --config "$sbctl_config" sign -s "$loader_output"
+      /usr/bin/sbctl --config "$sbctl_config" sign -s "$fallback_output"
+    fi
+
+    for file in "$loader_output" "$fallback_output"; do
+      [ -s "$file" ] && [ "$(head -c2 "$file")" = "MZ" ] || {
+        echo "nixboot: final loader artifact is missing or invalid: $file" >&2
+        exit 1
+      }
+    done
+    /usr/bin/bootctl --esp-path="$esp" is-installed
+
+    echo "nixboot: final systemd-boot cutover completed. Reboot only through the separately approved recovery test."
+  '';
 in
 {
   options.nixboot.systemdBoot = {
@@ -260,6 +304,24 @@ in
       '';
     };
 
+    cutover = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Render the manual final-cutover unit. It replaces the active fallback loader and writes
+          a systemd-boot EFI variable only after a verified staged-loader test. The unit is never
+          wanted automatically.
+        '';
+      };
+
+      efiBootOptionDescription = lib.mkOption {
+        type = lib.types.str;
+        default = "NixBoot systemd-boot";
+        description = "Firmware boot-option description passed to bootctl during the final manual cutover.";
+      };
+    };
+
     archPackages = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       readOnly = true;
@@ -289,9 +351,13 @@ in
         assertion = !cfg.secureBoot.enable || cfg.secureBoot.sbctlConfig != null;
         message = "nixboot.systemdBoot.secureBoot.enable requires secureBoot.sbctlConfig: declare a root-owned runtime sbctl configuration through the host's secret-delivery mechanism, never a Nix store key path.";
       }
+      {
+        assertion = !cfg.cutover.enable || cfg.stage.enable;
+        message = "nixboot.systemdBoot.cutover.enable requires stage.enable: a final fallback/NVRAM change is only valid after the separate staged path exists.";
+      }
       ];
 
-      systemd.services = lib.mkIf cfg.stage.enable {
+      systemd.services = lib.mkIf cfg.stage.enable ({
       nixboot-systemd-boot-stage = {
         description = "NixBoot: stage systemd-boot and native UKIs without cutover";
         serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
@@ -303,7 +369,14 @@ in
         serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
         script = verifyScript;
       };
+      } // lib.optionalAttrs cfg.cutover.enable {
+      nixboot-systemd-boot-cutover = {
+        description = "NixBoot: replace active fallback and create the systemd-boot firmware entry";
+        after = [ "nixboot-systemd-boot-stage.service" ];
+        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+        script = cutoverScript;
       };
+      });
 
       # /etc/pacman.d/hooks has higher precedence than package-provided hooks. `replaceExisting`
       # avoids system-manager's silent existing-file skip, which would otherwise leave a stale
