@@ -43,7 +43,7 @@
 #           SECOND, non-default UKIs on the same ESP (extraEntries.*,
 #           modules/extra-entries.nix) -- built and signed by the same
 #           ukify+sbsign pipeline, placed under an operator-named file,
-#           optionally rotated as a current/previous pair and optionally
+#           retained as an explicit bounded UKI history and optionally
 #           registered as an idempotent firmware NVRAM boot entry --
 #           deliberately independent of generations.keep/bootCounting.tries
 #           (which only ever govern loader.program's OWN generations) and
@@ -179,16 +179,12 @@ let
     else lib.findFirst (p: p.role or null == "esp") null (espSourceImage.partitions or [ ]);
 
 
-  # Measured, not guessed (contract evidence: a live production ESP
-  # measured at 187 MiB used of 2048 MiB declared). A lanzaboote UKI stub is
-  # ~195 KiB; rounding up to a flat 1 MiB/generation is a deliberately
-  # generous ceiling so this warning fires early rather than late.
-  # Kernel+initrd are shared per DISTINCT kernel version at ~50 MiB
-  # regardless of loader.program; budget for 2 in flight (a kernel bump
-  # briefly needs both old and new). Both `nixnas/modules/options.nix`
-  # ("~80 MiB per generation") and a private per-host config ("150-300 MiB
-  # each") document this wrong -- do not copy those numbers forward.
-  espProjectedMiB = cfg.generations.keep + (2 * 50);
+  # This is deliberately only the generic, opt-in-off warning estimate. A
+  # Lanzaboote generation carries an initrd as well as its small signed stub,
+  # so a flat "one MiB per generation" estimate is dangerously false. Hosts
+  # that turn on generations.capacity get a real declared budget and runtime
+  # pre-install collector from lanzaboote-retention.nix instead.
+  espProjectedMiB = cfg.generations.keep * 64 + 64;
 
   ## ── Remote unlock (initrd SSH) plumbing ─────────────────────────────────
   ## `ru` short-hands `cfg.remoteUnlock` the same way `cfg` short-hands
@@ -691,15 +687,58 @@ in
       type = lib.types.ints.positive;
       default = 8;
       description = ''
-        How many past systems stay bootable from the menu? This is the
-        GUARANTEED manual rollback path, so it must exceed the number of
-        generations this host can build in one uptime -- a host that
-        rebuilds faster than this drains generations it is currently
-        running off of, out of the menu, before anyone would need to use
-        it. That is a real, previously-shipped bug, not a hypothetical:
-        at `keep = 5` and roughly 10 generations/day, the running system
-        left the boot menu within hours.
+        How many normal systems stay bootable from the menu. With the stock
+        loader path this is the raw loader limit. A host that enables
+        generations.capacity instead gets exactly this many entries selected
+        as the running generation plus the newest alternatives, so a long
+        uptime cannot silently evict its own booted entry.
       '';
+    };
+
+    generations.capacity = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Use NixBoot's capacity-accounted Lanzaboote retention path. Before
+          each install it retains the booted generation plus the newest
+          alternatives within generations.keep, removes only unreferenced
+          Lanzaboote artifacts, then requires reserveMiB free before writing.
+          This is for a small ESP where stock Lanzaboote's post-install GC can
+          otherwise run out of space before it gets a chance to collect.
+        '';
+      };
+
+      generationMiB = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 64;
+        description = "Worst-case ESP budget per retained normal Lanzaboote generation, including its initrd, kernel and signed stub.";
+      };
+
+      reserveMiB = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 64;
+        description = "Free ESP space that must remain available for a new Lanzaboote artifact and FAT metadata after pre-install collection.";
+      };
+
+      fixedMiB = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 32;
+        description = "Declared ESP budget for the primary loader, credentials and fixed boot metadata, excluding normal and extra UKIs.";
+      };
+
+      extraReservedMiB = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 0;
+        description = "Additional declared ESP budget for protected UKIs maintained outside nixboot.extraEntries, such as a runtime-built rescue entry.";
+      };
+
+      lanzabootePackage = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.lzbt;
+        defaultText = lib.literalExpression "pkgs.lzbt";
+        description = "The upstream lzbt package wrapped by the capacity-retention installer. Override only when the host deliberately uses a compatible Lanzaboote build.";
+      };
     };
 
     bootCounting.tries = lib.mkOption {
@@ -1194,8 +1233,8 @@ in
         ];
 
         warnings =
-          lib.optional (cfg.esp.capacityMiB != null && espProjectedMiB * 100 > cfg.esp.capacityMiB * 75) ''
-            nixboot: projected ESP usage is ~${toString espProjectedMiB} MiB (${toString cfg.generations.keep} kept generation(s) at a rounded-up 1 MiB/stub, plus a 100 MiB floor for two in-flight kernel versions) against a declared esp.capacityMiB = ${toString cfg.esp.capacityMiB}, over the 75% line. This is only an eval-time estimate -- nixboot-verify's headroom check reads the real number after boot -- but an ESP resize is an image reprovision, not a deploy, so this is worth planning for before it becomes a live "no space left on device" failure during switch-to-configuration.
+          lib.optional (!cfg.generations.capacity.enable && cfg.esp.capacityMiB != null && espProjectedMiB * 100 > cfg.esp.capacityMiB * 75) ''
+            nixboot: generic ESP projection is ~${toString espProjectedMiB} MiB (${toString cfg.generations.keep} normal generation(s) at a conservative 64 MiB each plus 64 MiB write reserve) against declared esp.capacityMiB = ${toString cfg.esp.capacityMiB}, over the 75% line. Enable generations.capacity on a small Lanzaboote ESP so this becomes a declared budget plus a booted-generation-safe pre-install collector, rather than relying on post-install garbage collection.
           ''
           ++ lib.optional (sbctlConfWritten && !cfg.tools.sbctl.enable) ''
             nixboot: secureBoot.sbctlCompat writes /etc/sbctl/sbctl.conf, but tools.sbctl.enable is false, so the sbctl binary that file exists for is not installed on this host. Either turn tools.sbctl.enable on or drop sbctlCompat -- a config file for an absent tool is exactly the kind of setting-that-does-nothing this module exists to surface, not to ship quietly.

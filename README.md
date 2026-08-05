@@ -234,7 +234,10 @@ had to be added here first to make the comparison honest.
             esp.byLabel = "ESP";
             esp.capacityMiB = 512;
 
-            generations.keep = 8; # must outlast this host's builds/uptime
+            generations = {
+              keep = 4; # booted generation plus three newest alternatives
+              capacity.enable = true; # small Lanzaboote ESP
+            };
           };
         }
       ];

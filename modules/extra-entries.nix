@@ -10,8 +10,8 @@
 # absorbs and generalises: resolve a toplevel, build a self-contained UKI
 # from its kernel+initrd+cmdline (init= pins the toplevel directly -- no
 # on-ESP store bookkeeping needed), optionally sign it, place it under an
-# operator-named file, optionally keep a one-step current/previous rollback
-# pair, and optionally register a firmware NVRAM boot entry pointing at it.
+# operator-named file, retain an explicit bounded UKI history, and optionally
+# register a firmware NVRAM boot entry pointing at it.
 #
 # WHAT THIS FILE DOES NOT DO, on purpose:
 #   - It never touches loader.program's own generations, `generations.keep`,
@@ -39,13 +39,15 @@
 let
   cfg = config.nixboot;
 
-  # Derives the one-step rollback filename from an entry's own espFileName,
-  # e.g. "myhost-rescue.efi" -> "myhost-rescue-prev.efi" -- the exact shape
-  # the source pipeline uses (nixnas-rescue.efi / nixnas-rescue-prev.efi),
-  # kept as a pure derivation rather than its own option: one fact
-  # (espFileName) should have one name, not two independently-settable ones
-  # that could drift apart.
-  prevFileNameFor = fn: "${lib.removeSuffix ".efi" fn}-prev.efi";
+  # Derives a bounded history from one operator-owned filename. Index zero is
+  # current; the first and later history entries are -prev and -prev-N. These
+  # names are pure derivations so a declared retention count cannot drift from
+  # a separately-maintained path list.
+  historyFileNameFor = fn: index:
+    if index == 0 then fn
+    else if index == 1 then "${lib.removeSuffix ".efi" fn}-prev.efi"
+    else "${lib.removeSuffix ".efi" fn}-prev-${toString index}.efi";
+  historyFileNamesFor = fn: keep: map (index: historyFileNameFor fn index) (lib.range 0 (keep - 1));
 
   # ── The shared, reusable boot-entry registrar ────────────────────────────
   # ONE tool, parameterised by CLI arguments, used by every entry that turns
@@ -66,9 +68,9 @@ let
   mkExtraEntryMaintainer = name: entry:
     let
       espDir = "${cfg.esp.mountPoint}/EFI/Linux";
-      espFile = "${espDir}/${entry.espFileName}";
+      historyFileNames = historyFileNamesFor entry.espFileName entry.history.keep;
+      espFile = "${espDir}/${builtins.head historyFileNames}";
       relPath = "/EFI/Linux/${entry.espFileName}";
-      prevFile = "${espDir}/${prevFileNameFor entry.espFileName}";
 
       # EVAL SAFETY, same technique as nixram's own documented convention
       # (modules/default.nix's "EVAL SAFETY" header): never index or
@@ -130,15 +132,29 @@ let
           placed="$uki"
         ''}
 
-        # ── 3. rotate (current -> previous) + place atomically ────────────
+        # ── 3. retain history + place atomically ──────────────────────────
         mkdir -p "${espDir}"
-        ${lib.optionalString entry.rotate ''
+        ${lib.optionalString (entry.history.keep > 1) ''
           if [ -f "${espFile}" ] && ! cmp -s "$placed" "${espFile}"; then
-            cp -f "${espFile}" "${prevFile}"
+            ${lib.concatMapStringsSep "\n" (index: ''
+              if [ -f "${espDir}/${historyFileNameFor entry.espFileName (index - 1)}" ]; then
+                cp -f "${espDir}/${historyFileNameFor entry.espFileName (index - 1)}" "${espDir}/${historyFileNameFor entry.espFileName index}"
+              fi
+            '') (lib.reverseList (lib.range 1 (entry.history.keep - 1)))}
           fi
         ''}
         install -m0644 "$placed" "${espFile}.new"
         mv -f "${espFile}.new" "${espFile}"   # rename = atomic on the same fs
+        ${lib.optionalString (entry.history.keep > 1) ''
+          # A newly-adopted history depth can start with only the current UKI
+          # on disk. Backfill missing slots from the nearest known-good image;
+          # this never replaces an existing older slot.
+          ${lib.concatMapStringsSep "\n" (index: ''
+            if [ ! -f "${espDir}/${historyFileNameFor entry.espFileName index}" ]; then
+              cp -f "${espDir}/${historyFileNameFor entry.espFileName (index - 1)}" "${espDir}/${historyFileNameFor entry.espFileName index}"
+            fi
+          '') (lib.range 1 (entry.history.keep - 1))}
+        ''}
         sync
 
         ${lib.optionalString entry.bootEntry.enable ''
@@ -242,17 +258,25 @@ in
           };
         };
 
-        rotate = lib.mkOption {
-          type = lib.types.bool;
-          default = true;
+        history.keep = lib.mkOption {
+          type = lib.types.ints.positive;
+          default = 1;
           description = ''
-            Keep the previously-placed UKI as a one-step rollback, at
-            `<espFileName without .efi>-prev.efi`, the exact shape the source
-            pipeline field-proved (`myhost-rescue.efi` /
-            `myhost-rescue-prev.efi`)? Only rotates when the newly-built UKI
-            actually differs from what is already placed (a byte-for-byte
-            `cmp`), so a re-run after a lost/absent state marker never
-            clobbers a genuine previous version with an identical copy.
+            Number of self-contained UKIs to retain for this entry, including
+            the current file. History entry one is `-prev.efi`; later entries
+            are `-prev-2.efi`, `-prev-3.efi`, and so on. Rotation happens only
+            when the newly-built UKI differs byte-for-byte, so a retry cannot
+            overwrite a genuine older rescue with an identical current image.
+          '';
+        };
+
+        espCapacityMiB = lib.mkOption {
+          type = lib.types.nullOr lib.types.ints.positive;
+          default = null;
+          description = ''
+            Worst-case ESP budget for one retained UKI of this entry. Required
+            when nixboot.generations.capacity.enable is on, so protected extra
+            UKIs are accounted for before normal generations are admitted.
           '';
         };
 
@@ -352,11 +376,11 @@ in
             assertion =
               let
                 paths = lib.flatten (lib.mapAttrsToList
-                  (_: entry: [ entry.espFileName ] ++ lib.optional entry.rotate (prevFileNameFor entry.espFileName))
+                  (_: entry: historyFileNamesFor entry.espFileName entry.history.keep)
                   cfg.extraEntries);
               in
               lib.length paths == lib.length (lib.unique paths);
-            message = "nixboot.extraEntries: two entries resolve to the same ESP path (including an auto-derived -prev.efi rotation target) -- each entry, and its rotation pair if rotate = true, needs its own espFileName.";
+            message = "nixboot.extraEntries: two entries resolve to the same ESP path (including auto-derived retained-history targets) -- each entry needs an espFileName whose complete history is disjoint from every other entry.";
           }
         ];
 

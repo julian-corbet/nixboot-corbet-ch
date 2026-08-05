@@ -48,6 +48,7 @@ let
       enable = lib.mkOption { type = lib.types.bool; default = false; };
       pkiBundle = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
       bootCounting.initialTries = lib.mkOption { type = lib.types.nullOr lib.types.int; default = null; };
+      package = lib.mkOption { type = lib.types.package; default = pkgs.lzbt; };
       # autoGenerateKeys.enable: added alongside pkiBundle/keySource actually reaching
       # boot.lanzaboote.* (modules/nixboot.nix) -- see the secureBoot fixtures below.
       autoGenerateKeys.enable = lib.mkOption { type = lib.types.bool; default = false; };
@@ -209,6 +210,22 @@ let
     nixboot.bootCounting.tries = 3;
   };
 
+  cfg-capacity-retention = evalFor {
+    nixboot.loader.program = "lanzaboote";
+    nixboot.esp.capacityMiB = 512;
+    nixboot.generations.keep = 4;
+    nixboot.generations.capacity = {
+      enable = true;
+      lanzabootePackage = pkgs.hello;
+    };
+    nixboot.extraEntries.rescue = {
+      toplevel = fakeToplevel;
+      espFileName = "myhost-rescue.efi";
+      history.keep = 3;
+      espCapacityMiB = 50;
+    };
+  };
+
   # ── remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set ──────
   # boot.initrd.systemd.enable = true is REQUIRED here: the sealed path (Path A) writes
   # entirely into boot.initrd.systemd.services.*, which the classic initrd builder never
@@ -268,10 +285,18 @@ let
       (cfg-signed-decoupled.nixboot.extraEntries.bmc.bootEntry.label == "bmc")
       "got: ${builtins.toJSON cfg-signed-decoupled.nixboot.extraEntries.bmc.bootEntry.label}")
 
-    # --- rotate defaults true --------------------------------------------------------
-    (check "rotate-defaults-true"
-      (cfg-none-unsigned.nixboot.extraEntries.rescue.rotate == true)
-      "got: ${builtins.toJSON cfg-none-unsigned.nixboot.extraEntries.rescue.rotate}")
+    # --- extra-entry history has an explicit one-UKI default -------------------------
+    (check "history-defaults-to-current-only"
+      (cfg-none-unsigned.nixboot.extraEntries.rescue.history.keep == 1)
+      "got: ${builtins.toJSON cfg-none-unsigned.nixboot.extraEntries.rescue.history.keep}")
+
+    (check "capacity-retention/wraps-lzbt-and-accounts-extra-ukis"
+      (
+        cfg-capacity-retention.boot.lanzaboote.package == cfg-capacity-retention.system.build.nixbootLanzabooteRetention
+        && cfg-capacity-retention.nixboot.extraEntries.rescue.history.keep == 3
+        && cfg-capacity-retention.nixboot.generations.capacity.generationMiB == 64
+      )
+      "capacity-retention did not render the lzbt wrapper or preserve the declared rescue history budget")
 
     # --- systemd wiring: async by the timer, never wantedBy multi-user.target ----------
     (check "timer-drives-it-not-boot"
@@ -504,12 +529,24 @@ let
       })
       "expected forcing system.build.toplevel to fail (two entries resolve to the same ESP path) but it succeeded")
 
-    (check "rotate-prev-collides-with-another-entrys-espFileName/eval-fails"
+    (check "history-target-collides-with-another-entrys-espFileName/eval-fails"
       (evalFailsBuild {
-        nixboot.extraEntries.a = { toplevel = fakeToplevel; espFileName = "x.efi"; rotate = true; };
-        nixboot.extraEntries.b = { toplevel = fakeToplevel; espFileName = "x-prev.efi"; rotate = false; };
+        nixboot.extraEntries.a = { toplevel = fakeToplevel; espFileName = "x.efi"; history.keep = 2; };
+        nixboot.extraEntries.b = { toplevel = fakeToplevel; espFileName = "x-prev.efi"; };
       })
-      "expected forcing system.build.toplevel to fail (a's auto-derived -prev.efi collides with b's own espFileName) but it succeeded")
+      "expected forcing system.build.toplevel to fail (a retained-history target collides with b's own espFileName) but it succeeded")
+
+    (check "capacity-retention/requires-an-extra-entry-budget/eval-fails"
+      (evalFailsBuild {
+        nixboot.loader.program = "lanzaboote";
+        nixboot.esp.capacityMiB = 512;
+        nixboot.generations.capacity = {
+          enable = true;
+          lanzabootePackage = pkgs.hello;
+        };
+        nixboot.extraEntries.rescue = { toplevel = fakeToplevel; espFileName = "myhost-rescue.efi"; };
+      })
+      "expected capacity retention with an unbudgeted extra entry to fail but it succeeded")
 
     (check "invalid-attribute-name/eval-fails"
       (evalFailsBuild {

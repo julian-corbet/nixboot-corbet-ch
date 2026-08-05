@@ -100,7 +100,7 @@ from a DIFFERENT toplevel (a foreign `nixosConfiguration`'s own
 `system.build.toplevel` is the common case — a rescue system, a BMC-recovery
 image), asserted to never collide with that `nixos-` prefix, so it survives
 both loaders' generation GC untouched. It is built, optionally signed,
-placed, optionally rotated as a current/previous pair, and optionally
+placed, retained as an explicit bounded history, and optionally
 registered as a firmware NVRAM boot entry by its own maintainer service —
 one per attrset entry, driven by a timer, never a boot/switch dependency
 (the same "never block the boot/switch transaction on an ESP write"

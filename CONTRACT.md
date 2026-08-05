@@ -85,17 +85,17 @@ automatically. It refuses to proceed unless it reads
 477-489`). Firmware NVRAM is the one piece of state this module cannot roll
 back, so enrollment only happens because a human chose to run it.
 
-**B7 — `generations.keep` must outlive this host's own rebuild cadence.**
-The kept-generation count is the guaranteed manual rollback path; it must
-exceed how many generations this host can build in one uptime, or the
-*currently running* system drains out of its own boot menu before anyone
-needs it. This is a documented, previously-shipped incident, not a
-hypothetical: `keep = 5` at roughly 10 generations/day emptied the menu
-within hours (`modules/nixboot.nix:210-222`).
-For a lanzaboote host using `bootCounting.tries`, the same loss leaves
-`systemd-bless-boot` unable to mark the running entry good. `nixboot-verify`
-therefore reads that unit's final state, rather than treating a retained count
-alone as evidence that the active generation survived.
+**B7 — capacity retention never silently drops the booted generation.**
+Stock Lanzaboote chooses only the newest profile links and collects only after
+writing them. On a small ESP, that can both evict a long-running current entry
+and fail with no space before its own collector runs. With
+`generations.capacity.enable`, NixBoot selects the booted generation plus the
+newest alternatives within `generations.keep`, removes only unreferenced
+Lanzaboote artifacts before installation, and reserves declared write space.
+The capacity contract includes fixed files and every protected extra UKI; an
+impossible budget is an evaluation failure. `nixboot-verify` still reads
+`systemd-bless-boot`, because an existing failed unit is live evidence that a
+prior installation violated this invariant.
 
 **B7a — The firmware handoff must name the declared ESP.**
 `bootctl status` can find a valid loader on the ESP mounted by NixOS even when

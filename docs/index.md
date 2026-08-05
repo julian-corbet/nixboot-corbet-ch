@@ -47,10 +47,10 @@ filesystem there must carry, the declared capacity (for headroom
 warnings), and a list of foreign paths (vendor firmware capsules, `fwupd`'s
 own entry, rescue media) that must never be touched or garbage-collected.
 
-**`generations.keep` / `bootCounting.tries`** — how many past systems stay
-selectable from the boot menu, and, on a `lanzaboote`-managed host only, how
-many boots a fresh generation gets before the loader falls back to the
-previous one.
+**`generations.keep` / `.capacity` / `bootCounting.tries`** — how many normal
+systems stay selectable, the optional capacity-accounted Lanzaboote collector
+that always retains the booted entry and a write reserve, and how many boots a
+fresh generation gets before the loader falls back to the previous one.
 
 **`secureBoot.*`** — whether this host's boot chain is signed with
 operator-owned keys, where the PKI bundle lives, whether the host trusts a
@@ -78,8 +78,8 @@ other) — see CONTRACT.md's B17.
 **`extraEntries.*`** — SECOND, non-default UKIs on the same ESP: a durable
 rescue, BMC-recovery, or fallback boot entry, built and signed by the same
 `ukify`+`sbsign` pipeline, placed under an operator-named file that never
-collides with either loader's own generation-GC prefix, optionally rotated
-as a current/previous pair, and optionally registered as an idempotent
+collides with either loader's own generation-GC prefix, retained as an
+explicit bounded history, and optionally registered as an idempotent
 firmware NVRAM boot entry. Deliberately independent of
 `generations.keep`/`bootCounting.tries` (which only ever govern
 loader.program's own generations) and of `secureBoot.enable`/`loader.program`

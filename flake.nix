@@ -13,7 +13,7 @@
     in
     {
       nixosModules = {
-        # Two files, one option namespace: modules/extra-entries.nix adds
+        # Three files, one option namespace: modules/extra-entries.nix adds
         # nixboot.extraEntries.* alongside modules/nixboot.nix's own option
         # tree, the same "reads options it does not declare" composition
         # this module already uses for boot.lanzaboote.* (see the "ONE
@@ -21,7 +21,11 @@
         # two files of the SAME flake rather than across flakes, so both are
         # always composed together.
         nixboot = {
-          imports = [ ./modules/nixboot.nix ./modules/extra-entries.nix ];
+          imports = [
+            ./modules/nixboot.nix
+            ./modules/extra-entries.nix
+            ./modules/lanzaboote-retention.nix
+          ];
         };
         default = self.nixosModules.nixboot;
       };
