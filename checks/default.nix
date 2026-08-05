@@ -548,6 +548,14 @@ let
       })
       "expected capacity retention with an unbudgeted extra entry to fail but it succeeded")
 
+    (check "capacity-retention/requires-the-composed-lanzaboote-package/eval-fails"
+      (evalFailsBuild {
+        nixboot.loader.program = "lanzaboote";
+        nixboot.esp.capacityMiB = 512;
+        nixboot.generations.capacity.enable = true;
+      })
+      "expected capacity retention without its composed lzbt package to fail but it succeeded")
+
     (check "invalid-attribute-name/eval-fails"
       (evalFailsBuild {
         nixboot.extraEntries."has a space" = { toplevel = fakeToplevel; espFileName = "x.efi"; };

@@ -734,10 +734,15 @@ in
       };
 
       lanzabootePackage = lib.mkOption {
-        type = lib.types.package;
-        default = pkgs.lzbt;
-        defaultText = lib.literalExpression "pkgs.lzbt";
-        description = "The upstream lzbt package wrapped by the capacity-retention installer. Override only when the host deliberately uses a compatible Lanzaboote build.";
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = ''
+          Exact upstream `lzbt` package from the Lanzaboote flake composed by
+          this host. Required when capacity retention is enabled. Lanzaboote
+          deliberately supplies this tool itself rather than through nixpkgs;
+          taking it explicitly keeps the installer, signing stub, and module
+          on the same pinned upstream release.
+        '';
       };
     };
 

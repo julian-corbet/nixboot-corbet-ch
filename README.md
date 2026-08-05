@@ -236,7 +236,11 @@ had to be added here first to make the comparison honest.
 
             generations = {
               keep = 4; # booted generation plus three newest alternatives
-              capacity.enable = true; # small Lanzaboote ESP
+              capacity = {
+                enable = true; # small Lanzaboote ESP
+                # `lzbt` comes from the exact Lanzaboote input this host imports.
+                lanzabootePackage = inputs.lanzaboote.packages.${pkgs.stdenv.hostPlatform.system}.lzbt;
+              };
             };
           };
         }

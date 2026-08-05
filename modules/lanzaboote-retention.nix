@@ -23,7 +23,7 @@ let
   everyExtraEntryBudgeted = lib.all (entry: entry.espCapacityMiB != null) (lib.attrValues extraEntries);
   requiredMiB = capacity.fixedMiB + capacity.reserveMiB + capacity.generationMiB * cfg.generations.keep + capacity.extraReservedMiB + entryBudgetMiB;
 
-  retainedLzbt = pkgs.writeShellApplication {
+  retainedLzbt = if capacity.lanzabootePackage == null then null else pkgs.writeShellApplication {
     name = "lzbt";
     runtimeInputs = [
       capacity.lanzabootePackage
@@ -198,11 +198,16 @@ let
   };
 in
 {
-  config = lib.mkIf (cfg.enable && capacity.enable) {
+  config = lib.mkMerge [
+    (lib.mkIf (cfg.enable && capacity.enable) {
     assertions = [
       {
         assertion = cfg.loader.program == "lanzaboote";
         message = "nixboot.generations.capacity.enable is a Lanzaboote-specific retention path; set loader.program = \"lanzaboote\" or leave capacity.enable = false.";
+      }
+      {
+        assertion = capacity.lanzabootePackage != null;
+        message = "nixboot.generations.capacity.enable requires generations.capacity.lanzabootePackage from the exact Lanzaboote flake composed by this host; lzbt is not a nixpkgs package.";
       }
       {
         assertion = cfg.esp.capacityMiB != null;
@@ -217,8 +222,11 @@ in
         message = "nixboot.generations.capacity budget is ${toString requiredMiB} MiB (fixed ${toString capacity.fixedMiB} + reserve ${toString capacity.reserveMiB} + ${toString cfg.generations.keep} normal generation(s) x ${toString capacity.generationMiB} + externally-maintained protected UKIs ${toString capacity.extraReservedMiB} + extraEntries UKIs ${toString entryBudgetMiB}), but esp.capacityMiB is only ${toString (if cfg.esp.capacityMiB == null then 0 else cfg.esp.capacityMiB)} MiB. Reduce retained entries or increase the ESP; do not ship an impossible boot budget.";
       }
     ];
+    })
 
-    boot.lanzaboote.package = lib.mkOverride 500 retainedLzbt;
-    system.build.nixbootLanzabooteRetention = retainedLzbt;
-  };
+    (lib.mkIf (cfg.enable && capacity.enable && capacity.lanzabootePackage != null) {
+      boot.lanzaboote.package = lib.mkOverride 500 retainedLzbt;
+      system.build.nixbootLanzabooteRetention = retainedLzbt;
+    })
+  ];
 }
