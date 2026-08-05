@@ -104,7 +104,9 @@ systemd-boot EFI artifact changes.
 Secure Boot signing is deliberately incomplete until a host supplies an explicit
 root-owned runtime `secureBoot.sbctlConfig` path. NixBoot signs only through that
 configuration; it never receives a private key, invents a default key directory,
-or puts key material in the Nix store.
+or puts key material in the Nix store. A secure stage signs both its separate
+systemd-boot binary and its NixBoot-owned UKIs; it never signs or replaces the
+current fallback path before the separately reviewed cutover.
 
 ```nix
 {

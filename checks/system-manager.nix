@@ -113,9 +113,13 @@ let
       )
       "NixBoot did not declare the pacman lifecycle hook")
 
-    (check "secure-stage/signs-only-staged-loader-artifacts"
-      (lib.hasInfix "/usr/bin/sbctl --config \"$sbctl_config\" sign -s \"$output\"" stagedSecure.systemd.services.${stage}.script)
-      "secure stage script has no explicit runtime-configured sbctl signing command")
+    (check "secure-stage/signs-the-staged-loader-and-ukis"
+      (
+        lib.hasInfix "loader_output=\"$esp/EFI/systemd/systemd-bootx64.efi\"" stagedSecure.systemd.services.${stage}.script
+        && lib.hasInfix "/usr/bin/sbctl --config \"$sbctl_config\" sign -s \"$loader_output\"" stagedSecure.systemd.services.${stage}.script
+        && lib.hasInfix "/usr/bin/sbctl --config \"$sbctl_config\" sign -s \"$output\"" stagedSecure.systemd.services.${stage}.script
+      )
+      "secure stage does not sign every staged EFI artifact through the runtime sbctl configuration")
 
     (check "secure-stage-without-runtime-sbctl-config-asserts"
       (assertionFails {

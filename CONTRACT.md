@@ -269,7 +269,10 @@ UKI set rather than depending on a retired foreign-loader hook.
 When Secure Boot signing is enabled, an explicit root-owned runtime
 `secureBoot.sbctlConfig` is mandatory. That configuration is the host's
 secret-delivery boundary: NixBoot invokes `sbctl` through it but never
-materializes or defaults a private-key location.
+materializes or defaults a private-key location. The explicit stage signs its
+separate systemd-boot EFI binary and NixBoot-owned UKIs under that identity;
+it does not sign or replace the active fallback until the separately reviewed
+cutover.
 
 **B21 — `secureBoot.pkiBundle` / `keySource` actually reach the thing that
 signs UKIs, not just the tools that assume it did.**

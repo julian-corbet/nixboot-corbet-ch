@@ -112,8 +112,9 @@ let
 
     # This intentionally does not write EFI/BOOT/BOOTX64.EFI and does not touch NVRAM. The
     # current loader remains the recovery path until an operator verifies this staged one locally.
-    /usr/bin/install -Dm0644 /usr/lib/systemd/boot/efi/systemd-bootx64.efi \
-      "$esp/EFI/systemd/systemd-bootx64.efi"
+    loader_output="$esp/EFI/systemd/systemd-bootx64.efi"
+    /usr/bin/install -Dm0644 /usr/lib/systemd/boot/efi/systemd-bootx64.efi "$loader_output"
+    [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$loader_output"
     /usr/bin/install -Dm0644 ${cmdlineFile} /etc/kernel/cmdline
     /usr/bin/install -Dm0644 ${loaderConfFile} "$esp/loader/loader.conf"
 
