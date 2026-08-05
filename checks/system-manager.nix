@@ -61,11 +61,23 @@ let
       cutover.enable = true;
     };
   });
+  retirement = evalBoot (lib.recursiveUpdate base {
+    nixboot.systemdBoot = {
+      stage.enable = true;
+      cutover.enable = true;
+      retireLimine = {
+        enable = true;
+        legacyArtifacts = [ "/boot/limine.conf" ];
+        protectedPaths = [ "/boot/EFI/Linux/nixrescue.efi" ];
+      };
+    };
+  });
 
   check = name: ok: detail: { inherit name ok detail; };
   stage = "nixboot-systemd-boot-stage";
   verify = "nixboot-systemd-boot-verify";
   cutoverUnit = "nixboot-systemd-boot-cutover";
+  retireLimineUnit = "nixboot-systemd-boot-retire-limine";
   pacmanHook = "pacman.d/hooks/95-nixboot-systemd-boot.hook";
 
   results = [
@@ -102,6 +114,23 @@ let
         && lib.hasInfix "EFI/BOOT/BOOTX64.EFI" cutover.systemd.services.${cutoverUnit}.script
       )
       "final cutover unit is missing a manual verification or firmware/fallback gate")
+
+    (check "retire-limine/manual-unit-runs-only-after-proven-systemd-boot"
+      (
+        retirement.systemd.services ? "${retireLimineUnit}"
+        && !(retirement.systemd.services.${retireLimineUnit} ? "wantedBy")
+        && lib.elem "nixboot-systemd-boot-cutover.service" retirement.systemd.services.${retireLimineUnit}.after
+        && lib.hasInfix "BootCurrent" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "BootOrder" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "expected exactly one Limine EFI entry" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "pacman -Rns --noconfirm --nosave" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "90-mkinitcpio-install.hook" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "zz-sbctl.hook" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "/usr/bin/cmp" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "/usr/bin/ln" retirement.systemd.services.${retireLimineUnit}.script
+        && lib.hasInfix "overlaps protected path" retirement.systemd.services.${retireLimineUnit}.script
+      )
+      "Limine retirement lost its manual current-boot, NVRAM, package, or native-hook guard")
 
     (check "stage/does-not-auto-start-or-overwrite-fallback"
       (
@@ -163,6 +192,16 @@ let
         };
       })
       "expected cutover.enable without stage.enable to fail an assertion")
+
+    (check "retire-limine-without-cutover-or-artifact-guards-asserts"
+      (assertionFails {
+        nixboot.systemdBoot = {
+          enable = true;
+          stage.enable = true;
+          retireLimine.enable = true;
+        };
+      })
+      "expected Limine retirement without cutover and explicit artifact protection to fail assertions")
 
     (check "stage-without-explicit-kernel-cmdline-asserts"
       (assertionFails {

@@ -268,6 +268,16 @@ Once the explicit stage gate is enabled, NixBoot also renders its own
 post-transaction pacman hook: native kernel `pkgbase` or systemd-boot EFI
 updates rerun the declared stage unit, so later upgrades rebuild the same
 UKI set rather than depending on a retired foreign-loader hook.
+
+**B21 — Limine retirement is a separate, post-boot manual operation.** A
+system-manager host may set `nixboot.systemdBoot.retireLimine.enable` only
+with `cutover.enable` and explicit legacy-artifact and protected-path lists.
+Before removing anything, the unit reruns NixBoot verification, requires a
+systemd-boot `BootCurrent` and first `BootOrder` entry, and finds exactly one
+Limine NVRAM path to delete. It masks the generic `mkinitcpio` and `sbctl`
+hooks, removes only declared files/packages, uses `rmdir` only for declared
+empty directories, and checks the protected path hashes afterwards. A staged
+loader or an EFI file alone is never grounds to delete the current loader.
 When Secure Boot signing is enabled, an explicit root-owned runtime
 `secureBoot.sbctlConfig` is mandatory. That configuration is the host's
 secret-delivery boundary: NixBoot invokes `sbctl` through it but never

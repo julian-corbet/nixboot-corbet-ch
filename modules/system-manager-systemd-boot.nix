@@ -48,7 +48,7 @@ let
   ) cfg.kernels;
 
   nativePackages = lib.unique (
-    [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" cfg.firmwarePackage ]
+    [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" "intel-ucode" cfg.firmwarePackage ]
     ++ kernelPackages
   );
 
@@ -265,6 +265,135 @@ let
 
     echo "nixboot: final systemd-boot cutover completed. Reboot only through the separately approved recovery test."
   '';
+
+  retireLimineScript = ''
+    set -euo pipefail
+
+    esp=${lib.escapeShellArg cfg.esp.mountPoint}
+    legacy_artifacts=( ${lib.concatMapStringsSep " " lib.escapeShellArg cfg.retireLimine.legacyArtifacts} )
+    legacy_empty_directories=( ${lib.concatMapStringsSep " " lib.escapeShellArg cfg.retireLimine.legacyEmptyDirectories} )
+    protected_paths=( ${lib.concatMapStringsSep " " lib.escapeShellArg cfg.retireLimine.protectedPaths} )
+    limine_packages=( ${lib.concatMapStringsSep " " lib.escapeShellArg cfg.retireLimine.packages} )
+
+    for command in /usr/bin/bootctl /usr/bin/cmp /usr/bin/efibootmgr /usr/bin/find /usr/bin/findmnt /usr/bin/install /usr/bin/ln /usr/bin/mktemp /usr/bin/pacman /usr/bin/readlink /usr/bin/rm /usr/bin/rmdir /usr/bin/sed /usr/bin/sha256sum /usr/bin/sort /usr/bin/systemctl /usr/bin/xargs; do
+      [ -x "$command" ] || { echo "nixboot: required native command is absent: $command" >&2; exit 1; }
+    done
+    [ "$(/usr/bin/findmnt -no FSTYPE --target "$esp")" = "vfat" ] || {
+      echo "nixboot: $esp is not the mounted FAT ESP; refusing Limine retirement." >&2
+      exit 1
+    }
+
+    # A staged file set is not enough. This host must be running the systemd-boot path that the
+    # final cutover registered before any fallback or Limine artifact can be retired.
+    /usr/bin/systemctl restart nixboot-systemd-boot-verify.service
+    /usr/bin/bootctl --esp-path="$esp" is-installed
+
+    boot_table="$(/usr/bin/efibootmgr -v)"
+    boot_current="$(printf '%s\n' "$boot_table" | sed -n -E 's/^BootCurrent:[[:space:]]*([[:xdigit:]]{4})$/\1/p')"
+    boot_order="$(printf '%s\n' "$boot_table" | sed -n -E 's/^BootOrder:[[:space:]]*([[:xdigit:],]+)$/\1/p')"
+    [ -n "$boot_current" ] && [ -n "$boot_order" ] || {
+      echo "nixboot: firmware did not report BootCurrent and BootOrder; refusing Limine retirement." >&2
+      exit 1
+    }
+    current_line="$(printf '%s\n' "$boot_table" | sed -n -E "/^Boot$boot_current([*[:space:]])/p")"
+    first_boot="''${boot_order%%,*}"
+    first_line="$(printf '%s\n' "$boot_table" | sed -n -E "/^Boot$first_boot([*[:space:]])/p")"
+    case "$current_line" in
+      *'\EFI\systemd\systemd-bootx64.efi'*|*'\EFI\BOOT\BOOTX64.EFI'*) ;;
+      *)
+        echo "nixboot: BootCurrent $boot_current is not systemd-boot; keep Limine as recovery and investigate." >&2
+        exit 1
+        ;;
+    esac
+    case "$first_line" in
+      *'\EFI\systemd\systemd-bootx64.efi'*) ;;
+      *)
+        echo "nixboot: first BootOrder entry is not the NixBoot systemd-boot entry; refusing Limine retirement." >&2
+        exit 1
+        ;;
+    esac
+
+    # NVRAM identifiers drift. Match the actual Limine device path and insist on exactly one
+    # match instead of assuming today's Boot0007 remains the correct target.
+    limine_entries=()
+    while IFS= read -r line; do
+      if [[ "$line" == Boot????* && "$line" == *'\EFI\limine\limine_x64.efi'* ]]; then
+        entry="''${line:4:4}"
+        [[ "$entry" =~ ^[[:xdigit:]]{4}$ ]] && limine_entries+=("$entry")
+      fi
+    done <<< "$boot_table"
+    if [ "''${#limine_entries[@]}" -ne 1 ]; then
+      echo "nixboot: expected exactly one Limine EFI entry, found ''${#limine_entries[@]}; refusing NVRAM changes." >&2
+      exit 1
+    fi
+
+    # A declaration error must not turn an explicit legacy-artifact list into a way to erase a
+    # recovery or vendor path. Check both child and parent relationships before anything changes.
+    for protected in "''${protected_paths[@]}"; do
+      for target in "''${legacy_artifacts[@]}" "''${legacy_empty_directories[@]}"; do
+        case "$target:$protected" in
+          "$protected":*|"$protected"/*:*|*:"$target"|*:"$target"/*)
+            echo "nixboot: legacy target $target overlaps protected path $protected; refusing retirement." >&2
+            exit 1
+            ;;
+        esac
+      done
+    done
+
+    hash_snapshot() {
+      local path
+      for path in "''${protected_paths[@]}"; do
+        [ -e "$path" ] || { echo "nixboot: protected path is missing: $path" >&2; return 1; }
+        if [ -f "$path" ]; then
+          /usr/bin/sha256sum "$path"
+        else
+          /usr/bin/find "$path" -type f -print0 | /usr/bin/sort -z | /usr/bin/xargs -0r /usr/bin/sha256sum
+        fi
+      done
+    }
+
+    before="$(/usr/bin/mktemp /run/nixboot-retire-limine.XXXXXX)"
+    after="$(/usr/bin/mktemp /run/nixboot-retire-limine.XXXXXX)"
+    trap '/usr/bin/rm -f "$before" "$after"' EXIT
+    hash_snapshot > "$before"
+
+    # Native hooks with these exact names have higher-precedence /etc masks. The generic
+    # mkinitcpio and global sbctl hooks would otherwise recreate non-UKI artifacts or sign a
+    # broader mutable set outside NixBoot's declared lifecycle.
+    for hook in 90-mkinitcpio-install.hook zz-sbctl.hook; do
+      hook_path="/etc/pacman.d/hooks/$hook"
+      /usr/bin/install -d -m0755 /etc/pacman.d/hooks
+      /usr/bin/rm -f "$hook_path"
+      /usr/bin/ln -s /dev/null "$hook_path"
+      [ "$(/usr/bin/readlink "$hook_path")" = /dev/null ] || {
+        echo "nixboot: failed to mask native hook $hook_path" >&2
+        exit 1
+      }
+    done
+
+    installed_packages=()
+    for package in "''${limine_packages[@]}"; do
+      /usr/bin/pacman -Q "$package" >/dev/null 2>&1 && installed_packages+=("$package")
+    done
+    if [ "''${#installed_packages[@]}" -gt 0 ]; then
+      /usr/bin/pacman -Rns --noconfirm --nosave "''${installed_packages[@]}"
+    fi
+
+    /usr/bin/efibootmgr --delete-bootnum --bootnum "''${limine_entries[0]}"
+    for path in "''${legacy_artifacts[@]}"; do
+      /usr/bin/rm -f "$path"
+    done
+    for path in "''${legacy_empty_directories[@]}"; do
+      /usr/bin/rmdir --ignore-fail-on-non-empty "$path"
+    done
+
+    hash_snapshot > "$after"
+    if ! /usr/bin/cmp -s "$before" "$after"; then
+      echo "nixboot: protected EFI artifact changed during Limine retirement; investigate immediately." >&2
+      exit 1
+    fi
+    echo "nixboot: Limine retirement completed; systemd-boot is now the sole loader path."
+  '';
 in
 {
   options.nixboot.systemdBoot = {
@@ -348,6 +477,42 @@ in
       };
     };
 
+    retireLimine = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Render the manual post-boot Limine-retirement unit. It removes only the declared
+          Limine packages, files, NVRAM entry, and native hooks after a physical systemd-boot
+          boot has succeeded. It is never wanted automatically.
+        '';
+      };
+
+      packages = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ "limine" "limine-mkinitcpio-hook" ];
+        description = "Native packages removed with --nosave after the systemd-boot cutover is proven.";
+      };
+
+      legacyArtifacts = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Exact legacy Limine files to remove; directories are refused here and handled separately.";
+      };
+
+      legacyEmptyDirectories = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Legacy directories to remove only when empty after the exact artifact retirement.";
+      };
+
+      protectedPaths = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Non-NixBoot EFI paths whose complete SHA-256 file set must remain unchanged during retirement.";
+      };
+    };
+
     archPackages = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       readOnly = true;
@@ -381,6 +546,18 @@ in
         assertion = !cfg.cutover.enable || cfg.stage.enable;
         message = "nixboot.systemdBoot.cutover.enable requires stage.enable: a final fallback/NVRAM change is only valid after the separate staged path exists.";
       }
+      {
+        assertion = !cfg.retireLimine.enable || cfg.cutover.enable;
+        message = "nixboot.systemdBoot.retireLimine.enable requires cutover.enable: Limine is retired only after final systemd-boot fallback/NVRAM ownership is declared.";
+      }
+      {
+        assertion = !cfg.retireLimine.enable || cfg.retireLimine.legacyArtifacts != [ ];
+        message = "nixboot.systemdBoot.retireLimine.enable requires explicit legacyArtifacts; never use a broad directory deletion on an ESP.";
+      }
+      {
+        assertion = !cfg.retireLimine.enable || cfg.retireLimine.protectedPaths != [ ];
+        message = "nixboot.systemdBoot.retireLimine.enable requires protectedPaths to detect unintended changes to recovery or firmware artifacts.";
+      }
       ];
 
       systemd.services = lib.mkIf cfg.stage.enable ({
@@ -401,6 +578,13 @@ in
         after = [ "nixboot-systemd-boot-stage.service" ];
         serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
         script = cutoverScript;
+      };
+      } // lib.optionalAttrs cfg.retireLimine.enable {
+      nixboot-systemd-boot-retire-limine = {
+        description = "NixBoot: retire Limine only after a proven systemd-boot cutover";
+        after = [ "nixboot-systemd-boot-cutover.service" ];
+        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+        script = retireLimineScript;
       };
       });
 

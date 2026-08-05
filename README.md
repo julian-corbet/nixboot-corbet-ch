@@ -116,6 +116,14 @@ enabled to replace the active fallback and create the systemd-boot firmware
 entry. It is never enabled automatically and a source declaration keeps it
 off until the staged loader has completed a physical boot test.
 
+`retireLimine.enable` is the final manual gate for a host migrating away from
+Limine. It is available only with a declared cutover and explicit artifact and
+protection lists. The unit verifies the current boot and first `BootOrder`
+entry are systemd-boot, verifies NixBoot's staged artifacts, hashes every
+protected foreign EFI path, masks the generic native artifact hooks, removes
+the one path-matched Limine NVRAM entry and declared legacy files, then checks
+the protected hashes again. It never deletes a directory recursively.
+
 ```nix
 {
   inputs.nixboot.url = "github:julian-corbet/nixboot-corbet-ch";

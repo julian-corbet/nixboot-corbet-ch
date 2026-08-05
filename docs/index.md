@@ -153,5 +153,10 @@ stage gate is enabled, its declared pacman hook regenerates the same UKIs on
 native kernel or systemd-boot EFI updates. See CONTRACT.md's B20 for the
 exact boundary and gates.
 
+For a clean break from Limine, `retireLimine.enable` renders one more manual
+post-cutover unit. It refuses to run until firmware is booting systemd-boot,
+then removes only explicitly named legacy artifacts and the matching Limine
+NVRAM entry while hash-checking host-declared recovery and firmware files.
+
 See [`docs/faq.md`](faq.md) for the boundary questions this design
 provokes, and [`CONTRACT.md`](../CONTRACT.md) for the full behavior list.
