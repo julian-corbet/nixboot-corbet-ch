@@ -239,36 +239,29 @@ limine cannot deliver (`modules/nixboot.nix`, the `boot.loader` merge block
 and the assertions block).
 
 **B19 — limine's fixed config search order is a shadow trap `nixboot-verify`
-checks for, on both backends.**
+checks for on the NixOS backend.**
 `<esp.mountPoint>/limine/limine.conf` beats `<esp.mountPoint>/limine.conf`
 in limine's own, non-configurable search order; the loser is ignored
-SILENTLY, not reported as a conflict. `nixboot-verify`'s Check 1 (NixOS)
-and `nixboot-limine-verify` (system-manager, below) both PASS/FAIL on the
-winning path's presence and separately WARN if the shadowed, losing path
-also exists — inert today, but it would become the ACTIVE config the
-instant the winning file ever disappears, with zero warning from limine
+SILENTLY, not reported as a conflict. `nixboot-verify`'s Check 1 PASSes or
+FAILs on the winning path's presence and separately WARNs if the shadowed,
+losing path also exists — inert today, but it would become the ACTIVE config
+the instant the winning file ever disappears, with zero warning from limine
 itself at that moment.
 
-**B20 — The system-manager backend is a deliberately narrow slice, not a
-second copy of the NixOS module.**
-`modules/system-manager-limine.nix` exposes its own `nixboot.limine.*` tree
-— not a reuse of `nixboot.loader.*` — because system-manager has no
-`boot.*` option surface at all, and no `system.build.toplevel` to chainload
-either (a system-manager host boots its own pacman-managed kernel, not a
-Nix-built generation). What it renders: the limine.conf HEADER
-(`timeout`/`editor_enabled`, via the pure `lib/render-limine-header.nix`),
-the loader EFI binary (from `pkgs.limine`), and — if `enrollConfig` is set
-— the config-hash enrollment. What it does NOT do, stated as a ceiling
-rather than faked: generate menu ENTRIES (`configText` is the operator's
-own hand-authored text — a system-manager host's installed kernels are
-pacman/mkinitcpio state, foreign to this module, the same foreign/Nix split
-`nixarch`'s own `modules/foreign-service.nix` draws for other pacman-owned
-services), BIOS/legacy install, or sign the loader binary itself (`sbctl
-sign` — a one-time, human-run operation with no system-manager counterpart
-in this first cut). `efiVariables = "write"` reuses the exact same
-idempotent/self-healing NVRAM registrar the NixOS backend's `extraEntries`
-uses (`lib/register-boot-entry.nix`, extracted specifically so neither
-backend drifts from the other's copy of that logic).
+**B20 — The system-manager backend declares a native systemd-boot + UKI
+chain without pretending the host is NixOS.**
+`modules/system-manager-systemd-boot.nix` exposes
+`nixboot.systemdBoot.*`, not `nixboot.loader.*`, because system-manager has
+no `boot.*` option surface or Nix-built kernel closure. It declares the
+native Arch package set, discovers actual releases under
+`/usr/lib/modules/*/pkgbase`, and builds uniquely-prefixed Type #2 UKIs with
+`mkinitcpio --uki` from an explicitly declared command line. The stage and
+verify units are manual even when declared: staging writes a separate
+`EFI/systemd/systemd-bootx64.efi`, `loader.conf`, and NixBoot-owned UKIs,
+but never changes `EFI/BOOT/BOOTX64.EFI`, NVRAM, or Secure Boot enrollment.
+An operator must physically boot the staged loader once before a separately
+reviewed cutover. This is the retained recovery path, not an imperative
+escape hatch: the files, commands, package set, and gates are all declared.
 
 **B21 — `secureBoot.pkiBundle` / `keySource` actually reach the thing that
 signs UKIs, not just the tools that assume it did.**

@@ -143,16 +143,11 @@ B18–B19.
 
 ## What does the system-manager backend (`systemManagerModules.nixboot`) actually cover?
 
-Much less than the NixOS module, on purpose. system-manager has no
-`boot.*` option surface and no `system.build.toplevel` to chainload — a
-system-manager host boots its own pacman-managed kernel, not a Nix-built
-generation — so `remoteUnlock`, `secureBoot`, `generations.keep`,
-`extraEntries`, and every systemd-boot/lanzaboote-specific knob have no
-counterpart there at all. What *is* soundly possible: rendering a
-limine.conf header, installing the limine EFI loader, optionally enrolling
-a config hash, and optionally registering a firmware NVRAM entry (reusing
-the exact same idempotent registrar `extraEntries.*.bootEntry` uses). The
-menu entries themselves are the operator's own text — a system-manager
-host's installed kernels are pacman/mkinitcpio state this module has no
-visibility into. See `modules/system-manager-limine.nix`'s header and
-CONTRACT.md's B20.
+It declares a native systemd-boot + UKI contract, not a NixOS kernel
+closure. The backend publishes the necessary Arch packages, finds the live
+pacman kernel releases by `pkgbase`, and uses `mkinitcpio --uki` to build
+declared, uniquely-prefixed UKIs. Its stage/verify units are manual even
+after declaration: they leave the active fallback and firmware NVRAM alone
+until a local boot proves the staged loader. Secure Boot enrollment remains
+a separately reviewed, physical-presence operation. See
+`modules/system-manager-systemd-boot.nix` and CONTRACT.md's B20.

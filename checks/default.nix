@@ -13,7 +13,7 @@
 # modules/nixboot.nix's own "ONE EXTERNAL DEPENDENCY" header note), so those fixtures exercise
 # the real module directly.
 #
-# checks/system-manager.nix is the separate suite for modules/system-manager-limine.nix (the
+# checks/system-manager.nix is the separate suite for modules/system-manager-systemd-boot.nix (the
 # system-manager backend) -- a different technique (a bare `lib.evalModules` stub, no
 # `nixos/lib/eval-config.nix`) because that backend has no NixOS-shaped `config` to evaluate at
 # all. See that file's own header for why.

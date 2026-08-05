@@ -54,10 +54,8 @@ let
   # buildable and testable (see checks/default.nix's idempotency proof)
   # without needing a real kernel, a real UKI, or real firmware NVRAM.
   #
-  # Lives in lib/register-boot-entry.nix, not inline here: modules/system-manager-limine.nix's
-  # `efiVariables = "write"` path needs the exact same idempotent/self-healing NVRAM logic (see
-  # that tool's own IDEMPOTENCY note) and must not drift out of sync with a second hand-copy.
-  # Pure `{ lib, pkgs }` -- no `config` reference -- so either backend can import it directly.
+  # Lives in lib/register-boot-entry.nix, not inline here, so every NixOS extra entry reuses the
+  # same independently buildable idempotency logic rather than maintaining a hand-copy.
   regTool = import ../lib/register-boot-entry.nix { inherit lib pkgs; };
   inherit (regTool) mkRegisterBootEntry registerBootEntry;
 

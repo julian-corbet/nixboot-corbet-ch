@@ -82,28 +82,22 @@ of this public module.
 
 ## The system-manager backend
 
-`systemManagerModules.nixboot` (`modules/system-manager-limine.nix`) is a
-**separate, deliberately narrow** module for hosts with no `boot.*` option
-surface at all — a plain Arch/CachyOS install managed by
-[system-manager](https://github.com/numtide/system-manager) rather than
-NixOS. It is not a second copy of the module above: system-manager has
-nothing resembling `boot.loader.*`, `boot.initrd.*`, or
-`system.build.toplevel` to chainload, so `remoteUnlock`, `secureBoot`'s
-sbctl/pkiBundle machinery, `generations.keep`, `extraEntries`, and every
-systemd-boot/lanzaboote-specific knob above have **no counterpart here at
-all** — stated plainly as a ceiling, not silently dropped.
+`systemManagerModules.nixboot` (`modules/system-manager-systemd-boot.nix`)
+is a separate backend for a plain Arch/CachyOS host managed by
+[system-manager](https://github.com/numtide/system-manager). It does not
+pretend the host has a NixOS kernel closure: it declares the native
+packages, discovers the installed kernel releases through their `pkgbase`
+files, and builds Type #2 UKIs with `mkinitcpio --uki`.
 
-What it *can* do soundly: render a limine.conf header
-(`timeout`/`editor_enabled`), install the limine EFI loader from
-`pkgs.limine`, optionally enroll a hash of the config
-(`nixboot.limine.enrollConfig`), and optionally register a firmware NVRAM
-boot entry via the exact same idempotent registrar the NixOS backend's
-`extraEntries.*.bootEntry` uses. The menu *entries* themselves
-(`nixboot.limine.configText`) are the operator's own hand-authored text —
-a system-manager host's installed kernels are pacman/mkinitcpio state this
-module has no visibility into, the same foreign/Nix boundary
-[nixarch](https://github.com/julian-corbet/nixarch-corbet-ch)'s own
-`modules/foreign-service.nix` draws for other pacman-owned services:
+The backend is deliberately staged. Merely enabling it selects packages;
+setting `stage.enable` makes manual stage/verify units available, but never
+starts them. Staging installs `EFI/systemd/systemd-bootx64.efi`, a loader
+configuration, and NixBoot-prefixed UKIs. It does **not** replace
+`EFI/BOOT/BOOTX64.EFI`, change NVRAM, or enroll Secure Boot keys. That gives
+an operator a physical one-shot firmware test before any cutover. Native
+kernel and firmware package names are published as `archPackages` for the
+consumer's package reconciler rather than installed by a second package
+manager.
 
 ```nix
 {
@@ -112,18 +106,16 @@ module has no visibility into, the same foreign/Nix boundary
   # a system-manager flake's own host config:
   imports = [ inputs.nixboot.systemManagerModules.default ];
 
-  nixboot.limine = {
+  nixboot.systemdBoot = {
     enable = true;
-    efiVariables = "removable";
-    timeout = 5;
-    configText = ''
-      /CachyOS
-          comment: current kernel
-          protocol: linux
-          kernel_path: boot():/vmlinuz-linux-cachyos
-          module_path: boot():/initramfs-linux-cachyos.img
-          cmdline: root=/dev/mapper/root rw
-    '';
+    kernels = [{
+      package = "linux-cachyos";
+      packageBase = "linux-cachyos";
+      headersPackage = "linux-cachyos-headers";
+      id = "cachyos";
+    }];
+    kernelCmdline = "rd.luks.name=example=cryptroot root=/dev/mapper/cryptroot rw";
+    stage.enable = true; # units are manual; this does not change firmware state
   };
 }
 ```
@@ -239,9 +231,8 @@ host already uses.
 | `flake.nix` | Flake entry point: `nixosModules.nixboot` / `.default`, `systemManagerModules.nixboot` / `.default`. |
 | `modules/nixboot.nix` | The NixOS module itself. |
 | `modules/extra-entries.nix` | `nixboot.extraEntries.*` — second, non-default UKIs on the same ESP (NixOS only). |
-| `modules/system-manager-limine.nix` | The system-manager backend — `nixboot.limine.*`, a narrower, separate option tree. |
+| `modules/system-manager-systemd-boot.nix` | Staged native systemd-boot and UKI backend for system-manager hosts. |
 | `lib/register-boot-entry.nix` | The idempotent/self-healing NVRAM registrar, shared by both backends. |
-| `lib/render-limine-header.nix` | Pure function rendering the limine.conf header, used by the system-manager backend. |
 | `docs/` | Reader-facing option-surface walkthrough and FAQ. |
 | `CONTRACT.md` | The option surface as a fixed behavioral contract. |
 | `checks/default.nix` | Eval-time tests for the NixOS module (+ one build-level idempotency proof). |

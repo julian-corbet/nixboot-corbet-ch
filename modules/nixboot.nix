@@ -415,9 +415,8 @@ in
           already does, unprompted) and separately WARNs if the losing,
           shadowed path also exists -- inert today, but it would become the
           ACTIVE config the moment the winning file ever goes missing, with
-          zero warning from limine itself. The system-manager backend
-          (modules/system-manager-limine.nix, for hosts with no `boot.*` at
-          all) hits the exact same trap and applies the same rule.
+          zero warning from limine itself. The separate system-manager backend
+          does not implement limine; it uses staged systemd-boot UKIs instead.
         '';
       };
 
@@ -1094,7 +1093,7 @@ in
             # secureBoot.enable for limine would silently promise a guarantee (per-generation signed
             # boot) it cannot deliver under that model -- refused outright rather than half-applied.
             assertion = !cfg.secureBoot.enable || (cfg.loader.program == "lanzaboote" && cfg.secureBoot.pkiBundle != null);
-            message = "nixboot.secureBoot.enable = true requires loader.program = \"lanzaboote\" (the only loader that signs and verifies what it boots) and secureBoot.pkiBundle set (a signed chain with nowhere to keep its keys is not a real chain). limine's own Secure Boot model (whole-config-hash enrollment, not per-generation signing) is a different mechanism this subsystem does not cover -- see nixboot.limine.enrollConfig on the system-manager backend, or boot.loader.limine.secureBoot.* directly on a NixOS host.";
+            message = "nixboot.secureBoot.enable = true requires loader.program = \"lanzaboote\" (the only loader this NixOS backend signs and verifies) and secureBoot.pkiBundle set (a signed chain with nowhere to keep its keys is not a real chain). limine's own Secure Boot model (whole-config-hash enrollment, not per-generation signing) is a different mechanism this subsystem does not cover; use boot.loader.limine.secureBoot.* directly on a NixOS host. The separate system-manager backend is a staged systemd-boot/UKI implementation.";
           }
           {
             # See loader.consoleMode/graceful/selfHeal's own option docs for exactly what each

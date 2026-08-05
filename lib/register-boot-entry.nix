@@ -1,11 +1,9 @@
 # lib/register-boot-entry.nix
 #
-# The idempotent, self-healing `efibootmgr` registrar -- extracted out of modules/extra-entries.nix
-# so BOTH backends that need to hand-register a firmware NVRAM boot entry (the NixOS
-# extraEntries.*.bootEntry mechanism, and the system-manager limine backend's own
-# `nixboot.limine.efiVariables = "write"` path) call the exact same tested logic instead of a second
-# copy drifting out of sync with the idempotency proof in checks/default.nix. Pure `{ lib, pkgs }` --
-# no `config`, no NixOS-only primitive -- so either caller can `import` it directly.
+# The idempotent, self-healing `efibootmgr` registrar -- extracted out of
+# modules/extra-entries.nix so every NixOS extra entry uses the exact same tested logic rather
+# than a hand-copy drifting away from checks/default.nix. Pure `{ lib, pkgs }`, with no config
+# reference, so a future backend can import it without duplicating this NVRAM safety mechanism.
 #
 # IDEMPOTENCY (the reason this exists as its own tool, not inlined per caller):
 # `efibootmgr --create` is NOT idempotent -- a naive create-on-every-run piles up duplicate NVRAM

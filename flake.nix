@@ -37,14 +37,12 @@
       # `loader.program = "limine"` needs NO such composition -- limine ships
       # inside nixpkgs itself, see the same header note.
 
-      # system-manager plane (Arch/CachyOS hosts): a deliberately narrow
-      # `nixboot.limine.*` tree, NOT a reuse of the NixOS module's `nixboot.loader.*` -- see
-      # modules/system-manager-limine.nix's own header for exactly why the rest of the NixOS
-      # boot stance (remoteUnlock, secureBoot, generations.keep, extraEntries, ...) has no
-      # counterpart here at all. Same "carve out only the sound half" shape as nixpower's own
-      # systemManagerModules (nixpower/modules/system-manager.nix).
+      # system-manager plane (Arch/CachyOS hosts): native systemd-boot plus mkinitcpio UKIs.
+      # This is deliberately separate from NixOS `nixboot.loader.*`: the system-manager backend
+      # owns a staged native-tool contract, not a NixOS kernel closure or automatic firmware
+      # cutover. See modules/system-manager-systemd-boot.nix.
       systemManagerModules = {
-        nixboot = ./modules/system-manager-limine.nix;
+        nixboot = ./modules/system-manager-systemd-boot.nix;
         default = self.systemManagerModules.nixboot;
       };
 
@@ -57,7 +55,7 @@
       # since limine ships inside nixpkgs -- see checks/default.nix's own
       # header). See checks/default.nix's own header, and checks/system-
       # manager.nix for the separate `lib.evalModules` stub-eval suite
-      # covering modules/system-manager-limine.nix (the same technique
+      # covering the native systemd-boot backend (the same technique
       # nixarch's own checks/default.nix uses for its system-manager
       # modules, since no real system-manager flake input is worth pulling
       # in just to prove an option surface renders correctly).

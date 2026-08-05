@@ -139,24 +139,15 @@ fixed, so `nixboot-verify` also warns if a lower-precedence, shadowed
 
 ## The system-manager backend
 
-`systemManagerModules.nixboot` (`modules/system-manager-limine.nix`) is a
-second, **separate** module for hosts with no `boot.*` option surface at
-all — system-manager on Arch/CachyOS, not NixOS. It is not a smaller copy
-of everything above: system-manager has nothing resembling
-`boot.loader.*`/`boot.initrd.*`, and no `system.build.toplevel` to
-chainload either, so `remoteUnlock`, `secureBoot`, `generations.keep`,
-`extraEntries`, and every systemd-boot/lanzaboote-specific knob have **no
-counterpart there at all**.
-
-What it does instead, under its own `nixboot.limine.*` tree: render a
-limine.conf header (`timeout`/`editor_enabled`), install the limine EFI
-loader, optionally enroll a hash of the installed config, and optionally
-register a firmware NVRAM entry — reusing the exact same idempotent
-registrar `extraEntries.*.bootEntry` uses above. The menu *entries*
-themselves are the operator's own text: a system-manager host's installed
-kernels are pacman/mkinitcpio state this module has no visibility into, so
-generating them would mean guessing, not declaring. See CONTRACT.md's B20
-for the full ceiling this module states rather than fakes.
+`systemManagerModules.nixboot` (`modules/system-manager-systemd-boot.nix`)
+is the separate Arch/CachyOS backend. It declares a native package set and
+uses the installed kernel `pkgbase` records to build Type #2 UKIs through
+`mkinitcpio --uki`; it does not pretend a system-manager host has a NixOS
+kernel closure. Its stage and verify units are manual by design. Staging
+writes a separate systemd-boot binary and NixBoot-owned UKIs but never
+changes the active fallback, NVRAM, or Secure Boot enrollment. A local boot
+of the staged binary proves the path before any cutover. See CONTRACT.md's
+B20 for the exact boundary and gates.
 
 See [`docs/faq.md`](faq.md) for the boundary questions this design
 provokes, and [`CONTRACT.md`](../CONTRACT.md) for the full behavior list.
