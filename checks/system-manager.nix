@@ -39,12 +39,16 @@ let
           id = "cachyos-lts";
         }
       ];
+      microcodePackage = "intel-ucode";
       kernelCmdline = "rd.luks.name=example=cryptroot root=/dev/mapper/cryptroot rw";
     };
   };
 
   disabled = evalBoot { };
   declared = evalBoot base;
+  generic = evalBoot (lib.recursiveUpdate base {
+    nixboot.systemdBoot.microcodePackage = null;
+  });
   staged = evalBoot (lib.recursiveUpdate base { nixboot.systemdBoot.stage.enable = true; });
   stagedSecure = evalBoot (lib.recursiveUpdate base {
     nixboot.systemdBoot = {
@@ -88,9 +92,14 @@ let
     (check "declared/native-package-selection-is-complete"
       (lib.all (package: lib.elem package declared.nixboot.systemdBoot.archPackages) [
         "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" "linux-firmware"
+        "intel-ucode"
         "linux-cachyos" "linux-cachyos-headers" "linux-cachyos-lts" "linux-cachyos-lts-headers"
       ])
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
+
+    (check "declared/microcode-is-host-selected-not-a-generic-intel-default"
+      (!(lib.elem "intel-ucode" generic.nixboot.systemdBoot.archPackages))
+      "generic packages: ${builtins.toJSON generic.nixboot.systemdBoot.archPackages}")
 
     (check "declared/no-stage-units-before-explicit-gate"
       (

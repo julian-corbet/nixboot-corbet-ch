@@ -97,7 +97,7 @@ will not fit. Only then does it install `EFI/systemd/systemd-bootx64.efi`, a
 loader configuration, and NixBoot-prefixed UKIs. It does **not** replace
 `EFI/BOOT/BOOTX64.EFI`, change NVRAM, or enroll Secure Boot keys. That gives
 an operator a physical one-shot firmware test before any cutover. Native
-kernel and firmware package names are published as `archPackages` for the
+kernel, firmware, and host-selected microcode package names are published as `archPackages` for the
 consumer's package reconciler rather than installed by a second package
 manager. After the explicit stage gate is enabled, NixBoot also declares the
 post-transaction pacman hook that rebuilds its UKIs when the native kernel or
@@ -133,6 +133,7 @@ the protected hashes again. It never deletes a directory recursively.
 
   nixboot.systemdBoot = {
     enable = true;
+    microcodePackage = "intel-ucode"; # Select the host CPU vendor explicitly.
     kernels = [{
       package = "linux-cachyos";
       packageBase = "linux-cachyos";

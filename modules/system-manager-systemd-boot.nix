@@ -48,7 +48,8 @@ let
   ) cfg.kernels;
 
   nativePackages = lib.unique (
-    [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" "intel-ucode" cfg.firmwarePackage ]
+    [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" cfg.firmwarePackage ]
+    ++ lib.optional (cfg.microcodePackage != null) cfg.microcodePackage
     ++ kernelPackages
   );
 
@@ -409,6 +410,12 @@ in
       type = lib.types.str;
       default = "linux-firmware";
       description = "Native firmware package kept with the boot-capable kernel set.";
+    };
+
+    microcodePackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional native CPU-vendor microcode package, selected by the consuming host.";
     };
 
     kernels = lib.mkOption {
