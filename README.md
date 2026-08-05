@@ -101,6 +101,11 @@ manager. After the explicit stage gate is enabled, NixBoot also declares the
 post-transaction pacman hook that rebuilds its UKIs when the native kernel or
 systemd-boot EFI artifact changes.
 
+Secure Boot signing is deliberately incomplete until a host supplies an explicit
+root-owned runtime `secureBoot.sbctlConfig` path. NixBoot signs only through that
+configuration; it never receives a private key, invents a default key directory,
+or puts key material in the Nix store.
+
 ```nix
 {
   inputs.nixboot.url = "github:julian-corbet/nixboot-corbet-ch";

@@ -93,6 +93,7 @@ let
     esp=${lib.escapeShellArg cfg.esp.mountPoint}
     prefix=${lib.escapeShellArg cfg.uki.prefix}
     secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
+    sbctl_config=${if cfg.secureBoot.sbctlConfig == null then "''" else lib.escapeShellArg cfg.secureBoot.sbctlConfig}
 
     for command in /usr/bin/findmnt /usr/bin/mkinitcpio /usr/bin/install /usr/bin/mktemp /usr/bin/sbctl; do
       [ -x "$command" ] || {
@@ -142,7 +143,7 @@ let
       rm -f "$temporary"
 
       if [ "$secure_boot" = yes ]; then
-        /usr/bin/sbctl sign -s "$output"
+        /usr/bin/sbctl --config "$sbctl_config" sign -s "$output"
       fi
 
       if [ "$fallback" = yes ]; then
@@ -150,7 +151,7 @@ let
         temporary="$(/usr/bin/mktemp "$esp/EFI/Linux/.$prefix-$id-fallback.XXXXXX")"
         /usr/bin/mkinitcpio --kernel "$release" --uki "$temporary" --cmdline /etc/kernel/cmdline -S autodetect
         /usr/bin/install -m0644 "$temporary" "$output"
-        [ "$secure_boot" != yes ] || /usr/bin/sbctl sign -s "$output"
+        [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$output"
       fi
 
       trap - RETURN
@@ -234,7 +235,19 @@ in
       editor = lib.mkOption { type = lib.types.bool; default = false; };
     };
 
-    secureBoot.enable = lib.mkEnableOption "sign staged NixBoot UKIs with the locally provisioned sbctl key";
+    secureBoot = {
+      enable = lib.mkEnableOption "sign staged NixBoot UKIs with a host-provisioned sbctl key";
+
+      sbctlConfig = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Root-owned runtime path to an sbctl configuration whose key and GUID paths are supplied
+          outside the Nix store. NixBoot never copies, generates, or persists Secure Boot private
+          material; the host's private secret-delivery module owns that lifecycle.
+        '';
+      };
+    };
 
     stage.enable = lib.mkOption {
       type = lib.types.bool;
@@ -270,6 +283,10 @@ in
       {
         assertion = lib.length (lib.unique (map (kernel: kernel.id) cfg.kernels)) == lib.length cfg.kernels;
         message = "nixboot.systemdBoot.kernels must use unique UKI ids.";
+      }
+      {
+        assertion = !cfg.secureBoot.enable || cfg.secureBoot.sbctlConfig != null;
+        message = "nixboot.systemdBoot.secureBoot.enable requires secureBoot.sbctlConfig: declare a root-owned runtime sbctl configuration through the host's secret-delivery mechanism, never a Nix store key path.";
       }
       ];
 

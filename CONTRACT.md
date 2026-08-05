@@ -266,6 +266,10 @@ Once the explicit stage gate is enabled, NixBoot also renders its own
 post-transaction pacman hook: native kernel `pkgbase` or systemd-boot EFI
 updates rerun the declared stage unit, so later upgrades rebuild the same
 UKI set rather than depending on a retired foreign-loader hook.
+When Secure Boot signing is enabled, an explicit root-owned runtime
+`secureBoot.sbctlConfig` is mandatory. That configuration is the host's
+secret-delivery boundary: NixBoot invokes `sbctl` through it but never
+materializes or defaults a private-key location.
 
 **B21 — `secureBoot.pkiBundle` / `keySource` actually reach the thing that
 signs UKIs, not just the tools that assume it did.**

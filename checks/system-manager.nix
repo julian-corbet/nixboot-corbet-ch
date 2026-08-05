@@ -49,7 +49,10 @@ let
   stagedSecure = evalBoot (lib.recursiveUpdate base {
     nixboot.systemdBoot = {
       stage.enable = true;
-      secureBoot.enable = true;
+      secureBoot = {
+        enable = true;
+        sbctlConfig = "/run/nixboot/secure-boot/sbctl.conf";
+      };
     };
   });
 
@@ -111,8 +114,17 @@ let
       "NixBoot did not declare the pacman lifecycle hook")
 
     (check "secure-stage/signs-only-staged-loader-artifacts"
-      (lib.hasInfix "/usr/bin/sbctl sign -s \"$output\"" stagedSecure.systemd.services.${stage}.script)
-      "secure stage script has no explicit sbctl signing command")
+      (lib.hasInfix "/usr/bin/sbctl --config \"$sbctl_config\" sign -s \"$output\"" stagedSecure.systemd.services.${stage}.script)
+      "secure stage script has no explicit runtime-configured sbctl signing command")
+
+    (check "secure-stage-without-runtime-sbctl-config-asserts"
+      (assertionFails {
+        nixboot.systemdBoot = {
+          enable = true;
+          secureBoot.enable = true;
+        };
+      })
+      "expected secureBoot.enable without secureBoot.sbctlConfig to fail an assertion")
 
     (check "stage-without-explicit-kernel-cmdline-asserts"
       (assertionFails {
