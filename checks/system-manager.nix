@@ -54,6 +54,15 @@ let
 
   disabled = evalBoot { };
   declared = evalBoot base;
+  firmwareTools = evalBoot (lib.recursiveUpdate base {
+    nixboot.firmware = {
+      fwupd.enable = true;
+      dmidecode.enable = true;
+    };
+  });
+  efitools = evalBoot (lib.recursiveUpdate base {
+    nixboot.tools.efitools.enable = true;
+  });
   missingMicrocode = assertionFails (lib.recursiveUpdate base {
     nixcpu.packages.bootMicrocode = {
       archPackage = null;
@@ -107,6 +116,18 @@ let
         "linux-cachyos" "linux-cachyos-headers" "linux-cachyos-lts" "linux-cachyos-lts-headers"
       ])
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
+
+    (check "firmware-tools/selects-fwupd-and-dmidecode"
+      (
+        lib.elem "fwupd" firmwareTools.nixboot.systemdBoot.archPackages
+        && lib.elem "dmidecode" firmwareTools.nixboot.systemdBoot.archPackages
+        && firmwareTools.nixboot.firmware.packageNames == [ "fwupd" "dmidecode" ]
+      )
+      "packages: ${builtins.toJSON firmwareTools.nixboot.systemdBoot.archPackages}")
+
+    (check "tools/efitools-selects-efitools-for-system-manager"
+      (lib.elem "efitools" efitools.nixboot.systemdBoot.archPackages)
+      "packages: ${builtins.toJSON efitools.nixboot.systemdBoot.archPackages}")
 
     (check "declared/microcode-must-come-from-nixcpu"
       missingMicrocode

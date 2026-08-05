@@ -52,10 +52,15 @@ let
     [ kernel.package ] ++ lib.optional (kernel.headersPackage != null) kernel.headersPackage
   ) cfg.kernels;
 
+  firmwareToolPackages = config.nixboot.firmware.packageNames;
+  efitoolsPackage = lib.optional config.nixboot.tools.efitools.enable "efitools";
+
   nativePackages = lib.unique (
     [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" cfg.firmwarePackage ]
     ++ lib.optional (microcodePackage != null) microcodePackage
     ++ kernelPackages
+    ++ firmwareToolPackages
+    ++ efitoolsPackage
   );
 
   cmdlineFile = pkgs.writeText "nixboot-kernel-cmdline" "${cfg.kernelCmdline}\n";
@@ -422,6 +427,8 @@ let
   '';
 in
 {
+  imports = [ ./firmware-tools.nix ./tool-options.nix ];
+
   options.nixboot.systemdBoot = {
     enable = lib.mkEnableOption "NixBoot's staged native systemd-boot and UKI backend";
 

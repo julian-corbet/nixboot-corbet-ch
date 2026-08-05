@@ -32,8 +32,9 @@
 #           whether the lanzaboote stub counts down failed boots
 #           (bootCounting.tries); the Secure Boot posture (secureBoot.*)
 #           and its operator-run enrollment command; the per-tool CLI
-#           exposure for sbctl/efitools/sbsigntool; the initrd-SSH remote
-#           unlock surface (remoteUnlock.*) -- NIC-up + sshd in the
+#           exposure for sbctl/efitools/sbsigntool; firmware maintenance and
+#           local SMBIOS inventory tools (firmware.fwupd and firmware.dmidecode);
+#           the initrd-SSH remote unlock surface (remoteUnlock.*) -- NIC-up + sshd in the
 #           initrd, the choice between a TPM2-sealed systemd credential
 #           and a plaintext build-time key for the host key, and the
 #           self-healing seal service that survives a Secure Boot key
@@ -367,6 +368,8 @@ let
     };
 in
 {
+  imports = [ ./firmware-tools.nix ./tool-options.nix ];
+
   options.nixboot = {
     enable = lib.mkEnableOption "nixboot: one declarative boot stance for this host, firmware handoff through to switch-root";
 
@@ -1036,48 +1039,6 @@ in
         description = "Is the sbctl key/enrollment/signature-status CLI on PATH? Defaults to secureBoot.enable, since sbctlCompat's whole point is a working `sbctl status` on this box -- override to false only to strip the tool while keeping the config file nixboot-verify can still fail loudly against.";
       };
 
-      efitools.enable = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = ''
-          Is `efi-readvar` on PATH, to back up the current PK/KEK/db/dbx
-          before a vendor BIOS flash? Worth turning on for any board whose
-          vendor update tooling reprograms NVRAM wholesale -- GIGABYTE's
-          F21 AFU update scripts, for example, pass `/n` (program NVRAM),
-          which should be treated as "enrollment wiped", not merely
-          "enrollment at risk".
-
-          efitools reads the firmware's CURRENT NVRAM variables directly,
-          independent of whichever tool enrolled them -- which is what makes
-          it worth carrying ALONGSIDE `tools.sbctl` rather than instead of
-          it. `sbctl status` answers "what does this host's own PKI say
-          should be enrolled"; `efi-readvar` answers "what is actually in
-          NVRAM", and only the second survives a firmware update as
-          evidence:
-
-            efi-readvar -v PK  -o pk.esl
-            efi-readvar -v KEK -o kek.esl
-            efi-readvar -v db  -o db.esl
-            efi-readvar -v dbx -o dbx.esl
-
-          Take those four before the flash, re-read them after, and compare.
-          Without the pre-flash copy there is nothing left to compare
-          against, so the only remaining evidence is the vendor's own
-          documentation of its update flags -- and a board that quietly kept
-          its keys is indistinguishable from one that quietly cleared them
-          until a boot fails to verify, by which point the enrollment that
-          would have proved it is already gone.
-
-          Deliberately NOT defaulted from `secureBoot.enable`, unlike
-          `tools.sbctl`/`tools.sbsigntool`: this is an inspect-and-back-up
-          tool for the firmware's own state, useful on a host that signs
-          nothing at all (someone auditing what a vendor shipped in db/dbx),
-          and pointless on a signing host that will never be flashed. Which
-          way round a given host is cannot be derived from its signing
-          posture, so it is asked rather than guessed.
-        '';
-      };
-
       sbsigntool.enable = lib.mkOption {
         type = lib.types.bool;
         default = cfg.secureBoot.enable;
@@ -1487,7 +1448,8 @@ in
           lib.optional cfg.tools.sbctl.enable pkgs.sbctl
           ++ lib.optional cfg.tools.efitools.enable pkgs.efitools
           ++ lib.optional cfg.tools.sbsigntool.enable pkgs.sbsigntool
-          ++ lib.optional (cfg.secureBoot.enrollTool.enable && cfg.secureBoot.enable) enrollSb;
+          ++ lib.optional (cfg.secureBoot.enrollTool.enable && cfg.secureBoot.enable) enrollSb
+          ++ map (name: lib.getAttr name pkgs) cfg.firmware.packageNames;
 
         # Exposed unconditionally (like `system.build.extraEntryMaintainers` /
         # `nixbootRegisterBootEntry` above) so `nix flake check` forces and

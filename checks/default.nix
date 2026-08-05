@@ -250,7 +250,23 @@ let
     nixboot.remoteUnlock.hostKeyPath = ./default.nix; # any real path; content is irrelevant here
   };
 
+  cfg-firmware-tools = evalFor {
+    nixboot.enable = true;
+    nixboot.firmware = {
+      fwupd.enable = true;
+      dmidecode.enable = true;
+    };
+  };
+
   results = [
+    (check "firmware-tools/selects-fwupd-and-dmidecode"
+      (
+        lib.elem pkgs.fwupd cfg-firmware-tools.environment.systemPackages
+        && lib.elem pkgs.dmidecode cfg-firmware-tools.environment.systemPackages
+        && cfg-firmware-tools.nixboot.firmware.packageNames == [ "fwupd" "dmidecode" ]
+      )
+      "packages: ${builtins.toJSON (pathNames cfg-firmware-tools)}")
+
     # --- decoupling from loader.program / secureBoot.enable (requirement 3) -------------
     (check "none-unsigned/builds-with-no-primary-chain-owned"
       (cfg-none-unsigned.systemd.services ? "nixboot-extra-entry-rescue")
