@@ -91,8 +91,10 @@ files, and builds Type #2 UKIs with `mkinitcpio --uki`.
 
 The backend is deliberately staged. Merely enabling it selects packages;
 setting `stage.enable` makes manual stage/verify units available, but never
-starts them. Staging installs `EFI/systemd/systemd-bootx64.efi`, a loader
-configuration, and NixBoot-prefixed UKIs. It does **not** replace
+starts them. Staging first builds all UKIs under `/var/tmp`, measures the
+additional ESP space they require, and fails without changing the ESP when it
+will not fit. Only then does it install `EFI/systemd/systemd-bootx64.efi`, a
+loader configuration, and NixBoot-prefixed UKIs. It does **not** replace
 `EFI/BOOT/BOOTX64.EFI`, change NVRAM, or enroll Secure Boot keys. That gives
 an operator a physical one-shot firmware test before any cutover. Native
 kernel and firmware package names are published as `archPackages` for the

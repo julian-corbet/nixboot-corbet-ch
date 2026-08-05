@@ -117,8 +117,11 @@ let
         && lib.hasInfix "/usr/bin/mkinitcpio --kernel" staged.systemd.services.${stage}.script
         && lib.hasInfix "--uki" staged.systemd.services.${stage}.script
         && lib.hasInfix "-S autodetect" staged.systemd.services.${stage}.script
+        && lib.hasInfix "/var/tmp/nixboot-systemd-boot" staged.systemd.services.${stage}.script
+        && lib.hasInfix "no ESP files were changed" staged.systemd.services.${stage}.script
+        && lib.hasInfix "required_bytes" staged.systemd.services.${stage}.script
       )
-      "stage script does not render the native mkinitcpio UKI contract")
+      "stage script does not render the native mkinitcpio UKI and ESP-capacity contract")
 
     (check "stage/pacman-hook-rebuilds-ukis-after-native-boot-updates"
       (

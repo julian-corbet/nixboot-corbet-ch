@@ -143,8 +143,10 @@ fixed, so `nixboot-verify` also warns if a lower-precedence, shadowed
 is the separate Arch/CachyOS backend. It declares a native package set and
 uses the installed kernel `pkgbase` records to build Type #2 UKIs through
 `mkinitcpio --uki`; it does not pretend a system-manager host has a NixOS
-kernel closure. Its stage and verify units are manual by design. Staging
-writes a separate systemd-boot binary and NixBoot-owned UKIs but never
+kernel closure. Its stage and verify units are manual by design. Staging first
+builds every UKI outside the ESP and refuses to write when its exact additional
+space requirement will not fit. It then writes a separate systemd-boot binary
+and NixBoot-owned UKIs but never
 changes the active fallback, NVRAM, or Secure Boot enrollment. A local boot
 of the staged binary proves the path before any cutover. Once that explicit
 stage gate is enabled, its declared pacman hook regenerates the same UKIs on

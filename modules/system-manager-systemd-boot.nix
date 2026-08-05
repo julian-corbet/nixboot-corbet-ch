@@ -95,7 +95,7 @@ let
     secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
     sbctl_config=${if cfg.secureBoot.sbctlConfig == null then "''" else lib.escapeShellArg cfg.secureBoot.sbctlConfig}
 
-    for command in /usr/bin/findmnt /usr/bin/mkinitcpio /usr/bin/install /usr/bin/mktemp /usr/bin/sbctl; do
+    for command in /usr/bin/basename /usr/bin/df /usr/bin/du /usr/bin/findmnt /usr/bin/install /usr/bin/mkinitcpio /usr/bin/mktemp /usr/bin/rm /usr/bin/sbctl /usr/bin/stat; do
       [ -x "$command" ] || {
         echo "nixboot: required native command is absent: $command" >&2
         echo "nixboot: activate the declared native package set before staging." >&2
@@ -108,19 +108,12 @@ let
       echo "nixboot: $esp is not the mounted FAT ESP; refusing to write boot artifacts." >&2
       exit 1
     }
-    /usr/bin/install -d -m0755 "$esp/EFI/Linux"
-
-    # This intentionally does not write EFI/BOOT/BOOTX64.EFI and does not touch NVRAM. The
-    # current loader remains the recovery path until an operator verifies this staged one locally.
-    loader_output="$esp/EFI/systemd/systemd-bootx64.efi"
-    /usr/bin/install -Dm0644 /usr/lib/systemd/boot/efi/systemd-bootx64.efi "$loader_output"
-    [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$loader_output"
-    /usr/bin/install -Dm0644 ${cmdlineFile} /etc/kernel/cmdline
-    /usr/bin/install -Dm0644 ${loaderConfFile} "$esp/loader/loader.conf"
+    staging_dir="$(/usr/bin/mktemp -d /var/tmp/nixboot-systemd-boot.XXXXXX)"
+    trap '/usr/bin/rm -rf "$staging_dir"' EXIT
 
     build_uki() {
       local package_base="$1" id="$2" fallback="$3"
-      local module_dir pkgbase release output temporary
+      local module_dir pkgbase release output
       local -a matches=()
 
       for module_dir in /usr/lib/modules/*; do
@@ -134,32 +127,65 @@ let
         exit 1
       fi
 
-      release="$(basename "''${matches[0]}")"
-      output="$esp/EFI/Linux/$prefix-$id.efi"
-      temporary="$(/usr/bin/mktemp "$esp/EFI/Linux/.$prefix-$id.XXXXXX")"
-      trap 'rm -f "$temporary"' RETURN
-
-      /usr/bin/mkinitcpio --kernel "$release" --uki "$temporary" --cmdline /etc/kernel/cmdline
-      /usr/bin/install -m0644 "$temporary" "$output"
-      rm -f "$temporary"
-
-      if [ "$secure_boot" = yes ]; then
-        /usr/bin/sbctl --config "$sbctl_config" sign -s "$output"
-      fi
+      release="$(/usr/bin/basename "''${matches[0]}")"
+      output="$staging_dir/$prefix-$id.efi"
+      /usr/bin/mkinitcpio --kernel "$release" --uki "$output" --cmdline ${cmdlineFile}
 
       if [ "$fallback" = yes ]; then
-        output="$esp/EFI/Linux/$prefix-$id-fallback.efi"
-        temporary="$(/usr/bin/mktemp "$esp/EFI/Linux/.$prefix-$id-fallback.XXXXXX")"
-        /usr/bin/mkinitcpio --kernel "$release" --uki "$temporary" --cmdline /etc/kernel/cmdline -S autodetect
-        /usr/bin/install -m0644 "$temporary" "$output"
-        [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$output"
+        output="$staging_dir/$prefix-$id-fallback.efi"
+        /usr/bin/mkinitcpio --kernel "$release" --uki "$output" --cmdline ${cmdlineFile} -S autodetect
       fi
-
-      trap - RETURN
-      rm -f "$temporary"
     }
 
     ${kernelCalls}
+
+    # Build everything off the ESP first. The ESP remains untouched until the exact new UKI
+    # sizes fit, so a small ESP fails closed instead of leaving a partial staged boot path.
+    loader_source=/usr/lib/systemd/boot/efi/systemd-bootx64.efi
+    loader_output="$esp/EFI/systemd/systemd-bootx64.efi"
+    mapfile -t df_lines < <(/usr/bin/df -B1 --output=avail "$esp")
+    available_bytes="''${df_lines[1]//[[:space:]]/}"
+    case "$available_bytes" in
+      ""|*[!0-9]*)
+        echo "nixboot: could not determine free space on $esp." >&2
+        exit 1
+        ;;
+    esac
+
+    required_bytes=$((1024 * 1024)) # FAT allocation and metadata reserve.
+    add_required_bytes() {
+      local source="$1" destination="$2" source_bytes destination_bytes
+      source_bytes="$(/usr/bin/stat --format=%s "$source")"
+      destination_bytes=0
+      [ ! -f "$destination" ] || destination_bytes="$(/usr/bin/stat --format=%s "$destination")"
+      if [ "$source_bytes" -gt "$destination_bytes" ]; then
+        required_bytes=$((required_bytes + source_bytes - destination_bytes))
+      fi
+    }
+
+    add_required_bytes "$loader_source" "$loader_output"
+    for uki in "$staging_dir"/*.efi; do
+      add_required_bytes "$uki" "$esp/EFI/Linux/$(/usr/bin/basename "$uki")"
+    done
+    if [ "$available_bytes" -lt "$required_bytes" ]; then
+      echo "nixboot: $esp has $available_bytes free bytes, but staging requires $required_bytes bytes." >&2
+      echo "nixboot: no ESP files were changed; free space or adjust the declared UKI set before retrying." >&2
+      exit 1
+    fi
+
+    /usr/bin/install -d -m0755 "$esp/EFI/Linux"
+    # This intentionally does not write EFI/BOOT/BOOTX64.EFI and does not touch NVRAM. The
+    # current loader remains the recovery path until an operator verifies this staged one locally.
+    /usr/bin/install -Dm0644 "$loader_source" "$loader_output"
+    [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$loader_output"
+    /usr/bin/install -Dm0644 ${cmdlineFile} /etc/kernel/cmdline
+    /usr/bin/install -Dm0644 ${loaderConfFile} "$esp/loader/loader.conf"
+
+    for uki in "$staging_dir"/*.efi; do
+      output="$esp/EFI/Linux/$(/usr/bin/basename "$uki")"
+      /usr/bin/install -m0644 "$uki" "$output"
+      [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$output"
+    done
 
     echo "nixboot: staged systemd-boot at $esp/EFI/systemd/systemd-bootx64.efi"
     echo "nixboot: current firmware entry and EFI/BOOT fallback were intentionally not changed."
