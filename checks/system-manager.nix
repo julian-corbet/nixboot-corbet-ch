@@ -8,6 +8,7 @@ let
   systemManagerSurfaceStub = { lib, ... }: {
     options = {
       systemd.services = lib.mkOption { type = lib.types.attrsOf lib.types.attrs; default = { }; };
+      environment.etc = lib.mkOption { type = lib.types.attrsOf lib.types.attrs; default = { }; };
       assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
     };
   };
@@ -55,6 +56,7 @@ let
   check = name: ok: detail: { inherit name ok detail; };
   stage = "nixboot-systemd-boot-stage";
   verify = "nixboot-systemd-boot-verify";
+  pacmanHook = "pacman.d/hooks/95-nixboot-systemd-boot.hook";
 
   results = [
     (check "disabled/no-units-or-native-package-selection"
@@ -69,7 +71,11 @@ let
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
 
     (check "declared/no-stage-units-before-explicit-gate"
-      (!(declared.systemd.services ? "${stage}") && !(declared.systemd.services ? "${verify}"))
+      (
+        !(declared.systemd.services ? "${stage}")
+        && !(declared.systemd.services ? "${verify}")
+        && !(declared.environment.etc ? "${pacmanHook}")
+      )
       "units: ${builtins.toJSON (builtins.attrNames declared.systemd.services)}")
 
     (check "stage/manual-stage-and-verify-units-exist"
@@ -92,6 +98,17 @@ let
         && lib.hasInfix "-S autodetect" staged.systemd.services.${stage}.script
       )
       "stage script does not render the native mkinitcpio UKI contract")
+
+    (check "stage/pacman-hook-rebuilds-ukis-after-native-boot-updates"
+      (
+        staged.environment.etc ? "${pacmanHook}"
+        && staged.environment.etc.${pacmanHook}.replaceExisting
+        # `source` is the Nix store path, not the hook text. Its basename makes the rendered
+        # immutable source observable at eval time; the module's lexical hook text remains the
+        # single source used for that path.
+        && lib.hasSuffix "-95-nixboot-systemd-boot.hook" (toString staged.environment.etc.${pacmanHook}.source)
+      )
+      "NixBoot did not declare the pacman lifecycle hook")
 
     (check "secure-stage/signs-only-staged-loader-artifacts"
       (lib.hasInfix "/usr/bin/sbctl sign -s \"$output\"" stagedSecure.systemd.services.${stage}.script)

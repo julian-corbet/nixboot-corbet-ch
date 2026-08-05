@@ -146,8 +146,10 @@ uses the installed kernel `pkgbase` records to build Type #2 UKIs through
 kernel closure. Its stage and verify units are manual by design. Staging
 writes a separate systemd-boot binary and NixBoot-owned UKIs but never
 changes the active fallback, NVRAM, or Secure Boot enrollment. A local boot
-of the staged binary proves the path before any cutover. See CONTRACT.md's
-B20 for the exact boundary and gates.
+of the staged binary proves the path before any cutover. Once that explicit
+stage gate is enabled, its declared pacman hook regenerates the same UKIs on
+native kernel or systemd-boot EFI updates. See CONTRACT.md's B20 for the
+exact boundary and gates.
 
 See [`docs/faq.md`](faq.md) for the boundary questions this design
 provokes, and [`CONTRACT.md`](../CONTRACT.md) for the full behavior list.

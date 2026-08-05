@@ -262,6 +262,10 @@ but never changes `EFI/BOOT/BOOTX64.EFI`, NVRAM, or Secure Boot enrollment.
 An operator must physically boot the staged loader once before a separately
 reviewed cutover. This is the retained recovery path, not an imperative
 escape hatch: the files, commands, package set, and gates are all declared.
+Once the explicit stage gate is enabled, NixBoot also renders its own
+post-transaction pacman hook: native kernel `pkgbase` or systemd-boot EFI
+updates rerun the declared stage unit, so later upgrades rebuild the same
+UKI set rather than depending on a retired foreign-loader hook.
 
 **B21 — `secureBoot.pkiBundle` / `keySource` actually reach the thing that
 signs UKIs, not just the tools that assume it did.**

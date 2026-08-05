@@ -59,6 +59,30 @@ let
     editor ${if cfg.loader.editor then "yes" else "no"}
   '';
 
+  # Pacman owns the native kernel packages on a system-manager host, so it is the event source
+  # for UKI regeneration. The hook is deliberately absent until the explicit stage gate is on:
+  # before a local staged-loader test, no package upgrade may create a second boot path.
+  pacmanHookFile = pkgs.writeText "95-nixboot-systemd-boot.hook" ''
+    [Trigger]
+    Operation = Install
+    Operation = Upgrade
+    Type = Path
+    Target = usr/lib/modules/*/pkgbase
+
+    [Trigger]
+    Operation = Install
+    Operation = Upgrade
+    Type = Path
+    Target = usr/lib/systemd/boot/efi/systemd-bootx64.efi
+
+    [Action]
+    Description = NixBoot: rebuild declared UKIs after native boot artifact update
+    When = PostTransaction
+    Depends = systemd
+    Depends = mkinitcpio
+    Exec = /usr/bin/systemctl start nixboot-systemd-boot-stage.service
+  '';
+
   kernelCalls = lib.concatMapStrings (kernel: ''
     build_uki ${lib.escapeShellArg kernel.packageBase} ${lib.escapeShellArg kernel.id} ${if kernel.fallback then "yes" else "no"}
   '') cfg.kernels;
@@ -70,7 +94,7 @@ let
     prefix=${lib.escapeShellArg cfg.uki.prefix}
     secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
 
-    for command in /usr/bin/mkinitcpio /usr/bin/install /usr/bin/mktemp /usr/bin/sbctl; do
+    for command in /usr/bin/findmnt /usr/bin/mkinitcpio /usr/bin/install /usr/bin/mktemp /usr/bin/sbctl; do
       [ -x "$command" ] || {
         echo "nixboot: required native command is absent: $command" >&2
         echo "nixboot: activate the declared native package set before staging." >&2
@@ -83,6 +107,7 @@ let
       echo "nixboot: $esp is not the mounted FAT ESP; refusing to write boot artifacts." >&2
       exit 1
     }
+    /usr/bin/install -d -m0755 "$esp/EFI/Linux"
 
     # This intentionally does not write EFI/BOOT/BOOTX64.EFI and does not touch NVRAM. The
     # current loader remains the recovery path until an operator verifies this staged one locally.
@@ -260,6 +285,16 @@ in
         serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
         script = verifyScript;
       };
+      };
+
+      # /etc/pacman.d/hooks has higher precedence than package-provided hooks. `replaceExisting`
+      # avoids system-manager's silent existing-file skip, which would otherwise leave a stale
+      # lifecycle contract after a manual experiment or an older NixBoot revision.
+      environment.etc = lib.mkIf cfg.stage.enable {
+        "pacman.d/hooks/95-nixboot-systemd-boot.hook" = {
+          source = pacmanHookFile;
+          replaceExisting = true;
+        };
       };
     })
   ];

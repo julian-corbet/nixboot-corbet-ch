@@ -97,7 +97,9 @@ configuration, and NixBoot-prefixed UKIs. It does **not** replace
 an operator a physical one-shot firmware test before any cutover. Native
 kernel and firmware package names are published as `archPackages` for the
 consumer's package reconciler rather than installed by a second package
-manager.
+manager. After the explicit stage gate is enabled, NixBoot also declares the
+post-transaction pacman hook that rebuilds its UKIs when the native kernel or
+systemd-boot EFI artifact changes.
 
 ```nix
 {
