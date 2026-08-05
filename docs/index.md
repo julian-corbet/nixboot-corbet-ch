@@ -150,8 +150,9 @@ and NixBoot-owned UKIs but never
 changes the active fallback, NVRAM, or Secure Boot enrollment. A local boot
 of the staged binary proves the path before any cutover. Once that explicit
 stage gate is enabled, its declared pacman hook regenerates the same UKIs on
-native kernel or systemd-boot EFI updates. See CONTRACT.md's B20 for the
-exact boundary and gates.
+native kernel or systemd-boot EFI updates and removes only stale UKIs below
+NixBoot's uniquely-owned prefix. See CONTRACT.md's B20 for the exact boundary
+and gates.
 
 For a clean break from Limine, `retireLimine.enable` renders one more manual
 post-cutover unit. It refuses to run until firmware is booting systemd-boot,

@@ -169,8 +169,11 @@ let
         && lib.hasInfix "/var/tmp/nixboot-systemd-boot" staged.systemd.services.${stage}.script
         && lib.hasInfix "no ESP files were changed" staged.systemd.services.${stage}.script
         && lib.hasInfix "required_bytes" staged.systemd.services.${stage}.script
+        && lib.hasInfix "desired_ukis" staged.systemd.services.${stage}.script
+        && lib.hasInfix "stale UKI artifact(s) under the NixBoot prefix" staged.systemd.services.${stage}.script
+        && lib.hasInfix "\"$esp/EFI/Linux/$prefix-\"*.efi" staged.systemd.services.${stage}.script
       )
-      "stage script does not render the native mkinitcpio UKI and ESP-capacity contract")
+      "stage script does not render the native mkinitcpio UKI, ESP-capacity, and stale-artifact collection contract")
 
     (check "stage/pacman-hook-rebuilds-ukis-after-native-boot-updates"
       (

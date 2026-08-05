@@ -102,7 +102,10 @@ reconciler rather than installed by a second package manager. The matching micro
 from NixCPU's read-only boot contract, so the vendor is declared once and NixBoot never carries a
 second Intel/AMD string. After the explicit stage gate is enabled, NixBoot also declares the
 post-transaction pacman hook that rebuilds its UKIs when the native kernel or
-systemd-boot EFI artifact changes.
+systemd-boot EFI artifact changes. Each successful rebuild also removes only
+stale UKIs under NixBoot's configured prefix, so retired kernels cannot fill
+the ESP; foreign rescue, vendor, Limine, and fallback paths are outside that
+ownership boundary.
 
 Secure Boot signing is deliberately incomplete until a host supplies an explicit
 root-owned runtime `secureBoot.sbctlConfig` path. NixBoot signs only through that

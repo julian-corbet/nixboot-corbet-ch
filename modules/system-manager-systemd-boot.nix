@@ -116,6 +116,7 @@ let
     }
     staging_dir="$(/usr/bin/mktemp -d /var/tmp/nixboot-systemd-boot.XXXXXX)"
     trap '/usr/bin/rm -rf "$staging_dir"' EXIT
+    shopt -s nullglob
 
     build_uki() {
       local package_base="$1" id="$2" fallback="$3"
@@ -187,13 +188,32 @@ let
     /usr/bin/install -Dm0644 ${cmdlineFile} /etc/kernel/cmdline
     /usr/bin/install -Dm0644 ${loaderConfFile} "$esp/loader/loader.conf"
 
+    declare -A desired_ukis=()
     for uki in "$staging_dir"/*.efi; do
+      desired_ukis["$(/usr/bin/basename "$uki")"]=1
       output="$esp/EFI/Linux/$(/usr/bin/basename "$uki")"
       /usr/bin/install -m0644 "$uki" "$output"
       [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$output"
     done
 
+    # The unique UKI prefix is NixBoot's ownership boundary. Once every desired image has
+    # been built and installed successfully, remove only stale files under that prefix. This
+    # makes native kernel updates and removed kernel declarations self-cleaning without ever
+    # treating a foreign rescue, vendor firmware, Limine, or the active fallback as garbage.
+    pruned=0
+    for existing in "$esp/EFI/Linux/$prefix-"*.efi "$esp/EFI/Linux/$prefix-"*.efi.new "$esp/EFI/Linux/$prefix-"*.efi.tmp; do
+      base="$(/usr/bin/basename "$existing")"
+      case "$base" in
+        *.efi)
+          [ -n "''${desired_ukis[$base]:-}" ] && continue
+          ;;
+      esac
+      /usr/bin/rm -f -- "$existing"
+      pruned=$((pruned + 1))
+    done
+
     echo "nixboot: staged systemd-boot at $esp/EFI/systemd/systemd-bootx64.efi"
+    echo "nixboot: pruned $pruned stale UKI artifact(s) under the NixBoot prefix."
     echo "nixboot: current firmware entry and EFI/BOOT fallback were intentionally not changed."
   '';
 
