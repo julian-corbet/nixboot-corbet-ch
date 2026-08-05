@@ -97,9 +97,10 @@ will not fit. Only then does it install `EFI/systemd/systemd-bootx64.efi`, a
 loader configuration, and NixBoot-prefixed UKIs. It does **not** replace
 `EFI/BOOT/BOOTX64.EFI`, change NVRAM, or enroll Secure Boot keys. That gives
 an operator a physical one-shot firmware test before any cutover. Native
-kernel, firmware, and host-selected microcode package names are published as `archPackages` for the
-consumer's package reconciler rather than installed by a second package
-manager. After the explicit stage gate is enabled, NixBoot also declares the
+kernel and firmware package names are published as `archPackages` for the consumer's package
+reconciler rather than installed by a second package manager. The matching microcode package comes
+from NixCPU's read-only boot contract, so the vendor is declared once and NixBoot never carries a
+second Intel/AMD string. After the explicit stage gate is enabled, NixBoot also declares the
 post-transaction pacman hook that rebuilds its UKIs when the native kernel or
 systemd-boot EFI artifact changes.
 
@@ -127,13 +128,26 @@ the protected hashes again. It never deletes a directory recursively.
 ```nix
 {
   inputs.nixboot.url = "github:julian-corbet/nixboot-corbet-ch";
+  inputs.nixcpu.url = "github:julian-corbet/nixcpu-corbet-ch";
 
   # a system-manager flake's own host config:
-  imports = [ inputs.nixboot.systemManagerModules.default ];
+  imports = [
+    inputs.nixcpu.systemManagerModules.packages
+    inputs.nixboot.systemManagerModules.default
+  ];
+
+  nixcpu = {
+    enable = true;
+    arch = "x86_64";
+    vendor = "intel";
+    execution = "bare-metal";
+    cores = 8;
+    threads = 8;
+    capabilities.microcode.enable = true;
+  };
 
   nixboot.systemdBoot = {
     enable = true;
-    microcodePackage = "intel-ucode"; # Select the host CPU vendor explicitly.
     kernels = [{
       package = "linux-cachyos";
       packageBase = "linux-cachyos";

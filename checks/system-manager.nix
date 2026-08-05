@@ -10,6 +10,10 @@ let
       systemd.services = lib.mkOption { type = lib.types.attrsOf lib.types.attrs; default = { }; };
       environment.etc = lib.mkOption { type = lib.types.attrsOf lib.types.attrs; default = { }; };
       assertions = lib.mkOption { type = lib.types.listOf lib.types.unspecified; default = [ ]; };
+      nixcpu.packages.bootMicrocode = {
+        archPackage = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+        vendor = lib.mkOption { type = lib.types.nullOr (lib.types.enum [ "amd" "intel" ]); default = null; };
+      };
     };
   };
 
@@ -23,6 +27,11 @@ let
     in lib.any (assertion: !assertion.assertion) cfg.assertions;
 
   base = {
+    nixcpu.packages.bootMicrocode = {
+      archPackage = "intel-ucode";
+      vendor = "intel";
+    };
+
     nixboot.systemdBoot = {
       enable = true;
       kernels = [
@@ -39,15 +48,17 @@ let
           id = "cachyos-lts";
         }
       ];
-      microcodePackage = "intel-ucode";
       kernelCmdline = "rd.luks.name=example=cryptroot root=/dev/mapper/cryptroot rw";
     };
   };
 
   disabled = evalBoot { };
   declared = evalBoot base;
-  generic = evalBoot (lib.recursiveUpdate base {
-    nixboot.systemdBoot.microcodePackage = null;
+  missingMicrocode = assertionFails (lib.recursiveUpdate base {
+    nixcpu.packages.bootMicrocode = {
+      archPackage = null;
+      vendor = null;
+    };
   });
   staged = evalBoot (lib.recursiveUpdate base { nixboot.systemdBoot.stage.enable = true; });
   stagedSecure = evalBoot (lib.recursiveUpdate base {
@@ -97,9 +108,9 @@ let
       ])
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
 
-    (check "declared/microcode-is-host-selected-not-a-generic-intel-default"
-      (!(lib.elem "intel-ucode" generic.nixboot.systemdBoot.archPackages))
-      "generic packages: ${builtins.toJSON generic.nixboot.systemdBoot.archPackages}")
+    (check "declared/microcode-must-come-from-nixcpu"
+      missingMicrocode
+      "an enabled NixBoot backend without nixcpu.packages.bootMicrocode.archPackage must fail")
 
     (check "declared/no-stage-units-before-explicit-gate"
       (
@@ -181,12 +192,11 @@ let
       "secure stage does not sign every staged EFI artifact through the runtime sbctl configuration")
 
     (check "secure-stage-without-runtime-sbctl-config-asserts"
-      (assertionFails {
+      (assertionFails (lib.recursiveUpdate base {
         nixboot.systemdBoot = {
-          enable = true;
           secureBoot.enable = true;
         };
-      })
+      }))
       "expected secureBoot.enable without secureBoot.sbctlConfig to fail an assertion")
 
     (check "secure-cutover-signs-the-final-fallback-loader"
@@ -194,54 +204,49 @@ let
       "secure final cutover does not sign the active fallback loader")
 
     (check "cutover-without-stage-asserts"
-      (assertionFails {
+      (assertionFails (lib.recursiveUpdate base {
         nixboot.systemdBoot = {
-          enable = true;
           cutover.enable = true;
         };
-      })
+      }))
       "expected cutover.enable without stage.enable to fail an assertion")
 
     (check "retire-limine-without-cutover-or-artifact-guards-asserts"
-      (assertionFails {
+      (assertionFails (lib.recursiveUpdate base {
         nixboot.systemdBoot = {
-          enable = true;
           stage.enable = true;
           retireLimine.enable = true;
         };
-      })
+      }))
       "expected Limine retirement without cutover and explicit artifact protection to fail assertions")
 
     (check "stage-without-explicit-kernel-cmdline-asserts"
-      (assertionFails {
+      (assertionFails (lib.recursiveUpdate base {
         nixboot.systemdBoot = {
-          enable = true;
           stage.enable = true;
-          kernels = [ { package = "linux"; packageBase = "linux"; id = "linux"; } ];
+          kernelCmdline = null;
         };
-      })
+      }))
       "expected a stage configuration without kernelCmdline to fail an assertion")
 
     (check "stage-without-kernels-asserts"
-      (assertionFails {
+      (assertionFails (lib.recursiveUpdate base {
         nixboot.systemdBoot = {
-          enable = true;
           stage.enable = true;
-          kernelCmdline = "root=/dev/mapper/cryptroot rw";
+          kernels = [ ];
         };
-      })
+      }))
       "expected a stage configuration without kernels to fail an assertion")
 
     (check "duplicate-uki-id-asserts-even-before-stage"
-      (assertionFails {
+      (assertionFails (lib.recursiveUpdate base {
         nixboot.systemdBoot = {
-          enable = true;
           kernels = [
             { package = "linux"; packageBase = "linux"; id = "same"; }
             { package = "linux-lts"; packageBase = "linux-lts"; id = "same"; }
           ];
         };
-      })
+      }))
       "expected duplicate UKI ids to fail an assertion")
   ];
 

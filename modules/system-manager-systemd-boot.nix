@@ -16,6 +16,11 @@
 let
   cfg = config.nixboot.systemdBoot;
 
+  # NixCPU owns the declared CPU vendor and resolves the matching native package. Read this
+  # defensively so importing NixBoot alone remains evaluable; an enabled backend asserts below
+  # that the consuming host actually composed NixCPU's package contract.
+  microcodePackage = config.nixcpu.packages.bootMicrocode.archPackage or null;
+
   kernelType = lib.types.submodule ({ ... }: {
     options = {
       package = lib.mkOption {
@@ -49,7 +54,7 @@ let
 
   nativePackages = lib.unique (
     [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" cfg.firmwarePackage ]
-    ++ lib.optional (cfg.microcodePackage != null) cfg.microcodePackage
+    ++ lib.optional (microcodePackage != null) microcodePackage
     ++ kernelPackages
   );
 
@@ -412,12 +417,6 @@ in
       description = "Native firmware package kept with the boot-capable kernel set.";
     };
 
-    microcodePackage = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "Optional native CPU-vendor microcode package, selected by the consuming host.";
-    };
-
     kernels = lib.mkOption {
       type = lib.types.listOf kernelType;
       default = [ ];
@@ -533,6 +532,15 @@ in
     }
     (lib.mkIf cfg.enable {
       assertions = [
+      {
+        assertion = microcodePackage != null;
+        message = ''
+          nixboot.systemdBoot.enable requires nixcpu.capabilities.microcode.enable and an explicit
+          bare-metal Intel/AMD NixCPU declaration. NixBoot consumes
+          nixcpu.packages.bootMicrocode.archPackage so a host never repeats a vendor package name
+          in its boot configuration.
+        '';
+      }
       {
         assertion = !cfg.stage.enable || cfg.kernelCmdline != null;
         message = "nixboot.systemdBoot.stage.enable requires an explicit kernelCmdline; never inherit a potentially temporary /proc/cmdline.";
