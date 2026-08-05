@@ -50,7 +50,9 @@
         default = self.systemManagerModules.nixboot;
       };
 
-      lib = { };
+      lib = {
+        mkUki = import ./lib/mk-uki.nix;
+      };
 
       # EVAL-TIME tests only -- no VM, no lanzaboote input (every fixture
       # below deliberately stays on loader.program = "systemd-boot" / "none"
