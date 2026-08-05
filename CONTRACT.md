@@ -92,6 +92,19 @@ exceed how many generations this host can build in one uptime, or the
 needs it. This is a documented, previously-shipped incident, not a
 hypothetical: `keep = 5` at roughly 10 generations/day emptied the menu
 within hours (`modules/nixboot.nix:210-222`).
+For a lanzaboote host using `bootCounting.tries`, the same loss leaves
+`systemd-bless-boot` unable to mark the running entry good. `nixboot-verify`
+therefore reads that unit's final state, rather than treating a retained count
+alone as evidence that the active generation survived.
+
+**B7a — The firmware handoff must name the declared ESP.**
+`bootctl status` can find a valid loader on the ESP mounted by NixOS even when
+firmware actually loaded one from a different partition. That split would
+otherwise let future deployments update one ESP while firmware executes stale
+boot code from another. On the systemd-boot/lanzaboote family,
+`nixboot-verify` treats bootctl's loader-partition UUID mismatch as a failure;
+an operator must recover the firmware handoff before entering a LUKS
+passphrase.
 
 **B8 — ESP capacity is warned, never enforced.**
 Resizing an ESP is an image reprovision, not a deploy nixboot can perform.

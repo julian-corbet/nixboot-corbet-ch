@@ -1514,7 +1514,11 @@ in
             # confusing FAIL, not a meaningful one.
             ${lib.optionalString isSystemdBootFamily ''
               if [ -d "$esp" ]; then
-                status="$(${pkgs.systemd}/bin/bootctl --esp-path="$esp" status 2>/dev/null || true)"
+                # Force the machine-readable English diagnostic. `bootctl` emits this warning
+                # from the firmware's LoaderDevicePartUUID versus the mounted ESP; leaving it
+                # locale-dependent would make a security check silently disappear on a host
+                # whose operator chose a non-English console language.
+                status="$(LC_ALL=C ${pkgs.systemd}/bin/bootctl --esp-path="$esp" status 2>/dev/null || true)"
                 case "${cfg.loader.program}" in
                   lanzaboote)
                     if echo "$status" | grep -qi 'lanzastub'; then
@@ -1533,6 +1537,19 @@ in
                     fi
                     ;;
                 esac
+
+                # `bootctl` can see a loader identity on the ESP while firmware actually
+                # booted a different ESP. That is not cosmetic: a future switch updates the
+                # declared ESP while the next boot can still execute stale code from another
+                # one. It also makes a signed-chain claim unverifiable, because the measured
+                # UKI did not come from the declared medium. Fail rather than training an
+                # operator to treat the warning as harmless.
+                if echo "$status" | grep -q '^WARNING: The boot loader reports a different partition UUID'; then
+                  echo "FAIL  loader.espHandoff: firmware reports a different loader-partition UUID than the ESP mounted at $esp -- do not enter a LUKS passphrase until the firmware handoff is recovered and re-verified"
+                  fail=1
+                else
+                  echo "PASS  loader.espHandoff: firmware loader-partition UUID matches the ESP mounted at $esp"
+                fi
               else
                 echo "SKIP  loader.program: $esp does not exist yet"
               fi
@@ -1557,6 +1574,26 @@ in
             ''}
             ${lib.optionalString (cfg.loader.program == "none") ''
               echo "SKIP  loader.program = none, nothing to verify"
+            ''}
+
+            # ── Check 1b: the boot-counting completion signal ────────────────
+            # The lanzaboote stub consumes a `+N` attempt suffix, then systemd-bless-boot
+            # marks the entry good after userspace reaches boot-complete.target. A bounded
+            # ESP generation history that deletes the entry of a long-running system leaves
+            # LoaderBootCountPath referring to a file that no longer exists; systemd-bless-boot
+            # then fails every subsequent switch. That is not just red cosmetics: the current
+            # generation is no longer a manual rollback candidate. Check the actual unit state
+            # whenever this module asked lanzaboote to use boot counting, rather than assuming a
+            # `+N` file on disk proves the running entry was blessed.
+            ${lib.optionalString (cfg.bootCounting.tries != null) ''
+              bless_state="$(LC_ALL=C ${pkgs.systemd}/bin/systemctl show --value --property=ActiveState systemd-bless-boot.service 2>/dev/null || true)"
+              bless_result="$(LC_ALL=C ${pkgs.systemd}/bin/systemctl show --value --property=Result systemd-bless-boot.service 2>/dev/null || true)"
+              if [ "$bless_state" = active ] && [ "$bless_result" = success ]; then
+                echo "PASS  bootCounting: systemd-bless-boot marked this boot good"
+              else
+                echo "FAIL  bootCounting: systemd-bless-boot is state='$bless_state', result='$bless_result' -- the running entry may have been removed from the ESP before it could be blessed; increase generations.keep above the host's rebuilds-per-uptime and perform a controlled reboot"
+                fail=1
+              fi
             ''}
 
             # ── Check 2: ESP mountpoint + label ──

@@ -200,6 +200,15 @@ let
     nixboot.secureBoot.keySource = "autogenerate";
   };
 
+  # Boot counting is deliberately tested on its own fixture: its runtime proof reads
+  # systemd-bless-boot, not merely the lanzaboote `initialTries` value it writes. Keeping
+  # this separate prevents a Secure Boot fixture from accidentally exercising the wrong
+  # branch just because it happens to use the same loader.
+  cfg-boot-counting = evalFor {
+    nixboot.loader.program = "lanzaboote";
+    nixboot.bootCounting.tries = 3;
+  };
+
   # ── remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set ──────
   # boot.initrd.systemd.enable = true is REQUIRED here: the sealed path (Path A) writes
   # entirely into boot.initrd.systemd.services.*, which the classic initrd builder never
@@ -308,6 +317,24 @@ let
         lib.hasInfix "intact EFI binary" cfg.systemd.services.nixboot-verify.script
       )
       "nixboot-verify script does not check foreign .efi paths for intactness, not just existence")
+
+    # `bootctl status` reports this warning when firmware's LoaderDevicePartUUID names a
+    # different ESP from the one the declarative configuration mounted. The loader can still
+    # look healthy in that state, so pin the extra check explicitly rather than letting a
+    # future tidy-up reduce Check 1 back to a loader-identity-only test.
+    (check "verify-script-detects-loader-esp-handoff-mismatch"
+      (
+        lib.hasInfix "loader.espHandoff" cfg-signed-decoupled.systemd.services.nixboot-verify.script
+        && lib.hasInfix "different partition UUID" cfg-signed-decoupled.systemd.services.nixboot-verify.script
+      )
+      "nixboot-verify script does not reject a firmware loader/declared-ESP UUID mismatch")
+
+    (check "verify-script-checks-boot-counting-completion"
+      (
+        lib.hasInfix "systemd-bless-boot.service" cfg-boot-counting.systemd.services.nixboot-verify.script
+        && lib.hasInfix "increase generations.keep" cfg-boot-counting.systemd.services.nixboot-verify.script
+      )
+      "nixboot-verify script does not read systemd-bless-boot for a boot-counting host")
 
     # --- nixboot-verify's OWN unit `path` must actually carry what its script resolves by bare
     # name (2026-08-01 incident: findmnt was never on it, so Check 2 could not PASS on ANY
