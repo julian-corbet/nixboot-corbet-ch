@@ -55,6 +55,16 @@ let
         exit 1
       }
 
+      # bootctl can report a valid loader while also saying firmware loaded it
+      # from a different ESP. Collection against the mounted ESP in that state
+      # cannot preserve the entry that actually booted this kernel, so fail
+      # before removing or installing anything.
+      boot_status="$(LC_ALL=C ${pkgs.systemd}/bin/bootctl --esp-path="$esp" status 2>&1 || true)"
+      if printf '%s\n' "$boot_status" | ${pkgs.gnugrep}/bin/grep -q '^WARNING: The boot loader reports a different partition UUID'; then
+        echo "nixboot: firmware booted a different ESP from $esp; refusing retention collection." >&2
+        exit 1
+      fi
+
       work="$(${pkgs.coreutils}/bin/mktemp -d /run/nixboot-lanzaboote-retention.XXXXXX)"
       trap '${pkgs.coreutils}/bin/rm -rf -- "$work"' EXIT
       shopt -s nullglob
@@ -89,22 +99,33 @@ let
       done
       [ "$have_limit" = yes ] || passthrough+=("--configuration-limit=0")
 
+      current_entry=""
       current_generation=""
       if [ -e /run/current-system ]; then
-        current_generation="$(${pkgs.systemd}/bin/bootctl --esp-path="$esp" status 2>/dev/null |
-          ${pkgs.gnused}/bin/sed -n -E 's/^[[:space:]]*Current Entry:[[:space:]]*nixos-generation-([0-9]+)-.*$/\1/p')"
-        if ! [[ "$current_generation" =~ ^[0-9]+$ ]]; then
-          echo "nixboot: could not identify the booted Lanzaboote generation from bootctl; refusing a capacity collection that might drop it." >&2
+        current_entry="$(printf '%s\n' "$boot_status" |
+          ${pkgs.gnused}/bin/sed -n -E 's/^[[:space:]]*Current Entry:[[:space:]]*(nixos-generation-[^[:space:]]+\.efi).*$/\1/p')"
+        # systemd-boot can report the attempt-counter form. The file may have
+        # been blessed to its bare name since then, so compare the stable
+        # entry identity while retaining whichever counter form exists.
+        current_entry="''${current_entry%.efi}"
+        current_entry="''${current_entry%%+*}.efi"
+        if [[ "$current_entry" =~ ^nixos-generation-([0-9]+)-[a-z0-9]+\.efi$ ]]; then
+          current_generation="''${BASH_REMATCH[1]}"
+        else
+          echo "nixboot: could not identify the exact booted Lanzaboote entry from bootctl; refusing a capacity collection that might drop it." >&2
           exit 1
         fi
-        ${pkgs.coreutils}/bin/ln -s "$(${pkgs.coreutils}/bin/readlink -f /run/current-system)" "$work/system-$current_generation-link"
       fi
 
       declare -A retained_generations=()
       selected=()
+      selected_count=0
       if [ -n "$current_generation" ]; then
         retained_generations["$current_generation"]=1
-        selected+=("$work/system-$current_generation-link")
+        # The booted entry already exists on the ESP. Do not recreate it from
+        # /run/current-system: that symlink changes after an in-place switch
+        # while the booted kernel and LoaderBootCountPath do not.
+        selected_count=1
       fi
 
       # lzbt sorts by the numeric generation component. Do the same explicitly,
@@ -118,7 +139,6 @@ let
         printf '%020d\t%s\n' "$generation" "$profile"
       done | ${pkgs.coreutils}/bin/sort -rn > "$newest"
 
-      selected_count="''${#selected[@]}"
       while IFS=$'\t' read -r _profile_order profile; do
         base="''${profile##*/}"
         generation="''${base#system-}"
@@ -130,33 +150,45 @@ let
         selected_count=$((selected_count + 1))
       done < "$newest"
 
-      [ "''${#selected[@]}" -gt 0 ] || {
+      [ "$selected_count" -gt 0 ] || {
         echo "nixboot: no NixOS generation links are available for Lanzaboote installation." >&2
         exit 1
       }
 
       linux_dir="$esp/EFI/Linux"
       nixos_dir="$esp/EFI/nixos"
+      booted_stub=""
+      if [ -n "$current_entry" ] && [ -d "$linux_dir" ]; then
+        for stub in "$linux_dir"/nixos-generation-*.efi; do
+          base="''${stub##*/}"
+          stable_entry="''${base%.efi}"
+          stable_entry="''${stable_entry%%+*}.efi"
+          if [ "$stable_entry" = "$current_entry" ]; then
+            booted_stub="$stub"
+            break
+          fi
+        done
+      fi
+      if [ -n "$current_entry" ] && [ -z "$booted_stub" ]; then
+        echo "nixboot: the exact booted entry $current_entry is absent from $linux_dir; refusing to collect or install boot artifacts." >&2
+        exit 1
+      fi
+
       selected_stubs=()
-      booted_stub_present=no
       if [ -d "$linux_dir" ]; then
         for stub in "$linux_dir"/nixos-generation-*.efi; do
           base="''${stub##*/}"
           if [[ "$base" =~ ^nixos-generation-([0-9]+)- ]]; then
             generation="''${BASH_REMATCH[1]}"
-            if [ -n "''${retained_generations[$generation]:-}" ]; then
+            if [ "$stub" = "$booted_stub" ]; then
               selected_stubs+=("$stub")
-              [ "$generation" != "$current_generation" ] || booted_stub_present=yes
+            elif [ "$generation" != "$current_generation" ] && [ -n "''${retained_generations[$generation]:-}" ]; then
+              selected_stubs+=("$stub")
             else
               ${pkgs.coreutils}/bin/rm -f -- "$stub"
             fi
           fi
         done
-      fi
-
-      if [ -n "$current_generation" ] && [ "$booted_stub_present" != yes ]; then
-        echo "nixboot: the booted generation $current_generation has no ESP stub; refusing to collect more artifacts." >&2
-        exit 1
       fi
 
       # Kernels/initrds are content-addressed, shared by the stubs that name
@@ -192,7 +224,7 @@ let
         exit 1
       fi
 
-      echo "nixboot: retaining ''${#selected[@]} normal generation(s), including booted generation ''${current_generation:-none}; $available_bytes bytes free before lzbt install."
+      echo "nixboot: retaining $selected_count normal generation(s), including exact booted entry ''${current_entry:-none}; $available_bytes bytes free before lzbt install."
       exec "$real_lzbt" "''${passthrough[@]}" "''${selected[@]}"
     '';
   };
@@ -220,6 +252,10 @@ in
       {
         assertion = cfg.esp.capacityMiB == null || requiredMiB <= cfg.esp.capacityMiB;
         message = "nixboot.generations.capacity budget is ${toString requiredMiB} MiB (fixed ${toString capacity.fixedMiB} + reserve ${toString capacity.reserveMiB} + ${toString cfg.generations.keep} normal generation(s) x ${toString capacity.generationMiB} + externally-maintained protected UKIs ${toString capacity.extraReservedMiB} + extraEntries UKIs ${toString entryBudgetMiB}), but esp.capacityMiB is only ${toString (if cfg.esp.capacityMiB == null then 0 else cfg.esp.capacityMiB)} MiB. Reduce retained entries or increase the ESP; do not ship an impossible boot budget.";
+      }
+      {
+        assertion = cfg.generations.keep >= 2;
+        message = "nixboot.generations.capacity requires generations.keep >= 2 so the exact booted entry and at least one new candidate can coexist.";
       }
     ];
     })

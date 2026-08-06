@@ -97,6 +97,12 @@ impossible budget is an evaluation failure. `nixboot-verify` still reads
 `systemd-bless-boot`, because an existing failed unit is live evidence that a
 prior installation violated this invariant.
 
+The retained boot entry is matched by its complete loader-reported identity,
+not merely its generation number, and is never reconstructed from
+`/run/current-system`: userspace can switch many times while the booted kernel
+and `LoaderBootCountPath` remain fixed. Collection also refuses a firmware
+loader/declared-ESP UUID mismatch before touching either partition.
+
 **B7a — The firmware handoff must name the declared ESP.**
 `bootctl status` can find a valid loader on the ESP mounted by NixOS even when
 firmware actually loaded one from a different partition. That split would

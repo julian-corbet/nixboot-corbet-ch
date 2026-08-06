@@ -22,6 +22,7 @@
 
 let
   lib = pkgs.lib;
+  retentionSource = builtins.readFile ../modules/lanzaboote-retention.nix;
 
   # A stand-in system.build.toplevel: only its SHAPE matters here (the four paths
   # extra-entries.nix's maintainer script references), never its actual bootability --
@@ -226,6 +227,16 @@ let
     };
   };
 
+  cfg-capacity-retention-one-slot = {
+    nixboot.loader.program = "lanzaboote";
+    nixboot.esp.capacityMiB = 512;
+    nixboot.generations.keep = 1;
+    nixboot.generations.capacity = {
+      enable = true;
+      lanzabootePackage = pkgs.hello;
+    };
+  };
+
   # ── remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set ──────
   # boot.initrd.systemd.enable = true is REQUIRED here: the sealed path (Path A) writes
   # entirely into boot.initrd.systemd.services.*, which the classic initrd builder never
@@ -313,6 +324,22 @@ let
         && cfg-capacity-retention.nixboot.generations.capacity.generationMiB == 64
       )
       "capacity-retention did not render the lzbt wrapper or preserve the declared rescue history budget")
+
+    (check "capacity-retention/rejects-one-slot-budget"
+      (evalFailsBuild cfg-capacity-retention-one-slot)
+      "capacity retention accepted generations.keep = 1 even though it cannot preserve the booted entry while installing a candidate")
+
+    (check "capacity-retention/preserves-exact-loader-entry"
+      (
+        lib.hasInfix "exact booted entry" retentionSource
+        && lib.hasInfix "stable_entry" retentionSource
+        && !(lib.hasInfix "readlink -f /run/current-system" retentionSource)
+      )
+      "capacity retention regressed to reconstructing a generation-number match from mutable /run/current-system")
+
+    (check "capacity-retention/rejects-loader-esp-mismatch-before-collection"
+      (lib.hasInfix "firmware booted a different ESP" retentionSource)
+      "capacity retention does not reject a firmware loader/declared-ESP mismatch")
 
     # --- systemd wiring: async by the timer, never wantedBy multi-user.target ----------
     (check "timer-drives-it-not-boot"
