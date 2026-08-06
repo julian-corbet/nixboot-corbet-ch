@@ -22,10 +22,13 @@ reuse path for any other host (`modules/nixboot.nix:4-15`).
 - **`switch-root` is the boundary.** nixboot owns firmware → bootloader →
   kernel/initrd handoff. What happens after `switch-root` — service
   ordering, targets — is not this module's problem, on purpose.
-- **The ESP already exists; nixboot never creates it.** Partitioning,
-  formatting, and mounting are a disk-layout tool's job. nixboot only
-  *declares* what must already be true about an ESP so it can assert and
-  verify (`modules/nixboot.nix:30-35, 182-207`).
+- **Physical storage and the boot-medium contract have different owners.**
+  nixstorage (or an equivalent layout owner) provisions and identifies the
+  physical partition. nixboot owns the ESP's boot role, constraints,
+  contents and verification, including construction of the boot portion of
+  an image artifact. The current NixOS backend only declares and verifies an
+  already-existing ESP; that is an implementation limit, not the permanent
+  architecture (`modules/nixboot.nix:30-35, 182-207`).
 - **Firmware NVRAM cannot be rolled back.** Every other nixboot mistake is
   fixable by another rebuild; a bad Secure Boot enrollment is not — which is
   why enrollment is the one piece of this module that is never automatic.
@@ -46,6 +49,45 @@ reuse path for any other host (`modules/nixboot.nix:4-15`).
   silently produce no effect (`bootCounting.tries` on a non-lanzaboote host,
   `secureBoot.sbctlCompat` with the tool not installed) are asserted or
   warned against explicitly, not left to fail quietly.
+
+## Architecture target beyond the current option surface
+
+The behavioral options below are the current implementation contract. The
+next interface revision must preserve them behind one boot-intent schema with
+these additional invariants:
+
+1. **One schema, several backends.** NixOS and system-manager produce and
+   verify the same boot intent through different native mechanisms. Home
+   Manager may consume read-only boot state or user-scoped tooling where
+   useful, but never writes the ESP, Secure Boot state, or NVRAM.
+2. **Device class and boot role are independent.** `nixarch`, `nixnas`, and
+   `nixvps` are device-class adapters. `primary` and `nixrescue` are boot
+   roles. A class translates capabilities; a role identifies the artifact's
+   purpose.
+3. **No boot is explicit.** A container or other target without firmware
+   handoff is neither a degraded `primary` nor an implicit loader choice. It
+   composes no boot actuator and declares no ESP, signing, or NVRAM contract.
+4. **Policy stays in the private composition.** Public repositories contain
+   generic mechanisms, adapters, examples, and tests. Host identity, network,
+   cloud, disk, account, key, endpoint, and production-policy facts are
+   inputs, never public defaults or embedded incident records.
+5. **Artifacts and delivery have separate owners.** nixrescue produces the
+   recovery content and runtime. nixboot produces and verifies boot artifacts.
+   nixdeploy alone schedules, transports, materializes, rotates and selects
+   slots, activates, rolls back, reimages, and reports typed outcomes across
+   every plane, class, and boot role.
+6. **The booted kernel/initrd and boot-medium contract are boot work.** Class
+   backends select and package the boot artifact from facts supplied by
+   nixcpu, nixfs, nixstorage, nixluks and other specialist domains. Those
+   specialists remain authoritative for the source facts and physical
+   provisioning; nixboot owns the projection required to reach switch-root.
+
+This target is not implemented yet. The current NixOS backend exposes
+`nixboot.*`; the current system-manager backend exposes
+`nixboot.systemdBoot.*`; no Home Manager backend or class/role schema is
+exported. Current nixboot maintainer timers and artifact rotation are
+therefore migration debt against the nixdeploy boundary, not precedent for a
+second delivery system.
 
 ## Behaviors
 
@@ -141,13 +183,17 @@ live system, and logs `PASS`/`FAIL`/`SKIP` per check, exiting non-zero on
 any `FAIL` (`modules/nixboot.nix:355-367, 522-529, 660-664`). Requesting a
 boot setting is not evidence it took.
 
-**B11 — Kernel packaging, disk-layout identity, and power policy are foreign
-domains, always.**
-Even though all three are boot-adjacent, nixboot never touches kernel
-variant/march/LTO choices, LUKS/ZFS/impermanence identity, or sleep/ASPM/EPP
-policy — a second manager on any of those surfaces is exactly the
-two-mechanisms-one-knob failure this module's own layering rule forbids
-(`modules/nixboot.nix:36-50`).
+**B11 — Source facts stay authoritative while nixboot owns their boot-time
+projection.**
+The target class backend owns selection and packaging of the kernel/initrd
+that actually boots, plus the boot-medium constraints required to reach
+switch-root. nixcpu/nixfs/nixstorage/nixluks remain authoritative for
+architecture, filesystem, physical-layout and encrypted-member facts;
+nixpower remains authoritative for sleep/ASPM/EPP policy. nixboot consumes
+those facts without repeating them or replacing their physical/runtime
+mechanisms. The current module has not completed that migration and still
+expects consumer-supplied kernel and layout values (`modules/nixboot.nix`,
+current SCOPE block).
 
 **B12 — The lanzaboote module is a required composition, not a dependency
 this flake pulls in.**
@@ -308,7 +354,7 @@ mints its own) are written from `secureBoot.pkiBundle`/`keySource` too, not
 left for lanzaboote's own defaults to disagree with everything else
 silently. `keySource = "autogenerate"` also carries the landlock/ENOENT
 workaround (`generate-sb-keys.service`'s `ExecStart` override) confirmed by
-direct reproduction on the source host, gated on the identical condition
+direct reproduction, gated on the identical condition
 lanzaboote itself gates that unit's existence on
 (`modules/nixboot.nix`, the `boot.lanzaboote.pkiBundle` /
 `autoGenerateKeys.enable` writes and the `generate-sb-keys` override).
@@ -321,15 +367,15 @@ Bringing a NIC + sshd up in the initrd is common to both paths
 with `remoteUnlock.tpm2.enable`) delivers the host key as a TPM2-sealed
 systemd CREDENTIAL that `nixboot-seal-hostkey` generates and re-seals
 SELF-HEALINGLY (a real decrypt self-test against the live TPM/PCR state,
-not mere file existence — the exact gate whose absence bricked the source
-host's first implementation across a Secure Boot key enrollment), serves an
+not mere file existence — the gate required to survive a Secure Boot key
+enrollment), serves an
 EPHEMERAL, loudly-banner-flagged key on a genuine first boot before any
 seal exists, and forces `Restart = "no"` on the initrd sshd unit (`mkForce`,
 the one write in this whole file that genuinely needs it rather than
 `mkOverride 500` — nixpkgs' own `initrd-ssh.nix` sets `Restart = "on-failure"`
 at *plain* priority, which `mkOverride 500` would lose to silently) so a
 single post-enrollment stale credential costs exactly one failed TPM2
-unseal instead of a retry storm that drove a real fTPM into dictionary-attack
+unseal instead of a retry storm that can drive an fTPM into dictionary-attack
 lockout. Path B (`sealHostKey = false`) embeds a plaintext, build-time
 `hostKeyPath` instead — LAN/tailnet-only, no TPM needed. Both paths are
 refused, not left silently inert, when they cannot possibly work: enabling
@@ -363,8 +409,8 @@ block; proved both directions in `checks/default.nix`).
 **B24 — `nixboot-enroll-sb` is forced and shellchecked by `nix flake check`
 even when no host currently turns it on.**
 Exposed as `system.build.nixbootEnrollSb` (mirroring
-`system.build.extraEntryMaintainers` / `nixbootRegisterBootEntry` above, and
-the source host's own `system.build.sbEnroller`) rather than only ever
+`system.build.extraEntryMaintainers` / `nixbootRegisterBootEntry` above)
+rather than only ever
 constructed inline at its `environment.systemPackages` call site — a
 `writeShellApplication`'s shellcheck pass only runs when something actually
 builds the derivation, and reading `environment.systemPackages` alone does
@@ -398,9 +444,9 @@ not (`modules/nixboot.nix`, the `enrollSb` binding; forced in
   real firmware implementation accepts the entry and actually offers it at
   POST — the registrar's own logic is proved, real firmware quirks are not),
   and the REST of B22 (a real TPM2 dictionary-attack lockout, and a real
-  Secure Boot key enrollment actually changing PCR 7 on real firmware — the
-  source host's own field incidents, not reproducible in a disposable VM
-  suite without swtpm PCR-extension support this repo does not yet drive).
+  Secure Boot key enrollment actually changing PCR 7 on real firmware — not
+  reproducible in a disposable VM suite without swtpm PCR-extension support
+  this repo does not yet drive).
 
 `checks/default.nix` is this repo's first automated test suite — eval-level
 assertions plus the one build-level idempotency proof described above. A

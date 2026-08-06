@@ -1,14 +1,15 @@
 # nixboot
 
-**One declarative boot stance per host: firmware handoff through to
-switch-root — not the kernel package, not disk layout, not power policy, and
-not post-boot service ordering.**
+**One declarative boot subsystem per host: the booted kernel/initrd artifact,
+firmware handoff and everything required to reach `switch-root` — with
+physical storage facts, runtime policy and delivery supplied by their own
+specialists.**
 
 ## What nixboot is
 
-A NixOS module (plus a narrower system-manager backend, for Arch/CachyOS
-hosts) that owns everything between firmware and `switch-root`: which
-program installs to the ESP — `systemd-boot`, `lanzaboote`, or `limine` —
+A NixOS module, plus a narrower system-manager backend, that currently
+declares the mechanisms between firmware and `switch-root`: which program
+produces the ESP artifact — `systemd-boot`, `lanzaboote`, or `limine` —
 and every knob of its menu, the declared shape of the ESP itself (for
 assertions and verification — nixboot never partitions, formats, or mounts
 anything), how many past generations stay in the rollback menu, whether the
@@ -40,27 +41,35 @@ root filesystem exists. Every other knob in this module lives behind
 `extraEntries`'s own unconditionally-exposed build outputs use), so a host
 that already owns its whole boot chain can reuse just this one mechanism.
 
-**What it explicitly does not own**, so no knob ever has two managers
-fighting over it (see the SCOPE block in
-[`modules/nixboot.nix`](modules/nixboot.nix#L17-L87) for the full reasoning
-behind each line):
+The current implementation is narrower than the target architecture below.
+Its source SCOPE block records that current boundary; it is migration status,
+not a permanent exclusion of kernel/initrd or boot-medium work.
 
-- **The ESP's existence.** Partitioning, formatting, and mounting are a
-  disk-layout tool's job (disko, or an appliance's own image build). nixboot
-  only *declares* where an ESP that already exists lives and what must
-  already be true about it.
-- **Kernel packaging.** Kernel variant, `march`, LTO, the ZFS kernel-module
-  pairing, substituter choice — a foreign domain, the same way PCI/USB power
-  policy stays out of a BMC module.
-- **Disk-layout identity.** LUKS members, ZFS pool import, impermanence /
-  persist paths. Appliance state that happens to get consulted from stage 1,
-  not boot policy.
+**What remains outside nixboot permanently**, so no knob ever has two
+managers fighting over it:
+
+- **Physical storage provisioning and source facts.** nixstorage or an
+  appliance layout creates partitions/filesystems and supplies device,
+  capacity and role facts. nixluks supplies encrypted-member identity,
+  ordering and criticality. nixboot owns their boot-time projection and the
+  constraints required to reach switch-root; it never retypes or destroys
+  the underlying storage.
+- **Source-domain policy.** nixcpu, nixfs, nixgpu and related domains supply
+  architecture, microcode, filesystem and hardware requirements. The target
+  nixboot class backend selects and packages the booted kernel/initrd from
+  those facts; it does not become a second source of CPU, filesystem or GPU
+  policy.
 - **Power policy.** Sleep/suspend, ASPM, EPP — boot-adjacent, but a second
   manager on the same kernel-param surface is exactly the failure mode this
   module's own layering rule forbids.
 - **Post-boot service ordering.** nixboot's job ends at `switch-root`; what
   systemd does with targets and units afterward belongs to whoever owns that
   service, not to a boot-stance module.
+- **Delivery.** Scheduling, transport, materialization, slot selection and
+  rotation, activation, rollback, reimage, and outcome reporting belong to
+  nixdeploy. Current nixboot timers and cutover units predate that target
+  boundary and are migration debt, not an invitation to add more rollout
+  policy here.
 
 The one thing nixboot *writes to* without *owning* is `boot.lanzaboote.*` —
 options defined by the separate [lanzaboote](https://github.com/nix-community/lanzaboote)
@@ -79,6 +88,60 @@ The companion [Boot Security And Recovery](docs/security-recovery.md)
 decision record defines the passphrase-only data-unlock invariant, rescue
 boundary, private-key custody, and firmware-recovery procedure for consumers
 of this public module.
+
+## Target architecture: one schema, class adapters, two roles
+
+The target is one boot-intent schema shared across the NixOS,
+system-manager, and Home Manager module systems wherever that plane can
+meaningfully participate. "Shared schema" does not mean every plane may
+write firmware:
+
+- the NixOS backend produces and verifies artifacts for a Nix-built kernel,
+  initrd, loader, and ESP;
+- the system-manager backend produces and verifies equivalent artifacts
+  around the native distro kernel and package manager;
+- Home Manager may consume read-only status or expose user-scoped tooling,
+  but it must never become a second ESP, Secure Boot, or NVRAM actuator.
+
+Two independent axes describe a bootable system:
+
+| Axis | Values | Meaning |
+|---|---|---|
+| Device class | `nixarch`, `nixnas`, `nixvps` | The public adapter that translates class capabilities into the common boot schema. It supplies mechanism-specific facts, not a private host's policy. |
+| Boot role | `primary`, `nixrescue` | Whether the artifact is the everyday operating system or a recovery system. The role does not imply a device class. |
+
+A container or other target with no firmware handoff is an explicit
+**no-boot** case, not a `primary` system with a conveniently disabled loader.
+It composes no boot actuator and has no ESP, NVRAM, or Secure Boot contract.
+The current NixOS `loader.program = "none"` remains useful for a guest whose
+configuration still owns an extra artifact, but it is not yet the complete
+cross-plane no-boot model above.
+
+The composition layer owns all actual host facts and policy: hostnames,
+addresses, cloud identities, disk identifiers, accounts, keys, endpoints,
+and chosen production values. Public class repos contain only adapters,
+generic defaults that are true for the class, examples, and tests. A class
+adapter may translate a fact; it must not become a second source for it.
+
+The other two ownership boundaries are equally strict:
+
+- [nixrescue](https://github.com/julian-corbet/nixrescue-corbet-ch) produces
+  the recovery content and runtime;
+- nixboot produces and verifies the boot artifact around either a `primary`
+  or `nixrescue` payload;
+- [nixdeploy](https://github.com/julian-corbet/nixdeploy-corbet-ch) alone owns
+  delivery: scheduling, transport, materialization, slot rotation and
+  selection, activation, rollback, reimage, and typed outcomes.
+
+This is the architectural target, not the current option surface. Today the
+NixOS backend uses `nixboot.*`, the system-manager backend uses the separate
+`nixboot.systemdBoot.*` tree, no Home Manager module is exported, and no
+device-class/boot-role schema has landed. Kernel selection/packaging and some
+boot-medium construction also still live in class or consumer repos. Those
+move into the class backends here while their source facts stay in the
+specialist domains. nixboot's current maintainer timers and slot rotation are
+implemented behavior, but delivery responsibility moves to nixdeploy rather
+than remaining a second deployment system.
 
 ## The system-manager backend
 
@@ -139,12 +202,14 @@ the protected hashes again. It never deletes a directory recursively.
     inputs.nixboot.systemManagerModules.default
   ];
 
+  # Illustrative values only. The private composition supplies the actual
+  # hardware facts, native package choices, and boot policy.
   nixcpu = {
     enable = true;
     arch = "x86_64";
     vendor = "intel";
     execution = "bare-metal";
-    cores = 8;
+    cores = 4;
     threads = 8;
     capabilities.microcode.enable = true;
   };
@@ -152,10 +217,10 @@ the protected hashes again. It never deletes a directory recursively.
   nixboot.systemdBoot = {
     enable = true;
     kernels = [{
-      package = "linux-cachyos";
-      packageBase = "linux-cachyos";
-      headersPackage = "linux-cachyos-headers";
-      id = "cachyos";
+      package = "linux";
+      packageBase = "linux";
+      headersPackage = "linux-headers";
+      id = "main";
     }];
     kernelCmdline = "rd.luks.name=example=cryptroot root=/dev/mapper/cryptroot rw";
     stage.enable = true; # units are manual; this does not change firmware state
@@ -171,17 +236,13 @@ use for its system-manager modules).
 
 ## Status
 
-Pre-alpha. The module is complete and was extracted verbatim from a private
-operator's boot-stance audit (see the header of
-[`modules/nixboot.nix`](modules/nixboot.nix) for the extraction story), but
-this standalone flake has not yet been re-verified live as its own input —
-only as an in-tree module in the configuration it came from, and — as of
-this revision — as a normalised eval-level comparison against that source
-configuration's own boot glue, not yet a live cutover on real hardware (see
-the note at the end of this section).
+Pre-alpha. The NixOS and system-manager backends, their assertions, and their
+eval/build checks exist today. Firmware-specific behavior still requires
+physical-host verification; successful evaluation is not proof that a
+firmware implementation will boot an artifact.
 
-Two pieces of the source contract that an earlier revision of this file
-called out as deliberately deferred are now implemented: `extraEntries.*`
+Two pieces that an earlier revision of this file called out as deliberately
+deferred are now implemented: `extraEntries.*`
 (the `ukify`+`sbsign`+place+rotate pipeline for a durable rescue/BMC boot
 entry — [`modules/extra-entries.nix`](modules/extra-entries.nix)), and
 `remoteUnlock.*` (headless in-initrd SSH, both the TPM2-sealed and
@@ -194,21 +255,14 @@ declares those members — [nixluks](https://github.com/julian-corbet/nixluks-co
 own `volumes.<name>.initrdUnlock.*`, not nixboot, which has no member list
 of its own to attach that mechanism to (see the "CROSS-MODULE COUPLING"
 comment on `remoteUnlock`'s common initrd-network block); and the initrd
-**console keymap** is real and evidenced from the same source audit but not
-yet implemented in this repo at all.
+**console keymap** is a known requirement but is not yet implemented in this
+repo.
 
-**A note on "one declarative boot stance per host":** that generality is a
-property of this MODULE, not automatically of any given consumer. nixnas —
-the appliance this module was extracted out of — still owns its own
-loader/Secure-Boot/rollback wiring in-tree
-(`modules/boot/{disk,rollback,image,secureboot,remote-unlock}.nix`) and
-consumes only `extraEntries.*` and `media.usb.enable` from this flake today;
-the rest of its boot chain has been compared against this module's option
-surface (behaviour-for-behaviour, not merely name-for-name) but not yet
-cut over. Two repos owning parts of one boot chain is exactly the shape this
-module exists to end — see that repo's own commit history for the ordered
-cutover plan such a comparison produces, and CONTRACT.md's B21–B24 for what
-had to be added here first to make the comparison honest.
+The cross-plane device-class/boot-role schema described above is not
+implemented yet. Existing class integrations therefore remain adapters over
+the current backend-specific option trees. New documentation and code should
+converge toward the common schema and the nixdeploy delivery boundary rather
+than add another mirrored boot or rollout surface.
 
 ## Usage
 
@@ -227,15 +281,17 @@ had to be added here first to make the comparison honest.
         lanzaboote.nixosModules.lanzaboote
 
         {
+          # Illustrative values only. Real host policy belongs in the private
+          # composition that imports this public mechanism.
           nixboot = {
             enable = true;
             loader.program = "systemd-boot";
             loader.efiVariables = "write"; # this host owns real NVRAM
-            loader.timeout = 5;
+            loader.timeout = 10;
 
             esp.mountPoint = "/boot";
             esp.byLabel = "ESP";
-            esp.capacityMiB = 512;
+            esp.capacityMiB = 1024;
 
             generations = {
               keep = 4; # booted generation plus three newest alternatives
@@ -270,9 +326,11 @@ A host that owns its own boot chain already (so `nixboot.enable` stays
 }
 ```
 
-The stick's own geometry — device path, image size, partition count — is
-never nixboot's business; that stays with whichever disk-layout tool the
-host already uses.
+The physical device and layout facts — device identity, capacity and
+partition geometry — stay with nixstorage or the host's disk-layout owner.
+nixboot owns the stick's boot role, the boot-medium constraints derived from
+those facts, and the boot artifact placed on it. Writing or rotating that
+artifact is delivery and therefore belongs to nixdeploy.
 
 ## Repository layout
 
@@ -292,12 +350,15 @@ host already uses.
 
 ## Related projects
 
-Part of the same small, independently-usable NixOS module family:
-[nixnas](https://github.com/julian-corbet/nixnas) (the appliance this module
-was extracted out of), [nixgpu](https://github.com/julian-corbet/nixgpu-corbet-ch),
-[nixram](https://github.com/julian-corbet/nixram-corbet-ch). A sibling
-hardware-power module in the same house style exists but is not yet a
-public repo of its own.
+Part of the same small, independently usable module family:
+[nixarch](https://github.com/julian-corbet/nixarch-corbet-ch),
+[nixnas](https://github.com/julian-corbet/nixnas),
+[nixvps](https://github.com/julian-corbet/nixvps-corbet-ch),
+[nixrescue](https://github.com/julian-corbet/nixrescue-corbet-ch), and
+[nixdeploy](https://github.com/julian-corbet/nixdeploy-corbet-ch) meet at the
+class, role, and delivery boundaries above. [nixram](https://github.com/julian-corbet/nixram-corbet-ch)
+and [nixgpu](https://github.com/julian-corbet/nixgpu-corbet-ch) remain
+separate subsystems; boot does not absorb their policy.
 
 ## License
 

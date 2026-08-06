@@ -6,6 +6,13 @@ is deliberately host-neutral: public nixboot documents mechanisms and
 recovery contracts; a private consumer supplies its own keys, disk layout,
 and access values.
 
+In the target architecture, nixrescue produces recovery content and runtime,
+nixboot produces and verifies the boot artifact, and nixdeploy alone delivers
+and selects `primary` or `nixrescue` artifacts and records rollout outcomes.
+The current nixboot and nixrescue maintainer/cutover helpers predate that
+split and remain documented as current behavior only, not as ownership
+precedent.
+
 ## Non-Negotiable Invariants
 
 1. **Data requires the one existing operator passphrase.** Every LUKS volume

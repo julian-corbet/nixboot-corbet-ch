@@ -8,20 +8,21 @@ restating the reasoning twice.
 
 ## Why doesn't nixboot partition or format the ESP?
 
-Because that would make it a disk-layout tool, and disk layout already has
-an owner on any given host (disko, or an appliance's own image build).
-nixboot's contract is narrower and more testable: given an ESP that already
-exists, declare what must be true about it and check that it stays true.
-See `modules/nixboot.nix:30-35, 182-207`.
+Because physical storage provisioning remains nixstorage or an appliance
+layout's job. nixboot owns the ESP's boot role, constraints, contents and
+verification, while consuming the device/capacity facts supplied by the
+layout owner. The current backend only declares an already-existing ESP;
+class-backed boot-medium construction is part of the target migration.
 
-## Why doesn't nixboot own kernel packaging?
+## Does nixboot own kernel packaging?
 
-Kernel variant, `march`, LTO flags, the ZFS-kernel-module pairing, and
-substituter choice are a genuinely separate domain — the same separation
-that keeps PCI/USB power policy out of a BMC module in this house's other
-projects. Whoever packages the kernel owns that surface; nixboot only cares
-that *a* kernel and initrd get handed off correctly. See
-`modules/nixboot.nix:36-40`.
+In the target architecture, yes: the kernel/initrd that actually boots is
+part of the boot artifact, so the nixarch/nixnas/nixvps backend selects and
+packages it. It does so from facts supplied by the specialist domains:
+nixcpu owns architecture/microcode knowledge, nixfs filesystem requirements,
+nixstorage physical layout and nixluks encrypted-member semantics. The
+current implementation still receives a consumer-packaged kernel; that is
+migration status, not the final ownership boundary.
 
 ## Why doesn't nixboot manage sleep/suspend or CPU power policy?
 
@@ -67,8 +68,18 @@ refusal rather than a silent partial enrollment. See
 
 ## What isn't implemented yet?
 
-The **initrd console keymap** is real and evidenced from the same source
-audit `remoteUnlock.*` and `secureBoot.*` were ported from, but is not
+The unified architecture described in the README and CONTRACT is a target,
+not a claim about today's exports. There is not yet one schema selecting a
+`nixarch`/`nixnas`/`nixvps` device class and a `primary`/`nixrescue` boot
+role across NixOS, system-manager, and Home Manager. Containers also do not
+yet have a first-class cross-plane no-boot declaration. Today NixOS uses
+`nixboot.*`, system-manager uses `nixboot.systemdBoot.*`, and there is no
+Home Manager backend. Delivery is also still partly implemented by nixboot's
+own timers; the target assigns scheduling, transport, materialization, slot
+rotation/selection, activation, rollback, reimage, and outcomes solely to
+nixdeploy.
+
+The **initrd console keymap** is a known requirement, but is not
 implemented in this repo at all yet — called out explicitly in the module's
 own SCOPE block rather than silently missing. See `modules/nixboot.nix`'s
 header.

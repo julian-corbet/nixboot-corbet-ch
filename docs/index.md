@@ -1,16 +1,10 @@
 # nixboot
 
-nixboot is one small NixOS module: declare a host's boot stance, get a
-coherent loader configuration, a declared ESP contract, generation
-retention, optional boot counting, an optional Secure Boot posture, and a
-`nixboot-verify` service that checks every one of those things actually
-took after boot. Instead of hand-picking `boot.loader.*` options per host
-and hoping they agree with each other and with whatever a NixOS profile
-already set as a default, you declare one `nixboot` block and get
-a coherent whole. A second, much narrower module
-(`systemManagerModules.nixboot`) covers the one piece of this that is
-soundly possible on a system-manager (Arch/CachyOS) host with no `boot.*`
-option surface at all — see its own section below.
+nixboot currently provides a full NixOS boot module and a narrower
+system-manager backend. The NixOS module declares a coherent loader, ESP,
+generation-retention, boot-counting, Secure Boot, and post-boot verification
+contract. The system-manager backend produces the equivalent safe subset
+through a foreign host's native kernel and package tooling.
 
 This page is the reader-facing walkthrough. The option-by-option contract —
 what nixboot guarantees, with assertions and warnings as the enforcement
@@ -23,6 +17,31 @@ host values live in [Boot Security And Recovery](security-recovery.md). It
 records the passphrase-only data-unlock invariant, rescue boundary, key
 custody, and the different interactive and headless recovery paths without
 putting any private host values into this public repository.
+
+## Target schema and current boundary
+
+The target is one boot-intent schema across NixOS, system-manager, and Home
+Manager wherever a plane can participate without becoming a second boot
+actuator. NixOS and system-manager produce and verify boot artifacts; Home
+Manager may expose read-only status or user-scoped tooling, never ESP,
+Secure Boot, or NVRAM writes.
+
+Device class (`nixarch`, `nixnas`, or `nixvps`) and boot role (`primary` or
+`nixrescue`) are independent axes. A container has an explicit no-boot case:
+no role, no ESP, and no actuator. nixrescue owns the recovery content and
+runtime; nixboot owns construction and verification of the boot artifact.
+nixdeploy alone owns delivery across every plane, class, and role, including
+scheduling, transport, materialization, slot rotation and selection,
+activation, rollback, reimage, and typed outcomes. The private composition
+supplies all host identities and chosen production values.
+
+That common schema is not implemented today. The NixOS option tree is
+`nixboot.*`, system-manager still uses `nixboot.systemdBoot.*`, and no Home
+Manager module or class/role schema is exported. Current maintainer timers
+and artifact rotation in nixboot are migration debt against the nixdeploy
+boundary. See
+[`CONTRACT.md`](../CONTRACT.md#architecture-target-beyond-the-current-option-surface)
+for the migration invariants.
 
 ## The option groups
 
@@ -114,18 +133,17 @@ on the command line regardless — this only ever reorders, never drops one.
 above, these two actually reach the thing that signs UKIs: `pkiBundle`
 becomes `boot.lanzaboote.pkiBundle`, and `keySource = "autogenerate"` turns
 on `boot.lanzaboote.autoGenerateKeys.enable` plus the landlock/ENOENT
-workaround `generate-sb-keys.service` needs on a genuine first boot. Ported
-from, and closing a real gap found in, the source configuration's own
-`secureboot.nix` — see CONTRACT.md's B21.
+workaround `generate-sb-keys.service` needs on a genuine first boot. The
+configuration reaches both the signer and its supporting tools so they
+cannot silently disagree — see CONTRACT.md's B21.
 
 ## Why a `*-verify` service at all
 
 Every other kind of NixOS misconfiguration gets caught by the next
 `nixos-rebuild` or the next time someone notices the wrong behavior at
 runtime. A boot misconfiguration is different: the evidence that a knob
-didn't take often only shows up at the *next* boot — on real hardware, that
-can mean a ~15-minute POST and no way to reach the box at all until it's
-resolved. `nixboot-verify` runs once after every successful boot, reads
+didn't take often only shows up at the *next* boot, when the host may no
+longer be reachable. `nixboot-verify` runs once after every successful boot, reads
 every managed knob back off the live system (loader identity via `bootctl
 status`, ESP mount/label/capacity, foreign-path survival, `sbctl status`,
 kept-generation count), and fails loudly the same boot a setting turns out
