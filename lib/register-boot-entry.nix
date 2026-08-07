@@ -85,7 +85,12 @@ let
   mkRegisterBootEntry = frontRuntimeInputs:
     pkgs.writeShellApplication {
       name = "nixboot-register-boot-entry";
-      runtimeInputs = frontRuntimeInputs ++ [ pkgs.efibootmgr pkgs.util-linux pkgs.gnugrep pkgs.coreutils ];
+      # gnused is NOT optional and NOT covered by coreutils: the stale-entry sweep above pipes
+      # through `sed 's/^Boot//'`. A missing sed is a bare 127 at the exact moment this script is
+      # deleting firmware entries, and the idempotency check cannot catch it -- a Nix build
+      # sandbox's stdenv already has sed on PATH, so the test passes while a systemd unit with a
+      # minimal PATH (which is what actually runs this in production) would not.
+      runtimeInputs = frontRuntimeInputs ++ [ pkgs.efibootmgr pkgs.util-linux pkgs.gnugrep pkgs.gnused pkgs.coreutils ];
       text = registerBootEntryText;
     };
 

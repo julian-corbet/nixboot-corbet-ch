@@ -104,9 +104,167 @@ let
     Exec = /usr/bin/systemctl start nixboot-systemd-boot-stage.service
   '';
 
+  # Read by an operator and by anything that aggregates host health. /run, not /var, on purpose:
+  # the fact this file states is scoped to the current boot and a reboot is what resolves it, so a
+  # copy surviving into the next boot could only ever be a lie. It exists at all because the
+  # journal is not a durable channel here — a system-manager host may run a volatile journal, and
+  # on the host this check was written for `systemctl status` answered a 22-hour-old failure with
+  # "journal has been rotated since unit was started, output may be incomplete".
+  bootedKernelStatusFile = "/run/nixboot/booted-kernel";
+
+  # Pacman owns the native kernel packages, so the transaction that replaces a module tree is the
+  # only precise moment to re-ask this question. Ordered after the stage hook (95-) so a staged UKI
+  # rebuild and this check report against the same post-transaction state. `restart`, not `start`:
+  # the unit is a RemainAfterExit oneshot, and `start` on an already-succeeded oneshot is a no-op,
+  # which would leave the previous run's verdict standing after the very event that invalidated it.
+  # `Remove` is a trigger too — uninstalling a kernel deletes a module tree exactly like an upgrade.
+  bootedKernelHookText = ''
+    [Trigger]
+    Operation = Install
+    Operation = Upgrade
+    Operation = Remove
+    Type = Path
+    Target = usr/lib/modules/*/pkgbase
+
+    [Action]
+    Description = NixBoot: re-check whether the booted kernel still matches the installed one
+    When = PostTransaction
+    Depends = systemd
+    Exec = /usr/bin/systemctl restart nixboot-booted-kernel-verify.service
+  '';
+
+  bootedKernelHookFile = pkgs.writeText "96-nixboot-booted-kernel.hook" bootedKernelHookText;
+
   kernelCalls = lib.concatMapStrings (kernel: ''
     build_uki ${lib.escapeShellArg kernel.packageBase} ${lib.escapeShellArg kernel.id} ${if kernel.fallback then "yes" else "no"}
   '') cfg.kernels;
+
+  # The exact ESP filenames the DECLARATION asks for. Derived from `kernels`, not from what a
+  # build produced -- that difference is what lets collection run before staging, which is the
+  # whole point of separating them (see collectFunction).
+  desiredUkiNames = lib.concatMap (kernel:
+    [ "${cfg.uki.prefix}-${kernel.id}.efi" ]
+    ++ lib.optional kernel.fallback "${cfg.uki.prefix}-${kernel.id}-fallback.efi"
+  ) cfg.kernels;
+
+  # Reclamation of NixBoot-owned ESP files that no declared kernel wants.
+  #
+  # This used to run only AFTER a successful staging, which deadlocks: staging needs ESP space,
+  # the space is held by artifacts only collection can free, and collection sat behind the step it
+  # was supposed to unblock. On a 512 MiB ESP carrying several UKIs that is not a theoretical
+  # ordering nit -- it is the state where the boot subsystem can no longer update itself and says
+  # so only as a capacity error. Collection therefore depends on nothing but the declaration: no
+  # mkinitcpio run, no staging directory, no free space.
+  #
+  # Ownership is unchanged: the unique UKI prefix is still the only thing considered. A foreign
+  # rescue image, vendor firmware capsule, Limine artifact or the active fallback is never a
+  # candidate, before or after this change.
+  collectFunction = ''
+    collect_stale_ukis() {
+      local linux_dir="$esp/EFI/Linux"
+      local existing base current_entry size boot_status
+      local pruned=0 freed=0
+
+      # Read by the caller. NOT local: the standalone unit turns a refusal into a failed unit,
+      # while staging only notes it and lets the capacity gate speak for itself.
+      collect_skipped=no
+
+      [ -d "$linux_dir" ] || return 0
+
+      # Never collect the entry this host actually booted, even if the declaration has since moved
+      # on and no longer names it. Same invariant the Lanzaboote retention path enforces one layer
+      # over: a running kernel's boot entry is not garbage because a config changed, and firmware
+      # is the only authority on which entry that is.
+      #
+      # So this DELETION path runs only when firmware can be asked and answers. "Is it in the
+      # declared set?" is a different question and not a fallback for this one -- the booted entry
+      # being absent from the declared set is precisely the case this guard exists for (a kernel
+      # dropped from `kernels` while the host still runs it), and precisely the case where matching
+      # on the declared set alone would delete it. Collection is an optimisation; a running
+      # kernel's boot entry is not, so when the authority is unavailable nothing is collected.
+      if [ ! -x /usr/bin/bootctl ]; then
+        echo "nixboot: /usr/bin/bootctl is absent, so the booted entry cannot be identified; refusing to collect anything." >&2
+        collect_skipped=yes
+        return 0
+      fi
+
+      boot_status="$(LC_ALL=C /usr/bin/bootctl --esp-path="$esp" status 2>&1 || true)"
+
+      # bootctl can report a valid loader while also saying firmware loaded it from a DIFFERENT
+      # ESP. `Current Entry` then names a file on that other partition, so matching it by basename
+      # against this one could protect the wrong file and delete the right one.
+      case "$boot_status" in
+        *"reports a different partition UUID"*)
+          echo "nixboot: firmware booted a different ESP from $esp; refusing to collect anything." >&2
+          collect_skipped=yes
+          return 0
+          ;;
+      esac
+
+      current_entry="$(printf '%s\n' "$boot_status" |
+        /usr/bin/sed -n -E 's/^[[:space:]]*Current Entry:[[:space:]]*(.+\.efi).*$/\1/p')"
+
+      if [ -z "$current_entry" ]; then
+        echo "nixboot: firmware did not report a Current Entry for $esp, so the booted entry cannot be identified; refusing to collect anything." >&2
+        collect_skipped=yes
+        return 0
+      fi
+
+      for existing in "$linux_dir/$prefix-"*.efi "$linux_dir/$prefix-"*.efi.new "$linux_dir/$prefix-"*.efi.tmp; do
+        base="$(/usr/bin/basename "$existing")"
+
+        if [ "$base" = "$current_entry" ]; then
+          echo "nixboot: keeping $base -- firmware reports it as the entry this host booted"
+          continue
+        fi
+    ${lib.optionalString (desiredUkiNames != [ ]) ''
+        case "$base" in
+          ${lib.concatMapStringsSep "|" lib.escapeShellArg desiredUkiNames}) continue ;;
+        esac
+    ''}
+        size="$(/usr/bin/stat --format=%s "$existing" 2>/dev/null || echo 0)"
+        /usr/bin/rm -f -- "$existing"
+        pruned=$((pruned + 1))
+        freed=$((freed + size))
+      done
+
+      echo "nixboot: collected $pruned stale NixBoot UKI artifact(s), $((freed / 1024 / 1024)) MiB reclaimed."
+    }
+  '';
+
+  collectScript = ''
+    set -euo pipefail
+
+    esp=${lib.escapeShellArg cfg.esp.mountPoint}
+    prefix=${lib.escapeShellArg cfg.uki.prefix}
+
+    # bootctl is a hard requirement HERE, unlike in staging: this unit's entire job is a deletion
+    # sweep, and it cannot prove which entry booted this host without it.
+    for command in /usr/bin/basename /usr/bin/bootctl /usr/bin/findmnt /usr/bin/rm /usr/bin/sed /usr/bin/stat; do
+      [ -x "$command" ] || {
+        echo "nixboot: required native command is absent: $command" >&2
+        exit 1
+      }
+    done
+
+    [ -d "$esp" ] || { echo "nixboot: ESP mount point does not exist: $esp" >&2; exit 1; }
+    [ "$(/usr/bin/findmnt -no FSTYPE --target "$esp")" = "vfat" ] || {
+      echo "nixboot: $esp is not the mounted FAT ESP; refusing to collect boot artifacts." >&2
+      exit 1
+    }
+    shopt -s nullglob
+
+    ${collectFunction}
+
+    collect_stale_ukis
+
+    # An operator asked this unit to reclaim space and it declined. That must be visible as a
+    # failed unit, not a green one that quietly did nothing.
+    [ "$collect_skipped" = no ] || {
+      echo "nixboot: no artifacts were collected -- see the refusal above. This unit reclaims space only when firmware can name the entry this host booted." >&2
+      exit 1
+    }
+  '';
 
   stageScript = ''
     set -euo pipefail
@@ -116,7 +274,7 @@ let
     secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
     sbctl_config=${if cfg.secureBoot.sbctlConfig == null then "''" else lib.escapeShellArg cfg.secureBoot.sbctlConfig}
 
-    for command in /usr/bin/basename /usr/bin/df /usr/bin/du /usr/bin/findmnt /usr/bin/install /usr/bin/mkinitcpio /usr/bin/mktemp /usr/bin/rm /usr/bin/sbctl /usr/bin/stat; do
+    for command in /usr/bin/basename /usr/bin/df /usr/bin/du /usr/bin/findmnt /usr/bin/install /usr/bin/mkinitcpio /usr/bin/mktemp /usr/bin/rm /usr/bin/sbctl /usr/bin/sed /usr/bin/stat; do
       [ -x "$command" ] || {
         echo "nixboot: required native command is absent: $command" >&2
         echo "nixboot: activate the declared native package set before staging." >&2
@@ -132,6 +290,19 @@ let
     staging_dir="$(/usr/bin/mktemp -d /var/tmp/nixboot-systemd-boot.XXXXXX)"
     trap '/usr/bin/rm -rf "$staging_dir"' EXIT
     shopt -s nullglob
+
+    ${collectFunction}
+
+    # BEFORE the capacity check, not after the install. Collection needs nothing this staging run
+    # produces, so running it first is what keeps a full ESP recoverable: the artifacts that would
+    # free the space are exactly the ones no declared kernel wants. Deleting them cannot break a
+    # declared boot path, and the booted entry is excluded regardless of what the declaration says.
+    #
+    # A refusal (no bootctl, a different ESP, no Current Entry) is NOT fatal here: it has already
+    # printed why, and staging is not a reclamation request. Either the declared set still fits --
+    # in which case nothing was needed -- or the capacity gate below refuses with its own explicit
+    # shortfall. Collection is never a precondition for staging, only an aid to it.
+    collect_stale_ukis
 
     build_uki() {
       local package_base="$1" id="$2" fallback="$3"
@@ -190,8 +361,12 @@ let
       add_required_bytes "$uki" "$esp/EFI/Linux/$(/usr/bin/basename "$uki")"
     done
     if [ "$available_bytes" -lt "$required_bytes" ]; then
-      echo "nixboot: $esp has $available_bytes free bytes, but staging requires $required_bytes bytes." >&2
-      echo "nixboot: no ESP files were changed; free space or adjust the declared UKI set before retrying." >&2
+      # Say the number in the unit the declaration is written in. `esp.capacityMiB`,
+      # `generations.capacity.*` and every ESP budget in this family are MiB, so a bare byte count
+      # forces an operator to do arithmetic before they can act on it. Bytes stay for precision.
+      echo "nixboot: insufficient ESP capacity on $esp -- need $((required_bytes / 1024 / 1024)) MiB, have $((available_bytes / 1024 / 1024)) MiB (need $required_bytes bytes, have $available_bytes)." >&2
+      echo "nixboot: stale NixBoot artifacts were already collected above, so this is what the declared UKI set genuinely costs; no ESP files were changed." >&2
+      echo "nixboot: reduce the declared set (a kernel's fallback = false is usually the largest single UKI), or grow the ESP. NixBoot will not drop a declared boot artifact on its own." >&2
       exit 1
     fi
 
@@ -203,32 +378,19 @@ let
     /usr/bin/install -Dm0644 ${cmdlineFile} /etc/kernel/cmdline
     /usr/bin/install -Dm0644 ${loaderConfFile} "$esp/loader/loader.conf"
 
-    declare -A desired_ukis=()
     for uki in "$staging_dir"/*.efi; do
-      desired_ukis["$(/usr/bin/basename "$uki")"]=1
       output="$esp/EFI/Linux/$(/usr/bin/basename "$uki")"
       /usr/bin/install -m0644 "$uki" "$output"
       [ "$secure_boot" != yes ] || /usr/bin/sbctl --config "$sbctl_config" sign -s "$output"
     done
 
-    # The unique UKI prefix is NixBoot's ownership boundary. Once every desired image has
-    # been built and installed successfully, remove only stale files under that prefix. This
-    # makes native kernel updates and removed kernel declarations self-cleaning without ever
-    # treating a foreign rescue, vendor firmware, Limine, or the active fallback as garbage.
-    pruned=0
-    for existing in "$esp/EFI/Linux/$prefix-"*.efi "$esp/EFI/Linux/$prefix-"*.efi.new "$esp/EFI/Linux/$prefix-"*.efi.tmp; do
-      base="$(/usr/bin/basename "$existing")"
-      case "$base" in
-        *.efi)
-          [ -n "''${desired_ukis[$base]:-}" ] && continue
-          ;;
-      esac
-      /usr/bin/rm -f -- "$existing"
-      pruned=$((pruned + 1))
-    done
+    # Second pass, same collector: the pre-staging call cannot see a `.new`/`.tmp` leftover this
+    # run's own install may have produced. It is deliberately the SAME function rather than a
+    # second prune loop -- two implementations of "what does NixBoot own" is how one of them ends
+    # up deleting something the other protects.
+    collect_stale_ukis
 
     echo "nixboot: staged systemd-boot at $esp/EFI/systemd/systemd-bootx64.efi"
-    echo "nixboot: pruned $pruned stale UKI artifact(s) under the NixBoot prefix."
     echo "nixboot: current firmware entry and EFI/BOOT fallback were intentionally not changed."
   '';
 
@@ -239,9 +401,16 @@ let
     prefix=${lib.escapeShellArg cfg.uki.prefix}
     fail=0
 
+    for command in /usr/bin/head; do
+      [ -x "$command" ] || {
+        echo "nixboot: required native command is absent: $command" >&2
+        exit 1
+      }
+    done
+
     check_efi() {
       local file="$1"
-      if [ -s "$file" ] && [ "$(head -c2 "$file")" = "MZ" ]; then
+      if [ -s "$file" ] && [ "$(/usr/bin/head -c2 "$file")" = "MZ" ]; then
         echo "PASS  nixboot: $file is a non-empty EFI image"
       else
         echo "FAIL  nixboot: $file is missing or not an EFI image" >&2
@@ -263,6 +432,119 @@ let
     echo "nixboot: staged loader and UKIs verified. Select EFI/systemd/systemd-bootx64.efi once from firmware before any cutover."
   '';
 
+  # Staleness of the BOOTED kernel, which is a different question from every other check in this
+  # backend: those ask whether the artifacts on the ESP are the ones NixBoot declared, this asks
+  # whether the kernel this host is actually executing still exists on disk. A native kernel
+  # upgrade replaces /usr/lib/modules/<release> wholesale. Modules already resident keep working,
+  # so nothing looks wrong; the next on-demand modprobe is what fails, in whichever subsystem
+  # happens to ask first, with an error that describes that subsystem and not the kernel. This
+  # unit exists so the condition is stated where it is true rather than rediscovered from a
+  # downstream symptom.
+  #
+  # It reports and stops there. No reboot, no install, no restore — the same ownership line
+  # nixnet draws in its own BEHAVIORS.md (OWN-2): a layer that acts on its own judgement destroys
+  # the evidence of the fault underneath it and makes its own action the story. Rebooting is a
+  # deploy concern with a different blast radius and a different owner. What this unit owes the
+  # operator is an unambiguous statement, not a decision.
+  bootedKernelVerifyScript = ''
+    set -euo pipefail
+
+    for command in /usr/bin/basename /usr/bin/install /usr/bin/mv /usr/bin/uname; do
+      [ -x "$command" ] || {
+        echo "nixboot: required native command is absent: $command" >&2
+        exit 1
+      }
+    done
+
+    status_file=${lib.escapeShellArg bootedKernelStatusFile}
+    running="$(/usr/bin/uname -r)"
+    modules_dir="/usr/lib/modules/$running"
+    fail=0
+    lines=()
+    shopt -s nullglob
+
+    # Every verdict goes to both the log and the status file, so the two can never disagree about
+    # what this run found. FAIL additionally goes to stderr, where systemd marks it.
+    record() {
+      lines+=("$1")
+      if [ "''${2:-pass}" = fail ]; then
+        fail=1
+        echo "$1" >&2
+      else
+        echo "$1"
+      fi
+    }
+
+    # Same discovery the stage script uses: pkgbase, not a filename convention, is what ties an
+    # installed module tree back to the native package that owns it.
+    installed_releases() {
+      local base="$1" candidate
+      for candidate in /usr/lib/modules/*; do
+        [ -f "$candidate/pkgbase" ] || continue
+        [ "$(<"$candidate/pkgbase")" = "$base" ] || continue
+        /usr/bin/basename "$candidate"
+      done
+    }
+
+    # Check 1 — does the running kernel still have a module tree at all?
+    if [ -d "$modules_dir" ]; then
+      record "PASS  nixboot: booted kernel $running still owns its module tree at $modules_dir"
+    else
+      record "FAIL  nixboot: booted kernel $running has no module tree at $modules_dir. A native kernel transaction removed it. Modules already loaded keep working, so this host looks healthy while every on-demand module load from now on fails — the symptom will appear in whichever subsystem asks for a module first and will describe that subsystem, not this. Reboot into the installed kernel to resolve it. NixBoot will not reboot, install, or restore anything on its own." fail
+    fi
+
+    # Check 2 — is the running release still the installed release of its own native package?
+    # This is the half that stays true when a module-preserving hook keeps Check 1 green: the tree
+    # is there, but the package has moved on and this host is executing yesterday's kernel.
+    booted_base=""
+    [ ! -f "$modules_dir/pkgbase" ] || booted_base="$(<"$modules_dir/pkgbase")"
+
+    if [ -n "$booted_base" ]; then
+      releases=()
+      while IFS= read -r release; do
+        releases+=("$release")
+      done < <(installed_releases "$booted_base")
+
+      others=()
+      for release in "''${releases[@]}"; do
+        [ "$release" = "$running" ] || others+=("$release")
+      done
+
+      if [ "''${#others[@]}" -eq 0 ]; then
+        record "PASS  nixboot: native package $booted_base is installed at $running, the release this host booted"
+      else
+        # A second tree for the SAME package is what a module-preserving native hook
+        # (kernel-modules-hook, mkmm) deliberately leaves behind, and it is exactly the state those
+        # hooks make invisible: Check 1 stays green because the old tree was kept, so nothing else
+        # on the host reports that the running kernel is no longer the installed one. Distinguished
+        # from plain absence because the two need different words to be actionable.
+        record "FAIL  nixboot: this host booted $running from native package $booted_base, but $booted_base also has ''${others[*]} installed. A newer kernel is on disk and this host is still executing the older one; a reboot is what converges them. NixBoot will not reboot anything." fail
+      fi
+    else
+      # Check 1 has already failed here — the tree that would name the owning package is the tree
+      # that is gone. Report the declared kernels' installed releases anyway: that is the operator's
+      # answer to "what replaced it", and it costs nothing to state.
+      record "SKIP  nixboot: $modules_dir/pkgbase is unreadable, so the booted kernel's native package identity cannot be established; the declared kernels below are what is installed now"
+      ${lib.concatMapStrings (kernel: ''
+        declared_releases=()
+        while IFS= read -r release; do
+          declared_releases+=("$release")
+        done < <(installed_releases ${lib.escapeShellArg kernel.packageBase})
+        record "SKIP  nixboot: declared kernel ${kernel.packageBase} (UKI id ${kernel.id}) is installed at ''${declared_releases[*]:-nothing}"
+      '') cfg.kernels}
+    fi
+
+    /usr/bin/install -d -m0755 "$(/usr/bin/dirname "$status_file")"
+    printf '%s\n' "''${lines[@]}" > "$status_file.new"
+    /usr/bin/mv -f "$status_file.new" "$status_file"
+
+    if [ "$fail" -ne 0 ]; then
+      echo "nixboot: the booted kernel no longer matches what is installed on this host. Full verdict: $status_file" >&2
+      exit 1
+    fi
+    echo "nixboot: booted kernel and installed kernel agree; module tree intact."
+  '';
+
   cutoverScript = ''
     set -euo pipefail
 
@@ -270,7 +552,7 @@ let
     secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
     sbctl_config=${if cfg.secureBoot.sbctlConfig == null then "''" else lib.escapeShellArg cfg.secureBoot.sbctlConfig}
 
-    for command in /usr/bin/bootctl /usr/bin/findmnt /usr/bin/systemctl; do
+    for command in /usr/bin/bootctl /usr/bin/findmnt /usr/bin/head /usr/bin/systemctl; do
       [ -x "$command" ] || {
         echo "nixboot: required native command is absent: $command" >&2
         exit 1
@@ -297,7 +579,7 @@ let
     fi
 
     for file in "$loader_output" "$fallback_output"; do
-      [ -s "$file" ] && [ "$(head -c2 "$file")" = "MZ" ] || {
+      [ -s "$file" ] && [ "$(/usr/bin/head -c2 "$file")" = "MZ" ] || {
         echo "nixboot: final loader artifact is missing or invalid: $file" >&2
         exit 1
       }
@@ -330,15 +612,15 @@ let
     /usr/bin/bootctl --esp-path="$esp" is-installed
 
     boot_table="$(/usr/bin/efibootmgr -v)"
-    boot_current="$(printf '%s\n' "$boot_table" | sed -n -E 's/^BootCurrent:[[:space:]]*([[:xdigit:]]{4})$/\1/p')"
-    boot_order="$(printf '%s\n' "$boot_table" | sed -n -E 's/^BootOrder:[[:space:]]*([[:xdigit:],]+)$/\1/p')"
+    boot_current="$(printf '%s\n' "$boot_table" | /usr/bin/sed -n -E 's/^BootCurrent:[[:space:]]*([[:xdigit:]]{4})$/\1/p')"
+    boot_order="$(printf '%s\n' "$boot_table" | /usr/bin/sed -n -E 's/^BootOrder:[[:space:]]*([[:xdigit:],]+)$/\1/p')"
     [ -n "$boot_current" ] && [ -n "$boot_order" ] || {
       echo "nixboot: firmware did not report BootCurrent and BootOrder; refusing Limine retirement." >&2
       exit 1
     }
-    current_line="$(printf '%s\n' "$boot_table" | sed -n -E "/^Boot$boot_current([*[:space:]])/p")"
+    current_line="$(printf '%s\n' "$boot_table" | /usr/bin/sed -n -E "/^Boot$boot_current([*[:space:]])/p")"
     first_boot="''${boot_order%%,*}"
-    first_line="$(printf '%s\n' "$boot_table" | sed -n -E "/^Boot$first_boot([*[:space:]])/p")"
+    first_line="$(printf '%s\n' "$boot_table" | /usr/bin/sed -n -E "/^Boot$first_boot([*[:space:]])/p")"
     case "$current_line" in
       *'\EFI\systemd\systemd-bootx64.efi'*|*'\EFI\BOOT\BOOTX64.EFI'*) ;;
       *)
@@ -492,6 +774,20 @@ in
       };
     };
 
+    bootedKernel.verify.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run `nixboot-booted-kernel-verify` after boot and after every native kernel transaction:
+        report whether the running kernel still has a module tree, and whether its release is
+        still the one its native package installs. Defaults on, like the NixOS backend's own
+        `verify.enable`, and for the same reason — the failure it names is silent by
+        construction. Unlike `stage`, `cutover` and `retireLimine` this unit writes nothing
+        outside its own status file, so it needs no manual gate; it never reboots, installs, or
+        restores anything, and it is not a substitute for a module-preserving native hook.
+      '';
+    };
+
     stage.enable = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -561,11 +857,18 @@ in
       readOnly = true;
       description = "Native packages selected by this backend for a host-provided Arch reconciler.";
     };
+
+    bootedKernel.hookText = lib.mkOption {
+      type = lib.types.str;
+      readOnly = true;
+      description = "The generated pacman hook (same text the rendered file holds). Exposed for checks/system-manager.nix's static-text assertions; not a stable interface.";
+    };
   };
 
   config = lib.mkMerge [
     {
       nixboot.systemdBoot.archPackages = if cfg.enable then nativePackages else [ ];
+      nixboot.systemdBoot.bootedKernel.hookText = bootedKernelHookText;
     }
     (lib.mkIf cfg.enable {
       assertions = [
@@ -613,7 +916,21 @@ in
       }
       ];
 
-      systemd.services = lib.mkIf cfg.stage.enable ({
+      systemd.services = lib.mkMerge [
+      # Wanted by multi-user.target, unlike every other unit in this backend. The others write the
+      # ESP, NVRAM, or the package set and are therefore manual by contract; this one only reads,
+      # and the question it answers is only meaningful about a boot that has actually happened.
+      (lib.mkIf cfg.bootedKernel.verify.enable {
+      nixboot-booted-kernel-verify = {
+        description = "NixBoot: report whether the booted kernel still matches the installed one";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "multi-user.target" ];
+        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+        script = bootedKernelVerifyScript;
+      };
+      })
+
+      (lib.mkIf cfg.stage.enable ({
       nixboot-systemd-boot-stage = {
         description = "NixBoot: stage systemd-boot and native UKIs without cutover";
         serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
@@ -624,6 +941,14 @@ in
         after = [ "nixboot-systemd-boot-stage.service" ];
         serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
         script = verifyScript;
+      };
+      # Independently runnable, and deliberately NOT ordered after the stage unit. Staging already
+      # collects first; this exists so an operator facing a full ESP can reclaim NixBoot's own
+      # garbage without needing a staging run to succeed — the ordering that used to be impossible.
+      nixboot-systemd-boot-collect = {
+        description = "NixBoot: reclaim NixBoot-owned UKIs that no declared kernel wants";
+        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+        script = collectScript;
       };
       } // lib.optionalAttrs cfg.cutover.enable {
       nixboot-systemd-boot-cutover = {
@@ -639,17 +964,26 @@ in
         serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
         script = retireLimineScript;
       };
-      });
+      }))
+      ];
 
       # /etc/pacman.d/hooks has higher precedence than package-provided hooks. `replaceExisting`
       # avoids system-manager's silent existing-file skip, which would otherwise leave a stale
       # lifecycle contract after a manual experiment or an older NixBoot revision.
-      environment.etc = lib.mkIf cfg.stage.enable {
-        "pacman.d/hooks/95-nixboot-systemd-boot.hook" = {
-          source = pacmanHookFile;
-          replaceExisting = true;
-        };
-      };
+      environment.etc = lib.mkMerge [
+        (lib.mkIf cfg.bootedKernel.verify.enable {
+          "pacman.d/hooks/96-nixboot-booted-kernel.hook" = {
+            source = bootedKernelHookFile;
+            replaceExisting = true;
+          };
+        })
+        (lib.mkIf cfg.stage.enable {
+          "pacman.d/hooks/95-nixboot-systemd-boot.hook" = {
+            source = pacmanHookFile;
+            replaceExisting = true;
+          };
+        })
+      ];
     })
   ];
 }

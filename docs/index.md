@@ -168,9 +168,22 @@ and NixBoot-owned UKIs but never
 changes the active fallback, NVRAM, or Secure Boot enrollment. A local boot
 of the staged binary proves the path before any cutover. Once that explicit
 stage gate is enabled, its declared pacman hook regenerates the same UKIs on
-native kernel or systemd-boot EFI updates and removes only stale UKIs below
-NixBoot's uniquely-owned prefix. See CONTRACT.md's B20 for the exact boundary
-and gates.
+native kernel or systemd-boot EFI updates. Reclaiming stale UKIs below
+NixBoot's uniquely-owned prefix is a separate step that depends only on the
+declaration, so it runs before staging's capacity gate and as its own
+`nixboot-systemd-boot-collect` unit — collecting only after a successful stage
+deadlocks a full ESP against itself. The booted entry is never collected. See
+CONTRACT.md's B20 for the exact boundary and gates, and B26 for the ordering.
+
+`bootedKernel.verify.enable` is the one unit here that is neither staged nor
+manual, because it only reads. A native kernel upgrade deletes the running
+kernel's module tree, and nothing on the host notices: resident modules keep
+working and the first on-demand module load fails somewhere else entirely,
+naming that subsystem instead of the kernel. `nixboot-booted-kernel-verify`
+runs after boot and after every native kernel transaction, reports whether the
+running release still has a module tree and is still the only release its
+package installs, and writes its verdict to `/run/nixboot/booted-kernel`. It
+reports and stops there — see CONTRACT.md's B25.
 
 For a clean break from Limine, `retireLimine.enable` renders one more manual
 post-cutover unit. It refuses to run until firmware is booting systemd-boot,

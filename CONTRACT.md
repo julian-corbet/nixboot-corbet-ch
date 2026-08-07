@@ -417,6 +417,99 @@ builds the derivation, and reading `environment.systemPackages` alone does
 not (`modules/nixboot.nix`, the `enrollSb` binding; forced in
 `checks/default.nix`'s `extraEntryMaintainerBuilds`).
 
+**B25 — A booted kernel that no longer exists on disk is stated, not
+inferred from a downstream symptom.**
+On a system-manager host, pacman owns the kernel and a kernel upgrade
+replaces `/usr/lib/modules/<release>` wholesale. Modules already resident in
+the running kernel keep working, so nothing observable changes at the moment
+of the upgrade; the first on-demand `modprobe` after it is what fails, and it
+fails inside whatever subsystem asked first, with an error naming that
+subsystem rather than the kernel. `nixboot-booted-kernel-verify` runs after
+boot and again after every native kernel transaction (its own
+`96-nixboot-booted-kernel.hook`, ordered after the stage hook, `restart`
+rather than `start` so a RemainAfterExit oneshot re-reports instead of
+no-opping on the very event that invalidated its last verdict). It answers
+two questions: whether the running release still has a module tree, and
+whether that release is still the one its native package installs — the
+second stays meaningful when a module-preserving native hook keeps the first
+green while the package has moved on. A failure is a failed unit plus the
+full verdict at `/run/nixboot/booted-kernel`; `/run`, because a reboot is
+what resolves the condition, so a copy surviving into the next boot could
+only be a lie. It is on by default (`bootedKernel.verify.enable`), like the
+NixOS backend's `verify.enable` and for the same reason B4 exists: the
+failure is silent by construction.
+**Not**: this unit never reboots, never installs, never restores a module
+tree. That line is the one nixnet draws for itself in its own `BEHAVIORS.md`
+(`OWN-2`) — a layer that acts on its own judgement destroys the evidence of
+the fault underneath it and makes its own action the story. Reboot and
+reimage are deploy concerns, a different blast radius with a different owner;
+what this unit owes an operator is an unambiguous statement, not a decision.
+Nor is it a substitute for a module-preserving native hook: it reports the
+condition, it does not prevent it
+(`modules/system-manager-systemd-boot.nix`, the `bootedKernelVerifyScript`
+and `bootedKernelHookFile` bindings; proved in `checks/system-manager.nix`).
+
+**B26 — Reclaiming NixBoot's own ESP garbage never depends on the step that
+needs the space.**
+Collection used to run only after a successful staging. That ordering
+deadlocks a full ESP: staging cannot write without space, the space is held
+by artifacts only collection frees, and collection sat behind the step it
+existed to unblock — so the boot subsystem loses the ability to update itself
+and reports it only as a capacity error. The desired file set is therefore
+derived from the DECLARATION (`kernels` → `<prefix>-<id>[-fallback].efi`),
+never from what a build produced, which is what makes collection possible
+with no `mkinitcpio` run, no staging directory, and no free space. It runs
+before the capacity gate inside staging, and as its own
+`nixboot-systemd-boot-collect` unit ordered after nothing, so an operator can
+reclaim without a staging run succeeding first. Exactly one implementation
+serves both call sites: two answers to "what does NixBoot own" is how one of
+them deletes what the other protects. A capacity failure states need and have
+in **MiB** — the unit `esp.capacityMiB` and every other ESP budget in this
+family is declared in — and still refuses with no ESP write.
+**Not**: collection never removes the entry firmware reports as
+`Current Entry`, even when the declaration no longer names it. A running
+kernel's boot entry does not become garbage because a config changed, and
+firmware is the only authority on which entry that is — the same invariant
+B25 and the Lanzaboote retention path enforce at their own layers. Because of
+that, **membership in the declared set is not a fallback for asking firmware,
+and collection fails closed when firmware cannot be asked**: no `bootctl`, a
+`bootctl` reporting a different partition UUID, or no `Current Entry` line
+each mean nothing at all is deleted. The two questions only look
+interchangeable — a booted entry missing from the declared set is the exact
+case this exclusion exists for, so treating the declared set as a second line
+of defence deletes precisely the file it was meant to save. (It did: an
+earlier revision of this behavior made `bootctl` optional and let that case
+fall through to `rm`.) The refusal is a failed
+`nixboot-systemd-boot-collect` unit — an operator who asked for reclamation
+and got none must see it — while staging only notes the refusal and lets its
+own capacity gate speak, since collection aids staging and never gates it. The
+ownership boundary is unchanged and unchanged deliberately: only the unique
+UKI prefix is ever a candidate, so a foreign rescue image, vendor firmware
+capsule, Limine artifact, or the active fallback is never touched. Nor does
+collection ever drop a *declared* artifact to make room: an ESP too small for
+what the host declares is a declaration to change (a kernel's
+`fallback = false` is usually the largest single UKI) or an ESP to grow, and
+that is the operator's call, not this module's
+(`modules/system-manager-systemd-boot.nix`, the `desiredUkiNames`,
+`collectFunction` and `collectScript` bindings; proved in
+`checks/system-manager.nix`, including the positional ordering assertion).
+
+**B27 — No script in this family invokes a command by bare name.**
+A `systemd.services.<name>.script` gets a unit PATH that on a system-manager
+host contains no native tools at all (measured: coreutils, findutils,
+gnugrep, gnused, systemd-minimal — no util-linux, no `/usr/bin`). A bare
+command name there is a bare `127` with no message, which is precisely the
+failure this backend's own `required native command is absent` preflight
+exists to replace. Every native tool is reached as `/usr/bin/<tool>` and
+listed in its script's preflight loop. The same rule binds the
+`writeShellApplication` wrappers from the other direction: every command a
+wrapper runs must appear in its `runtimeInputs`, and a Nix build sandbox is
+not evidence that it does — stdenv already carries `sed`, `cmp` and friends
+on PATH, so an execution test inside the sandbox passes while the systemd
+unit that runs the same script in production exits 127
+(`lib/register-boot-entry.nix`'s `gnused`; proved in
+`checks/system-manager.nix`'s `scripts/no-bare-native-command-invocations`).
+
 ## Which behaviors become automated tests vs. stay observed
 
 - **Automatable** (a `pkgs.testers.nixosTest` VM can assert these directly):
@@ -433,7 +526,19 @@ not (`modules/nixboot.nix`, the `enrollSb` binding; forced in
   fires when Path A is active and stays silent — proved in both
   directions — when it is not, and Path B is proved unaffected either way),
   B24 (`nixbootEnrollSb` is present in `system.build` and its derivation
-  builds/shellchecks cleanly), and B15's idempotency/self-heal proof (a real
+  builds/shellchecks cleanly), B25 (the unit and its pacman hook are rendered
+  when enabled and absent when not, the unit is the only one in the backend
+  that is `wantedBy` a target, the hook `restart`s rather than `start`s, and
+  the script carries no reboot/install/restore verb — the REST of B25, that a
+  real pacman kernel transaction actually deletes the running module tree and
+  trips the unit, is observed: it needs a real Arch host and a real upgrade),
+  B26 (collection is rendered before the capacity gate — asserted
+  positionally, not by mere presence, since the broken version also mentioned
+  collection; the collect unit is ordered after nothing and references
+  neither `mkinitcpio` nor the staging directory; the booted-entry exclusion
+  and the MiB-denominated capacity failure are both present), B27 (no
+  `head`/`sed`/`dirname` is invoked by bare name in any rendered script),
+  and B15's idempotency/self-heal proof (a real
   invocation of the registrar against a faked `efibootmgr` inside the Nix
   build sandbox — no VM, no KVM, no real firmware, but a genuine execution
   rather than an eval-only assertion).

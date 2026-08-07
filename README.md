@@ -165,10 +165,40 @@ reconciler rather than installed by a second package manager. The matching micro
 from NixCPU's read-only boot contract, so the vendor is declared once and NixBoot never carries a
 second Intel/AMD string. After the explicit stage gate is enabled, NixBoot also declares the
 post-transaction pacman hook that rebuilds its UKIs when the native kernel or
-systemd-boot EFI artifact changes. Each successful rebuild also removes only
-stale UKIs under NixBoot's configured prefix, so retired kernels cannot fill
-the ESP; foreign rescue, vendor, Limine, and fallback paths are outside that
-ownership boundary.
+systemd-boot EFI artifact changes.
+
+Reclaiming NixBoot's own stale UKIs is a **separate** step from staging, and
+that separation is load-bearing rather than tidiness. Collection derives the
+wanted file set from the declaration (`kernels` → `<prefix>-<id>[-fallback].efi`),
+not from what a build produced, so it needs no `mkinitcpio` run, no staging
+directory, and no free space. It runs before staging's capacity gate and also
+as its own `nixboot-systemd-boot-collect` unit ordered after nothing. The
+alternative — collecting only after a successful stage — deadlocks a full ESP:
+staging cannot write without space, and the space is held by exactly the
+artifacts collection would free. Foreign rescue, vendor, Limine and fallback
+paths remain outside the ownership boundary, and the entry firmware reports as
+`Current Entry` is never collected even if the declaration stopped naming it.
+When the ESP genuinely cannot hold what the host declares, staging refuses with
+the shortfall in MiB and changes nothing; shrinking the declared set (a
+kernel's `fallback = false` is usually the largest single UKI) or growing the
+ESP is the operator's call.
+
+One unit in this backend is **not** staged and **not** manual, because it only
+reads: `nixboot-booted-kernel-verify` (`bootedKernel.verify.enable`, on by
+default). A native kernel upgrade replaces `/usr/lib/modules/<release>`
+wholesale, and the kernel that is still executing does not notice — modules
+already resident keep working, so the host looks healthy right up until the
+first on-demand module load, which then fails inside whatever subsystem asked
+for it and reports itself, not the kernel, as the cause. This unit runs after
+boot and again after every native kernel transaction (its own pacman hook), and
+answers two questions: does the running release still have a module tree, and
+is that release still the only one its native package installs. The second
+matters even when a module-preserving hook (`kernel-modules-hook`, `mkmm`)
+keeps the first green — that combination is precisely the state nothing else
+reports. A failure is a failed unit plus the full verdict at
+`/run/nixboot/booted-kernel`. It never reboots, installs, or restores anything,
+and it is not a substitute for a module-preserving hook: it reports the
+condition, it does not prevent it.
 
 Secure Boot signing is deliberately incomplete until a host supplies an explicit
 root-owned runtime `secureBoot.sbctlConfig` path. NixBoot signs only through that

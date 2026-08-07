@@ -69,6 +69,9 @@ let
       vendor = null;
     };
   });
+  bootedKernelOff = evalBoot (lib.recursiveUpdate base {
+    nixboot.systemdBoot.bootedKernel.verify.enable = false;
+  });
   staged = evalBoot (lib.recursiveUpdate base { nixboot.systemdBoot.stage.enable = true; });
   stagedSecure = evalBoot (lib.recursiveUpdate base {
     nixboot.systemdBoot = {
@@ -103,6 +106,15 @@ let
   cutoverUnit = "nixboot-systemd-boot-cutover";
   retireLimineUnit = "nixboot-systemd-boot-retire-limine";
   pacmanHook = "pacman.d/hooks/95-nixboot-systemd-boot.hook";
+  bootedKernelUnit = "nixboot-booted-kernel-verify";
+  bootedKernelHook = "pacman.d/hooks/96-nixboot-booted-kernel.hook";
+  collectUnit = "nixboot-systemd-boot-collect";
+
+  # Everything the stage script does BEFORE it reaches the capacity gate. Used to assert ordering
+  # rather than mere presence -- the deadlock this fixes was a correctly-implemented collector
+  # placed after the step it needed to unblock.
+  stageBeforeCapacityGate =
+    lib.head (lib.splitString "insufficient ESP capacity" staged.systemd.services.${stage}.script);
 
   results = [
     (check "disabled/no-units-or-native-package-selection"
@@ -147,6 +159,59 @@ let
         && !(declared.environment.etc ? "${pacmanHook}")
       )
       "units: ${builtins.toJSON (builtins.attrNames declared.systemd.services)}")
+
+    # B25 --------------------------------------------------------------------
+    (check "booted-kernel/guard-needs-no-stage-gate"
+      (
+        declared.systemd.services ? "${bootedKernelUnit}"
+        && declared.environment.etc ? "${bootedKernelHook}"
+        && declared.environment.etc.${bootedKernelHook}.replaceExisting
+      )
+      "the booted-kernel guard must exist as soon as the backend is enabled: it only reads, so unlike stage/cutover/retireLimine it has no reason to wait for a manual gate")
+
+    (check "booted-kernel/runs-at-boot-and-after-every-kernel-transaction"
+      (
+        declared.systemd.services.${bootedKernelUnit}.wantedBy == [ "multi-user.target" ]
+        && lib.hasInfix "Target = usr/lib/modules/*/pkgbase" declared.nixboot.systemdBoot.bootedKernel.hookText
+        && lib.hasInfix "Operation = Remove" declared.nixboot.systemdBoot.bootedKernel.hookText
+        && lib.hasInfix "When = PostTransaction" declared.nixboot.systemdBoot.bootedKernel.hookText
+        # `restart`, never `start`: this is a RemainAfterExit oneshot, and `start` on one that has
+        # already succeeded is a no-op -- it would leave the previous verdict standing after the
+        # exact transaction that invalidated it, which is the whole failure this guard exists for.
+        && lib.hasInfix "systemctl restart nixboot-booted-kernel-verify.service" declared.nixboot.systemdBoot.bootedKernel.hookText
+        && !(lib.hasInfix "systemctl start nixboot-booted-kernel-verify.service" declared.nixboot.systemdBoot.bootedKernel.hookText)
+      )
+      "hook: ${builtins.toJSON declared.nixboot.systemdBoot.bootedKernel.hookText}")
+
+    (check "booted-kernel/detects-tree-absence-and-release-drift"
+      (
+        lib.hasInfix "/usr/lib/modules/$running" declared.systemd.services.${bootedKernelUnit}.script
+        && lib.hasInfix "uname -r" declared.systemd.services.${bootedKernelUnit}.script
+        # The second half must survive a module-preserving native hook: the tree is still there,
+        # but the package that owns it has moved on and this host runs the older release.
+        && lib.hasInfix "pkgbase" declared.systemd.services.${bootedKernelUnit}.script
+        && lib.hasInfix "/run/nixboot/booted-kernel" declared.systemd.services.${bootedKernelUnit}.script
+      )
+      "the guard lost one of its two conditions, or the readable status file it must leave behind")
+
+    (check "booted-kernel/reports-and-never-remediates"
+      (
+        # Prose may say "reboot"; this script must never CALL anything that acts. No systemctl, no
+        # pacman, no depmod/modprobe, no restoring a module tree -- nixnet's OWN-2 line, applied
+        # here: a layer that acts on its own judgement destroys the evidence underneath it.
+        !(lib.hasInfix "systemctl" declared.systemd.services.${bootedKernelUnit}.script)
+        && !(lib.hasInfix "pacman" declared.systemd.services.${bootedKernelUnit}.script)
+        && !(lib.hasInfix "depmod" declared.systemd.services.${bootedKernelUnit}.script)
+        && !(lib.hasInfix "modprobe" declared.systemd.services.${bootedKernelUnit}.script)
+      )
+      "the booted-kernel guard gained a remediation verb; it reports and stops there")
+
+    (check "booted-kernel/opt-out-removes-both-unit-and-hook"
+      (
+        !(bootedKernelOff.systemd.services ? "${bootedKernelUnit}")
+        && !(bootedKernelOff.environment.etc ? "${bootedKernelHook}")
+      )
+      "units: ${builtins.toJSON (builtins.attrNames bootedKernelOff.systemd.services)}")
 
     (check "stage/manual-stage-and-verify-units-exist"
       (staged.systemd.services ? "${stage}" && staged.systemd.services ? "${verify}")
@@ -197,11 +262,85 @@ let
         && lib.hasInfix "/var/tmp/nixboot-systemd-boot" staged.systemd.services.${stage}.script
         && lib.hasInfix "no ESP files were changed" staged.systemd.services.${stage}.script
         && lib.hasInfix "required_bytes" staged.systemd.services.${stage}.script
-        && lib.hasInfix "desired_ukis" staged.systemd.services.${stage}.script
-        && lib.hasInfix "stale UKI artifact(s) under the NixBoot prefix" staged.systemd.services.${stage}.script
-        && lib.hasInfix "\"$esp/EFI/Linux/$prefix-\"*.efi" staged.systemd.services.${stage}.script
+        && lib.hasInfix "collect_stale_ukis" staged.systemd.services.${stage}.script
+        && lib.hasInfix "stale NixBoot UKI artifact(s)" staged.systemd.services.${stage}.script
+        && lib.hasInfix "\"$linux_dir/$prefix-\"*.efi" staged.systemd.services.${stage}.script
       )
       "stage script does not render the native mkinitcpio UKI, ESP-capacity, and stale-artifact collection contract")
+
+    # The ordering defect this replaced: collection ran only AFTER a successful staging, so a full
+    # ESP could not be staged into and the garbage that would free it could not be collected. The
+    # assertion is positional on purpose -- "the script mentions collection somewhere" was already
+    # true of the broken version.
+    # Matches the bare CALL statement, not `collect_stale_ukis() {`. The function definition is
+    # necessarily in this prefix too, so a substring test on the name alone passes even with the
+    # call deleted -- verified by deleting it and watching the weaker assertion stay green.
+    (check "stage/collects-before-the-capacity-gate-not-after-the-install"
+      (lib.hasInfix "\ncollect_stale_ukis\n" stageBeforeCapacityGate)
+      "collection must run before the ESP capacity check, otherwise a full ESP deadlocks: staging needs the space that only collection frees")
+
+    (check "collect/runs-independently-of-staging"
+      (
+        staged.systemd.services ? "${collectUnit}"
+        && !(staged.systemd.services.${collectUnit} ? "after")
+        && !(staged.systemd.services.${collectUnit} ? "wantedBy")
+        # Nothing a staging run produces may be required to collect.
+        && !(lib.hasInfix "mkinitcpio" staged.systemd.services.${collectUnit}.script)
+        && !(lib.hasInfix "staging_dir" staged.systemd.services.${collectUnit}.script)
+      )
+      "the collect unit must not depend on staging, its build, or its staging directory")
+
+    (check "collect/never-reclaims-the-booted-entry"
+      (
+        lib.hasInfix "Current Entry:" staged.systemd.services.${collectUnit}.script
+        && lib.hasInfix "firmware reports it as the entry this host booted" staged.systemd.services.${collectUnit}.script
+        # Ownership boundary is unchanged: only the declared prefix is ever a candidate.
+        && lib.hasInfix "$prefix-" staged.systemd.services.${collectUnit}.script
+      )
+      "collection lost the booted-entry exclusion or its prefix ownership boundary")
+
+    # The declared set is NOT a fallback for the booted-entry check. A booted entry that is no
+    # longer declared is exactly the case the exclusion exists for, so if firmware cannot be asked,
+    # collection must delete nothing at all -- an earlier revision let that case fall through to
+    # `rm`, which is the very bug this whole change exists to prevent.
+    (check "collect/refuses-entirely-when-the-booted-entry-cannot-be-named"
+      (lib.all (marker: lib.hasInfix marker staged.systemd.services.${collectUnit}.script) [
+        "/usr/bin/bootctl is absent"
+        "reports a different partition UUID"
+        "did not report a Current Entry"
+        "refusing to collect anything"
+        "collect_skipped=yes"
+      ])
+      "collection must refuse outright when bootctl is absent, reports a different ESP, or names no Current Entry")
+
+    (check "collect/refusal-is-a-failed-unit-not-a-quiet-success"
+      (
+        lib.hasInfix "[ \"$collect_skipped\" = no ]" staged.systemd.services.${collectUnit}.script
+        # bootctl is a hard preflight requirement for the unit whose whole job is deletion.
+        && lib.hasInfix "/usr/bin/bootctl" (lib.head (lib.splitString "collect_stale_ukis()" staged.systemd.services.${collectUnit}.script))
+        # Staging must NOT inherit that hard failure: collection is an aid to it, never a gate on it.
+        && !(lib.hasInfix "[ \"$collect_skipped\" = no ]" staged.systemd.services.${stage}.script)
+      )
+      "a refused collection must fail the collect unit, and must not block staging")
+
+    (check "stage/capacity-failure-names-the-shortfall-in-declared-units"
+      (
+        lib.hasInfix "insufficient ESP capacity" staged.systemd.services.${stage}.script
+        && lib.hasInfix "MiB, have" staged.systemd.services.${stage}.script
+        && lib.hasInfix "no ESP files were changed" staged.systemd.services.${stage}.script
+      )
+      "a capacity failure must state need and have in MiB -- the unit every ESP budget in this family is declared in")
+
+    # Every command these scripts run must be absolute or preflight-checked. A bare name resolves
+    # against the unit's PATH, which on a system-manager host holds no native tools at all, and the
+    # result is a bare 127 instead of this backend's named "required native command is absent".
+    (check "scripts/no-bare-native-command-invocations"
+      (lib.all (script:
+        !(lib.hasInfix "$(head " script)
+        && !(lib.hasInfix "| sed " script)
+        && !(lib.hasInfix "$(dirname " script)
+      ) (map (unit: unit.script) (lib.attrValues retirement.systemd.services)))
+      "a script invokes head/sed/dirname by bare name; use /usr/bin/<tool> and add it to that script's preflight loop")
 
     (check "stage/pacman-hook-rebuilds-ukis-after-native-boot-updates"
       (
