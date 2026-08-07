@@ -337,9 +337,24 @@ let
       )
       "capacity retention regressed to reconstructing a generation-number match from mutable /run/current-system")
 
-    (check "capacity-retention/rejects-loader-esp-mismatch-before-collection"
-      (lib.hasInfix "firmware booted a different ESP" retentionSource)
-      "capacity retention does not reject a firmware loader/declared-ESP mismatch")
+    # The guard this replaced refused EVERY loader/ESP UUID mismatch. On a host whose boot medium
+    # is rebuilt from the system running on it, sgdisk hands the ESP a fresh partition GUID while
+    # firmware's LoaderDevicePartUUID keeps naming the old one -- that variable is written once, at
+    # boot, so no installation can refresh it. Every switch then died inside the bootloader
+    # installer, INCLUDING the switch needed to reach the reboot that is the only thing which
+    # clears the recording: three generations were built, profile-linked, and never activated. The
+    # refusal is right only when the mismatch is genuinely ambiguous, and that question is answered
+    # by the live partition table, never by the existence of the warning -- these string checks pin
+    # that the decision reads `lsblk` and knows the ESP type GUID, and the two execution proofs
+    # below (`lanzaboote-retention-*`) pin which way it actually goes in each direction.
+    (check "capacity-retention/decides-a-loader-esp-mismatch-from-the-live-partition-table"
+      (
+        lib.hasInfix "firmware booted a different ESP" retentionSource
+        && lib.hasInfix "lsblk --noheadings --raw --output PARTUUID,PARTTYPE" retentionSource
+        && lib.hasInfix "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" retentionSource
+        && lib.hasInfix "LoaderDevicePartUUID" retentionSource
+      )
+      "capacity retention no longer decides a firmware loader/declared-ESP mismatch from the live partition table")
 
     # --- systemd wiring: async by the timer, never wantedBy multi-user.target ----------
     (check "timer-drives-it-not-boot"
@@ -1066,9 +1081,276 @@ let
         echo "nixboot-enroll-sb built: ${enrollSbTool}"
         touch $out
       '';
+
+  # ── BUILD-level proof of the Lanzaboote retention wrapper's firmware guards ─────────
+  #
+  # These two derivations RUN modules/lanzaboote-retention.nix's own script, unmodified,
+  # against stand-in `bootctl`/`findmnt`/`lsblk` binaries, a scratch ESP, scratch profile
+  # links, and a `lzbt` that records its arguments instead of writing firmware. Nothing
+  # here is simulated except the three answers the guards ask the live system for, which
+  # is the point: the wrapper decides deletions on those answers.
+  #
+  # A source-text `hasInfix` cannot tell "refuses when it must" from "refuses always",
+  # and the difference between those two was a storage host that could not complete a
+  # single `nixos-rebuild switch` for as long as the state lasted. So both directions are
+  # executed, and the ESP is inspected afterwards.
+  #
+  # The seam is `passthru.mkTestVariant` (see that module's own note, and the identical
+  # mechanism in lib/register-boot-entry.nix): the script invokes every tool by absolute
+  # store path on purpose, so PATH order cannot reach them.
+  #
+  # The three scratch paths are RELATIVE, so everything these tests create lives inside
+  # the build directory: the wrapper only ever uses `esp.mountPoint` as a path prefix, and
+  # the alternative -- a fixed absolute path such as /tmp/nixboot-retention-esp -- is a
+  # name two of these builds would fight over on any builder running without a sandbox.
+  retentionTestEsp = "nixboot-retention-test-esp";
+  retentionTestProfiles = "nixboot-retention-test-profiles";
+  retentionTestCurrentSystem = "nixboot-retention-test-current-system";
+
+  # bootctl's real mismatch line names BOTH partitions on one line, as
+  # "(<loader> vs. <esp>)" -- the wrapper reads its two UUIDs from exactly that shape,
+  # so the stand-in reproduces it verbatim rather than paraphrasing it.
+  retentionLoaderUuid = "11111111-1111-4111-8111-111111111111";
+  retentionEspUuid = "22222222-2222-4222-8222-222222222222";
+  retentionOtherEspUuid = "44444444-4444-4444-8444-444444444444";
+  espTypeGuid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
+
+  fakeRetentionTools = pkgs.runCommand "nixboot-test-fake-retention-tools" { } ''
+    mkdir -p $out/bin
+
+    cat > $out/bin/bootctl <<'EOF'
+    #!/bin/sh
+    # Only ever called as: bootctl --esp-path=<esp> status
+    cat "$NIXBOOT_TEST_BOOTCTL_STATUS"
+    EOF
+
+    cat > $out/bin/findmnt <<'EOF'
+    #!/bin/sh
+    # Only ever called as: findmnt -no FSTYPE --target <esp>. The scratch ESP is a plain
+    # directory, so the FAT identity is the one fact this stub has to assert.
+    echo vfat
+    EOF
+
+    cat > $out/bin/lsblk <<'EOF'
+    #!/bin/sh
+    # Only ever called as: lsblk --noheadings --raw --output PARTUUID,PARTTYPE
+    cat "$NIXBOOT_TEST_PARTITION_TABLE"
+    EOF
+
+    chmod +x $out/bin/bootctl $out/bin/findmnt $out/bin/lsblk
+  '';
+
+  # Stands in for the lzbt the Lanzaboote flake supplies. It records what the wrapper
+  # decided to hand it, which is the only observable that distinguishes "installed the
+  # right generations" from "installed at all".
+  fakeLzbt = pkgs.writeShellApplication {
+    name = "lzbt";
+    text = ''
+      printf '%s\n' "$@" >> "$NIXBOOT_TEST_LZBT_ARGS"
+    '';
+  };
+
+  cfg-capacity-retention-runtime = evalFor {
+    nixboot.loader.program = "lanzaboote";
+    nixboot.esp.mountPoint = retentionTestEsp;
+    nixboot.esp.capacityMiB = 512;
+    # Two slots exactly: enough for the booted entry plus one candidate, which is what
+    # makes the eviction decision below observable at all.
+    nixboot.generations.keep = 2;
+    nixboot.generations.capacity = {
+      enable = true;
+      lanzabootePackage = fakeLzbt;
+    };
+  };
+
+  retentionTestLzbt =
+    cfg-capacity-retention-runtime.system.build.nixbootLanzabooteRetention.passthru.mkTestVariant {
+      systemdPackage = fakeRetentionTools;
+      utilLinuxPackage = fakeRetentionTools;
+      currentSystemLink = retentionTestCurrentSystem;
+      profilesDirectory = retentionTestProfiles;
+    };
+
+  # Shared fixture: an ESP holding generations 208 and 210 (stubs plus the kernel/initrd
+  # each names), three profile links, and a `lzbt` argument log. Generation 209 is the
+  # booted one throughout, and whether its stub is on the ESP is what each scenario varies.
+  retentionTestPreamble = ''
+    esp=${retentionTestEsp}
+    profiles=${retentionTestProfiles}
+    export NIXBOOT_TEST_LZBT_ARGS="$PWD/lzbt-args"
+    export NIXBOOT_TEST_BOOTCTL_STATUS="$PWD/bootctl-status"
+    export NIXBOOT_TEST_PARTITION_TABLE="$PWD/partition-table"
+
+    add_generation() {
+      printf 'kernel-%s.efi initrd-%s.efi\n' "$1" "$1" > "$esp/EFI/Linux/nixos-generation-$1-aaaaaaa.efi"
+      : > "$esp/EFI/nixos/kernel-$1.efi"
+      : > "$esp/EFI/nixos/initrd-$1.efi"
+    }
+
+    reset_host() {
+      rm -rf "$esp" "$profiles" ${retentionTestCurrentSystem}
+      mkdir -p "$esp/EFI/Linux" "$esp/EFI/nixos" "$profiles"
+      ln -s /nix/store ${retentionTestCurrentSystem}
+      : > "$NIXBOOT_TEST_LZBT_ARGS"
+      add_generation 208
+      add_generation 210
+      for generation in 208 209 210; do
+        ln -s /nix/store "$profiles/system-$generation-link"
+      done
+    }
+
+    # A whole-disk row (both columns empty) and a non-ESP partition are in every table on
+    # purpose: the wrapper counts ESPs out of this exact output shape. Each argument adds
+    # one further EFI System Partition.
+    write_partition_table() {
+      {
+        printf ' \n'
+        printf '%s %s\n' ${retentionEspUuid} ${espTypeGuid}
+        printf '%s %s\n' 33333333-3333-4333-8333-333333333333 0fc63daf-8483-4772-8e79-3d69d8477de4
+        for extra in "$@"; do printf '%s %s\n' "$extra" ${espTypeGuid}; done
+      } > "$NIXBOOT_TEST_PARTITION_TABLE"
+    }
+
+    append_partition() {
+      printf '%s %s\n' "$1" "$2" >> "$NIXBOOT_TEST_PARTITION_TABLE"
+    }
+
+    write_boot_status() {
+      {
+        [ "$1" = mismatch ] && printf 'WARNING: The boot loader reports a different partition UUID than the detected ESP (%s vs. %s)!\n' \
+          ${retentionLoaderUuid} ${retentionEspUuid}
+        printf 'System:\n      Firmware: UEFI 2.70 (test)\n'
+        printf 'Current Boot Loader:\n      Product: systemd-boot 257 (test)\n'
+        printf '  Current Entry: nixos-generation-209-aaaaaaa.efi\n'
+      } > "$NIXBOOT_TEST_BOOTCTL_STATUS"
+    }
+
+    install_run() {
+      ${retentionTestLzbt}/bin/lzbt install --configuration-limit 4 \
+        "$profiles/system-208-link" "$profiles/system-209-link" "$profiles/system-210-link"
+    }
+
+    stub_exists() { [ -e "$esp/EFI/Linux/nixos-generation-$1-aaaaaaa.efi" ]; }
+  '';
+
+  # Direction 1: the wrapper proceeds -- both when firmware agrees with the mounted ESP,
+  # and when its recorded partition is unambiguously gone.
+  retentionInstallsTest = pkgs.runCommand "nixboot-lanzaboote-retention-installs-test" { } ''
+    set -eu
+    ${retentionTestPreamble}
+
+    # ── Scenario 1: healthy firmware handoff. The booted entry is ON the ESP, so it
+    # occupies one of the two slots, is never reinstalled, and the oldest generation is
+    # the one evicted. This is the invariant the mismatch handling must not cost us.
+    reset_host
+    add_generation 209
+    write_partition_table
+    write_boot_status agree
+    if ! install_run > "$PWD/out-healthy" 2> "$PWD/err-healthy"; then
+      echo "healthy handoff: the wrapper refused a clean install"; cat "$PWD/err-healthy"; exit 1
+    fi
+    stub_exists 209 || { echo "healthy handoff: the booted entry was collected"; exit 1; }
+    stub_exists 210 || { echo "healthy handoff: the newest generation was collected"; exit 1; }
+    stub_exists 208 && { echo "healthy handoff: generation 208 outlived a 2-slot budget"; exit 1; }
+    [ -e "$esp/EFI/nixos/kernel-208.efi" ] && { echo "healthy handoff: an unreferenced kernel survived"; exit 1; }
+    [ -e "$esp/EFI/nixos/kernel-209.efi" ] || { echo "healthy handoff: the booted kernel was reclaimed"; exit 1; }
+    grep -qx -- "--configuration-limit=0" "$NIXBOOT_TEST_LZBT_ARGS" ||
+      { echo "healthy handoff: lzbt kept its own configuration limit"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
+    grep -qx -- "$profiles/system-210-link" "$NIXBOOT_TEST_LZBT_ARGS" ||
+      { echo "healthy handoff: the newest generation was not installed"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
+    grep -qx -- "$profiles/system-209-link" "$NIXBOOT_TEST_LZBT_ARGS" &&
+      { echo "healthy handoff: the booted entry was rebuilt from the profile link"; exit 1; }
+
+    # ── Scenario 2: the incident. Firmware recorded a partition UUID that no longer
+    # exists anywhere on this system (a boot medium rebuilt under the running system,
+    # its GUID regenerated), the ESP mounted here is the only EFI System Partition, and
+    # the booted entry has already gone with the old medium. Refusing here protects
+    # nothing and blocks every future switch, including the reboot that is the only way
+    # out -- so the wrapper must warn, name both partitions, and install.
+    reset_host
+    write_partition_table
+    write_boot_status mismatch
+    if ! install_run > "$PWD/out-stale" 2> "$PWD/err-stale"; then
+      echo "stale loader UUID: the wrapper refused, which is the deadlock this test exists for"
+      cat "$PWD/err-stale"; exit 1
+    fi
+    grep -q -- ${retentionLoaderUuid} "$PWD/err-stale" ||
+      { echo "stale loader UUID: the warning does not name the recorded partition"; cat "$PWD/err-stale"; exit 1; }
+    grep -q -- ${retentionEspUuid} "$PWD/err-stale" ||
+      { echo "stale loader UUID: the warning does not name the mounted ESP"; cat "$PWD/err-stale"; exit 1; }
+    grep -q "reboots" "$PWD/err-stale" ||
+      { echo "stale loader UUID: the warning does not say a reboot is the only thing that clears it"; cat "$PWD/err-stale"; exit 1; }
+    # With its stub gone, the booted generation is an ordinary candidate again: both it
+    # and the newest generation are installed, and the two-slot budget evicts 208.
+    grep -qx -- "$profiles/system-210-link" "$NIXBOOT_TEST_LZBT_ARGS" ||
+      { echo "stale loader UUID: the newest generation was not installed"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
+    grep -qx -- "$profiles/system-209-link" "$NIXBOOT_TEST_LZBT_ARGS" ||
+      { echo "stale loader UUID: the booted generation was not restored"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
+    grep -qx -- "$profiles/system-208-link" "$NIXBOOT_TEST_LZBT_ARGS" &&
+      { echo "stale loader UUID: the slot budget was exceeded"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
+    stub_exists 210 || { echo "stale loader UUID: the newest generation was collected"; exit 1; }
+    stub_exists 208 && { echo "stale loader UUID: generation 208 outlived a 2-slot budget"; exit 1; }
+
+    echo "lanzaboote retention: healthy handoff and stale-recording install proofs PASSED"
+    touch $out
+  '';
+
+  # Direction 2: the wrapper still refuses, and still touches nothing, in every case
+  # where the mismatch is genuinely ambiguous or the booted entry vanished for a reason
+  # this wrapper cannot explain.
+  retentionRefusesTest = pkgs.runCommand "nixboot-lanzaboote-retention-refuses-test" { } ''
+    set -eu
+    ${retentionTestPreamble}
+
+    expect_refusal() {
+      local label="$1"
+      if install_run > "$PWD/out" 2> "$PWD/err"; then
+        echo "$label: the wrapper installed when it must have refused"; cat "$PWD/err"; exit 1
+      fi
+      grep -q "nixboot:" "$PWD/err" || { echo "$label: refused without saying why"; cat "$PWD/err"; exit 1; }
+      [ -s "$NIXBOOT_TEST_LZBT_ARGS" ] && { echo "$label: lzbt ran anyway"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
+      stub_exists 208 || { echo "$label: a refusal still collected boot files"; exit 1; }
+      stub_exists 210 || { echo "$label: a refusal still collected boot files"; exit 1; }
+      [ -e "$esp/EFI/nixos/kernel-208.efi" ] || { echo "$label: a refusal still reclaimed artifacts"; exit 1; }
+    }
+
+    # ── The partition firmware recorded is STILL HERE and is not this ESP. Two media can
+    # serve this host's boot path and this is demonstrably not the one firmware read.
+    #
+    # It is deliberately typed as Microsoft basic data, not as an EFI System Partition:
+    # that is how a hybrid-ISO rescue stick usually presents the FAT partition its
+    # firmware loads, so this system still reports exactly ONE ESP -- the mounted one --
+    # and only the "is the recorded partition reachable" test can catch it. Counting ESPs
+    # alone would call this unambiguous and write the partition firmware does not read.
+    reset_host
+    write_partition_table
+    append_partition ${retentionLoaderUuid} ebd0a0a2-b9e5-4433-87c0-68b6b72699c7
+    write_boot_status mismatch
+    expect_refusal "loader partition still present"
+
+    # ── The recorded partition is gone, but this system carries a second EFI System
+    # Partition, so nothing here can say which of them firmware read.
+    reset_host
+    write_partition_table ${retentionOtherEspUuid}
+    write_boot_status mismatch
+    expect_refusal "more than one ESP present"
+
+    # ── No mismatch at all, and the booted entry is missing from the ESP anyway. That is
+    # unexplained, so the original refusal stands unchanged: only the stale-recording
+    # branch above may treat an absent booted entry as expected.
+    reset_host
+    write_partition_table
+    write_boot_status agree
+    expect_refusal "booted entry absent with a healthy loader"
+
+    echo "lanzaboote retention: ambiguous-handoff refusal proofs PASSED"
+    touch $out
+  '';
 in
 {
   inherit eval-tests;
   register-boot-entry-idempotency = registerBootEntryIdempotencyTest;
   extra-entry-maintainer-builds = extraEntryMaintainerBuilds;
+  lanzaboote-retention-installs = retentionInstallsTest;
+  lanzaboote-retention-refuses = retentionRefusesTest;
 }

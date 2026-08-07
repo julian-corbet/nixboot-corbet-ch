@@ -142,8 +142,32 @@ prior installation violated this invariant.
 The retained boot entry is matched by its complete loader-reported identity,
 not merely its generation number, and is never reconstructed from
 `/run/current-system`: userspace can switch many times while the booted kernel
-and `LoaderBootCountPath` remain fixed. Collection also refuses a firmware
-loader/declared-ESP UUID mismatch before touching either partition.
+and `LoaderBootCountPath` remain fixed.
+
+A firmware loader/declared-ESP UUID mismatch is decided from the live
+partition table, never from the existence of the mismatch.
+`LoaderDevicePartUUID` is written once, at boot, from the medium systemd-boot
+was loaded from — a snapshot, not a live pointer, which no installation can
+refresh and only a reboot can clear. When the partition firmware recorded is
+still reachable on this system, or more than one EFI System Partition is
+present, which medium firmware read is in genuine doubt and collection refuses
+before touching either partition. When that partition is gone from the system
+and the declared ESP is the only one present, there is nothing left to be
+wrong about, and refusing is not the safe answer but the fatal one: every
+switch then dies inside the bootloader installer, including the switch that
+would reach the reboot. Retention warns instead, naming both partitions and
+saying only a reboot clears the recording, and installs. If the recorded
+booted entry went with the vanished medium, that generation also stops being a
+reserved slot and becomes an ordinary retention candidate, so the same
+installation puts its entry back. **Not**: an absent booted entry stays fatal
+in every other case, including a healthy loader handoff — only the
+stale-recording branch may treat it as expected. This is what the unrefined
+guard cost: a host that rebuilds its own boot medium (regenerating the ESP's
+partition GUID under the running system) built and profile-linked three
+generations it never activated, each deployment failing at bootloader
+installation and rolling back. B7a is unchanged and deliberately stricter:
+`nixboot-verify` still REPORTS the same mismatch as a failure, because a
+report cannot deadlock the host it describes.
 
 **B7a — The firmware handoff must name the declared ESP.**
 `bootctl status` can find a valid loader on the ESP mounted by NixOS even when
@@ -538,7 +562,15 @@ unit that runs the same script in production exits 127
   neither `mkinitcpio` nor the staging directory; the booted-entry exclusion
   and the MiB-denominated capacity failure are both present), B27 (no
   `head`/`sed`/`dirname` is invoked by bare name in any rendered script),
-  and B15's idempotency/self-heal proof (a real
+  B7's firmware-handoff branches (the retention wrapper's own script is RUN
+  against stand-in `bootctl`/`findmnt`/`lsblk` binaries and a scratch ESP,
+  once per direction: it installs on a healthy handoff and on a recorded
+  partition that is provably gone, and refuses — deleting nothing, running no
+  `lzbt` — when that partition is still reachable, when a second EFI System
+  Partition exists, or when the booted entry is missing without a stale
+  recording to explain it; a `hasInfix` on the module source cannot tell
+  "refuses when it must" from "refuses always", and that difference was an
+  outage), and B15's idempotency/self-heal proof (a real
   invocation of the registrar against a faked `efibootmgr` inside the Nix
   build sandbox — no VM, no KVM, no real firmware, but a genuine execution
   rather than an eval-only assertion).
@@ -554,7 +586,9 @@ unit that runs the same script in production exits 127
   this repo does not yet drive).
 
 `checks/default.nix` is this repo's first automated test suite — eval-level
-assertions plus the one build-level idempotency proof described above. A
+assertions plus the build-level execution proofs described above (the boot
+entry registrar's idempotency, and both directions of the retention wrapper's
+firmware-handoff decision). A
 full `pkgs.testers.nixosTest` VM suite covering the boot path itself (real
 UEFI via OVMF, real UKI discovery) remains future work — see
 [`experiments/README.md`](experiments/README.md) and
