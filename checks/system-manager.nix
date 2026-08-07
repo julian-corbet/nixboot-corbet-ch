@@ -112,9 +112,16 @@ let
     (check "declared/native-package-selection-is-complete"
       (lib.all (package: lib.elem package declared.nixboot.systemdBoot.archPackages) [
         "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" "linux-firmware"
-        "intel-ucode"
         "linux-cachyos" "linux-cachyos-headers" "linux-cachyos-lts" "linux-cachyos-lts-headers"
       ])
+      "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
+
+    # NixCPU owns microcode (CPU-keyed fact, vendor detection lives there); NixBoot cannot know
+    # the CPU vendor and must not re-declare the vendor package into its own archPackages, even
+    # though it reads nixcpu.packages.bootMicrocode.archPackage for the presence assertion below.
+    # This regression-tests the ownership boundary itself, not just that the base list is complete.
+    (check "declared/nixboot-does-not-re-declare-nixcpus-microcode-package"
+      (!(lib.elem "intel-ucode" declared.nixboot.systemdBoot.archPackages))
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
 
     (check "firmware-tools/selects-fwupd-and-dmidecode"

@@ -16,9 +16,16 @@
 let
   cfg = config.nixboot.systemdBoot;
 
-  # NixCPU owns the declared CPU vendor and resolves the matching native package. Read this
-  # defensively so importing NixBoot alone remains evaluable; an enabled backend asserts below
-  # that the consuming host actually composed NixCPU's package contract.
+  # NixCPU owns microcode: which vendor blob a host needs is a CPU-keyed fact, and NixCPU already
+  # models it (vendor detection, lib/package-catalogue.nix) while NixBoot cannot know the CPU
+  # vendor at all. NixBoot therefore reads this contract ONLY to assert its presence below -- early
+  # microcode is a hard boot-path requirement for a UKI, so an enabled backend must fail loudly
+  # when no vendor package was selected -- and never adds the name to its own `nativePackages`.
+  # Installing it is NixCPU's system-manager backend's job (nixcpu.packages.archPackages feeds
+  # nixarch.packages.pacman directly); NixBoot repeating the name here was a second, redundant
+  # declaration of the same pacman package into the same reconciler. Read defensively so importing
+  # NixBoot alone remains evaluable; an enabled backend asserts below that the consuming host
+  # actually composed NixCPU's package contract.
   microcodePackage = config.nixcpu.packages.bootMicrocode.archPackage or null;
 
   kernelType = lib.types.submodule ({ ... }: {
@@ -55,9 +62,12 @@ let
   firmwareToolPackages = config.nixboot.firmware.packageNames;
   efitoolsPackage = lib.optional config.nixboot.tools.efitools.enable "efitools";
 
+  # Microcode is deliberately absent from this list: it is a NixCPU-owned Arch package (see
+  # `microcodePackage` above), installed once through NixCPU's own system-manager backend. Once
+  # pacman has it installed, mkinitcpio's `-S autodetect` hook picks up the vendor ucode image on
+  # its own -- NixBoot's UKI build needs the blob to exist, not to be the one that names it.
   nativePackages = lib.unique (
     [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" cfg.firmwarePackage ]
-    ++ lib.optional (microcodePackage != null) microcodePackage
     ++ kernelPackages
     ++ firmwareToolPackages
     ++ efitoolsPackage
@@ -563,9 +573,10 @@ in
         assertion = microcodePackage != null;
         message = ''
           nixboot.systemdBoot.enable requires nixcpu.capabilities.microcode.enable and an explicit
-          bare-metal Intel/AMD NixCPU declaration. NixBoot consumes
-          nixcpu.packages.bootMicrocode.archPackage so a host never repeats a vendor package name
-          in its boot configuration.
+          bare-metal Intel/AMD NixCPU declaration. NixBoot only READS
+          nixcpu.packages.bootMicrocode.archPackage to confirm early microcode was selected for
+          this boot path; it never installs the package itself, so a host declares the vendor
+          blob exactly once, in NixCPU.
         '';
       }
       {
