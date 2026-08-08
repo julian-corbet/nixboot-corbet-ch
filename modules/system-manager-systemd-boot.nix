@@ -62,6 +62,12 @@ let
   firmwareToolPackages = config.nixboot.firmware.packageNames;
   efitoolsPackage = lib.optional config.nixboot.tools.efitools.enable "efitools";
 
+  # `hwdetect` -- the module-set LISTER, not a config writer; see its own option doc for why the
+  # read-only half is the point. system-manager only: the package is Arch-family and nixpkgs has
+  # no attribute for it at all (checked, not assumed), so unlike `efitools` there is no NixOS
+  # counterpart for modules/nixboot.nix to select.
+  hwdetectPackage = lib.optional config.nixboot.tools.hwdetect.enable "hwdetect";
+
   # Microcode is deliberately absent from this list: it is a NixCPU-owned Arch package (see
   # `microcodePackage` above), installed once through NixCPU's own system-manager backend. Once
   # pacman has it installed, mkinitcpio's `-S autodetect` hook picks up the vendor ucode image on
@@ -71,6 +77,7 @@ let
     ++ kernelPackages
     ++ firmwareToolPackages
     ++ efitoolsPackage
+    ++ hwdetectPackage
   );
 
   cmdlineFile = pkgs.writeText "nixboot-kernel-cmdline" "${cfg.kernelCmdline}\n";

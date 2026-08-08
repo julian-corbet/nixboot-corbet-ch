@@ -63,6 +63,9 @@ let
   efitools = evalBoot (lib.recursiveUpdate base {
     nixboot.tools.efitools.enable = true;
   });
+  hwdetect = evalBoot (lib.recursiveUpdate base {
+    nixboot.tools.hwdetect.enable = true;
+  });
   missingMicrocode = assertionFails (lib.recursiveUpdate base {
     nixcpu.packages.bootMicrocode = {
       archPackage = null;
@@ -147,6 +150,17 @@ let
     (check "tools/efitools-selects-efitools-for-system-manager"
       (lib.elem "efitools" efitools.nixboot.systemdBoot.archPackages)
       "packages: ${builtins.toJSON efitools.nixboot.systemdBoot.archPackages}")
+
+    (check "tools/hwdetect-selects-hwdetect-for-system-manager"
+      (lib.elem "hwdetect" hwdetect.nixboot.systemdBoot.archPackages)
+      "packages: ${builtins.toJSON hwdetect.nixboot.systemdBoot.archPackages}")
+
+    # Its own decision, like efitools: a declared kernel set does not imply wanting the lister
+    # that audits it, and a tool that can also WRITE mkinitcpio.conf is not something to acquire
+    # by side effect of enabling the backend.
+    (check "tools/hwdetect-is-not-installed-by-the-backend-alone"
+      (!(lib.elem "hwdetect" declared.nixboot.systemdBoot.archPackages))
+      "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
 
     (check "declared/microcode-must-come-from-nixcpu"
       missingMicrocode
