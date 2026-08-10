@@ -200,6 +200,23 @@ reports. A failure is a failed unit plus the full verdict at
 and it is not a substitute for a module-preserving hook: it reports the
 condition, it does not prevent it.
 
+`plymouth.enable` is the one option in this backend that is not a boot
+mechanism — it is boot cosmetics, and it is a deliberate widening of what this
+repo covers. It is here because a splash needs the kernel command line and the
+initramfs, this backend's own two surfaces, and because plymouth is finished
+before any desktop exists, so nothing on the desktop side can own it. It
+selects the native package and stops there: it does **not** put `splash` on
+`kernelCmdline` (an opaque string, rendered verbatim into every staged UKI) and
+it does **not** add the `plymouth` hook to `/etc/mkinitcpio.conf` (NixBoot never
+writes that file). Both remain the consumer's. Selecting it is still a boot
+decision rather than a package-list line: the package's own `.wants` symlinks
+pull `plymouth-start.service` into `sysinit.target` and the quit units into
+`multi-user.target`, and that unit gates on `plymouth.enable=0`, not on
+`splash`. `quiet splash` without the hook is the trap — no splash, and the
+kernel log gone for exactly the boot that needed it, with no boot-menu escape
+because the command line is baked into the UKI. NixOS hosts use stock
+`boot.plymouth.*` instead. See CONTRACT.md's B28.
+
 Secure Boot signing is deliberately incomplete until a host supplies an explicit
 root-owned runtime `secureBoot.sbctlConfig` path. NixBoot signs only through that
 configuration; it never receives a private key, invents a default key directory,

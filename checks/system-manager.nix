@@ -66,6 +66,9 @@ let
   hwdetect = evalBoot (lib.recursiveUpdate base {
     nixboot.tools.hwdetect.enable = true;
   });
+  plymouth = evalBoot (lib.recursiveUpdate base {
+    nixboot.systemdBoot.plymouth.enable = true;
+  });
   missingMicrocode = assertionFails (lib.recursiveUpdate base {
     nixcpu.packages.bootMicrocode = {
       archPackage = null;
@@ -161,6 +164,25 @@ let
     (check "tools/hwdetect-is-not-installed-by-the-backend-alone"
       (!(lib.elem "hwdetect" declared.nixboot.systemdBoot.archPackages))
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
+
+    (check "plymouth/selects-plymouth-for-system-manager"
+      (lib.elem "plymouth" plymouth.nixboot.systemdBoot.archPackages)
+      "packages: ${builtins.toJSON plymouth.nixboot.systemdBoot.archPackages}")
+
+    # Harder than efitools' and hwdetect's version of this test, because the package is not inert:
+    # its own `.wants` symlinks put plymouth-start.service into sysinit.target and the quit units
+    # into multi-user.target on arrival. A boot chain that acquired that by declaring kernels
+    # would be changing the stage-2 unit graph of every host on this backend.
+    (check "plymouth/is-not-installed-by-the-backend-alone"
+      (!(lib.elem "plymouth" declared.nixboot.systemdBoot.archPackages))
+      "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
+
+    # The option's doc promises it never touches the command line, and the promise is load-bearing:
+    # a later revision that "helpfully" appended `splash` would silently change what every staged
+    # UKI boots with, on a surface whose whole contract is that it is rendered verbatim.
+    (check "plymouth/never-composes-the-kernel-command-line"
+      (plymouth.nixboot.systemdBoot.kernelCmdline == declared.nixboot.systemdBoot.kernelCmdline)
+      "cmdline: ${builtins.toJSON plymouth.nixboot.systemdBoot.kernelCmdline}")
 
     (check "declared/microcode-must-come-from-nixcpu"
       missingMicrocode

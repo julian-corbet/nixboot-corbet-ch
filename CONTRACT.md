@@ -534,6 +534,45 @@ unit that runs the same script in production exits 127
 (`lib/register-boot-entry.nix`'s `gnused`; proved in
 `checks/system-manager.nix`'s `scripts/no-bare-native-command-invocations`).
 
+**B28 — A boot splash is selected, never half-wired.**
+`nixboot.systemdBoot.plymouth.enable` is the first thing in this repo that is
+not a boot *mechanism*: it answers what a human sees while a machine boots, not
+what boots it. It is here anyway because the two things a splash actually needs
+are this backend's own two surfaces and nobody else's — the word `splash` on the
+kernel command line, and a `plymouth` hook in the initramfs generator — and
+because plymouth's whole job is finished before any desktop exists, so nothing
+on the desktop side can own it. **The widening stops at selection.** The option
+puts the native package into `archPackages` and arranges neither of the other
+two: `kernelCmdline` stays an opaque string rendered verbatim into every staged
+UKI, and `/etc/mkinitcpio.conf` keeps the single writer it has always had (the
+line `tools.hwdetect` already draws). The option's own description states both
+gaps in those words, because an option that overpromises here is worse than a
+narrow one — what it would hide is a cold boot with no kernel log and no splash
+to replace it, on a backend where the command line is baked into the UKI and
+there is no boot-menu escape.
+**Not**: selecting the package is not inert, and this contract says so rather
+than implying a package-list line. Pacman's payload rewires the stage-2 unit
+graph on arrival — its own `.wants` symlinks pull `plymouth-start.service` and
+`plymouth-read-write.service` into `sysinit.target`, `plymouth-quit.service` and
+`plymouth-quit-wait.service` into `multi-user.target` — and
+`plymouth-start.service` gates only on
+`ConditionKernelCommandLine=!plymouth.enable=0` and
+`ConditionVirtualization=!container`, never on `splash` (measured: `pacman -Fl`
+plus the unit files themselves, package 26.134.222-2). That is why it is off by
+default and a stated decision rather than a side effect of declaring a boot
+chain. It is also the one place this repo touches the far side of the
+`switch-root` boundary: those quit units run in stage 2, and NixBoot owns none
+of them — it owns the selection, and the package owns its unit graph.
+**Not**: no assertion binds this option to `kernelCmdline`. A splash rollout on
+a machine that must be physically rebooted is legitimately three separate steps
+— package, hook, command line — taken one at a time in whatever order the
+operator can test, and refusing the intermediate states would refuse the only
+safe way to do it. NixOS hosts get nothing here: nixpkgs' own `boot.plymouth.*`
+already owns the initrd contents and the kernel parameters, and a second owner
+of one knob is the mistake this whole contract is written against
+(`modules/system-manager-systemd-boot.nix`'s `plymouthPackage` binding and the
+`plymouth.enable` option; proved in `checks/system-manager.nix`).
+
 ## Which behaviors become automated tests vs. stay observed
 
 - **Automatable** (a `pkgs.testers.nixosTest` VM can assert these directly):
@@ -562,6 +601,12 @@ unit that runs the same script in production exits 127
   neither `mkinitcpio` nor the staging directory; the booted-entry exclusion
   and the MiB-denominated capacity failure are both present), B27 (no
   `head`/`sed`/`dirname` is invoked by bare name in any rendered script),
+  B28 (the package is selected when asked for, is absent from a backend that
+  merely declares a boot chain, and — the half that actually protects the
+  contract's promise — leaves `kernelCmdline` byte-identical, so a later
+  revision cannot start composing `splash` in unnoticed; that the initramfs
+  hook and the command-line word remain the consumer's is a gap this repo
+  states rather than a behavior it can assert),
   B7's firmware-handoff branches (the retention wrapper's own script is RUN
   against stand-in `bootctl`/`findmnt`/`lsblk` binaries and a scratch ESP,
   once per direction: it installs on a healthy handoff and on a recorded

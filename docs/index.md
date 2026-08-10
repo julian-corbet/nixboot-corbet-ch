@@ -185,6 +185,19 @@ running release still has a module tree and is still the only release its
 package installs, and writes its verdict to `/run/nixboot/booted-kernel`. It
 reports and stops there — see CONTRACT.md's B25.
 
+`plymouth.enable` widens this backend, on purpose, past what boots a machine to
+what a human sees while it does. The argument for putting a splash in a boot
+repo is that its two requirements are this backend's own surfaces — the word
+`splash` on the kernel command line and a `plymouth` hook in the initramfs
+generator — and that plymouth is done before any desktop exists, so no
+desktop-side module can own it. The option arranges neither of those two: it
+selects the native package, and says so plainly rather than half-wiring the
+rest. The command line stays verbatim and `/etc/mkinitcpio.conf` keeps its
+single writer. What it does change is real, though — the package's own `.wants`
+symlinks start `plymouth-start.service` from `sysinit.target` on the next boot,
+gated on `plymouth.enable=0` rather than on `splash` — which is why it is off by
+default. NixOS hosts use stock `boot.plymouth.*`. See CONTRACT.md's B28.
+
 For a clean break from Limine, `retireLimine.enable` renders one more manual
 post-cutover unit. It refuses to run until firmware is booting systemd-boot,
 then removes only explicitly named legacy artifacts and the matching Limine

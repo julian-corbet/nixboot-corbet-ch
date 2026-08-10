@@ -68,6 +68,15 @@ let
   # counterpart for modules/nixboot.nix to select.
   hwdetectPackage = lib.optional config.nixboot.tools.hwdetect.enable "hwdetect";
 
+  # `plymouth` -- boot COSMETICS, and deliberately NOT a member of tool-options.nix's `tools.*`
+  # group. That group is shared with the NixOS backend and every member of it is a CLI whose
+  # entire effect is being on PATH; plymouth is none of the three (see its option doc for what
+  # selecting it actually rewires, and for the two things it does NOT arrange). Declaring it on
+  # `nixboot.systemdBoot.*` instead makes "Arch plane only" structural rather than a promise in
+  # prose: a NixOS host cannot set an option it does not have, so there is no silent no-op to
+  # warn about -- it uses stock `boot.plymouth.*`.
+  plymouthPackage = lib.optional cfg.plymouth.enable "plymouth";
+
   # Microcode is deliberately absent from this list: it is a NixCPU-owned Arch package (see
   # `microcodePackage` above), installed once through NixCPU's own system-manager backend. Once
   # pacman has it installed, mkinitcpio's `-S autodetect` hook picks up the vendor ucode image on
@@ -78,6 +87,7 @@ let
     ++ firmwareToolPackages
     ++ efitoolsPackage
     ++ hwdetectPackage
+    ++ plymouthPackage
   );
 
   cmdlineFile = pkgs.writeText "nixboot-kernel-cmdline" "${cfg.kernelCmdline}\n";
@@ -792,6 +802,75 @@ in
       type = lib.types.nullOr lib.types.lines;
       default = null;
       description = "Exact kernel command line embedded in every staged UKI.";
+    };
+
+    ## ── Boot cosmetics: the one thing in this backend that is not a mechanism ──
+    ## Everything else here answers "what boots this machine"; a splash answers "what does a
+    ## human see while it does". It is here anyway because the two things a splash actually
+    ## needs are this backend's own two surfaces and nobody else's -- the word `splash` on the
+    ## KERNEL COMMAND LINE (`kernelCmdline` directly above, rendered into every staged UKI) and a
+    ## `plymouth` HOOK in the initramfs generator (`mkinitcpio`, which this backend drives) -- and
+    ## because plymouth's whole job is over before any desktop exists, so nothing on the desktop
+    ## side can own it. The widening stops at selection; the gap is stated, not papered over.
+    plymouth.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Select `plymouth`, the graphical boot splash, into this backend's native package set.
+
+        THIS OPTION SELECTS THE PACKAGE AND ARRANGES NOTHING ELSE, AND THAT GAP IS THE POINT. A
+        splash needs three things; NixBoot does exactly one of them:
+
+          1. the package -- this option, and the whole of it;
+          2. `splash` on the kernel command line -- NOT arranged. `kernelCmdline` above is an
+             opaque string this backend renders VERBATIM into every staged UKI; nothing here
+             composes or appends to it, so the word is the consumer's to write. (The requirement
+             is the vendor's own: plymouth's mkinitcpio hook says in its `help()` that it shows
+             a splash "if the 'splash' kernel parameter is specified".)
+          3. `plymouth` in `HOOKS=()` in `/etc/mkinitcpio.conf` -- NOT arranged, and not from
+             here ever. NixBoot does not write that file; that is the same line
+             `nixboot.tools.hwdetect` draws, for the same reason -- a declared `mkinitcpio.conf`
+             with a second writer is a declaration that has quietly stopped describing the
+             machine. The package ships the hook DEFINITION at
+             `/usr/lib/initcpio/install/plymouth`, and a definition that no `HOOKS=()` names
+             contributes nothing to the initramfs.
+
+        SELECTING THE PACKAGE IS NOT INERT, WHICH IS PRECISELY WHY IT IS A BOOT DECISION AND NOT
+        A LINE IN A PACKAGE LIST. Unlike `tools.efitools` / `tools.hwdetect`, whose entire effect
+        is a binary on PATH, pacman's payload here rewires the stage-2 unit graph the moment it
+        lands: the package ships its own `.wants` symlinks, pulling `plymouth-start.service` and
+        `plymouth-read-write.service` into `sysinit.target` and `plymouth-quit.service` +
+        `plymouth-quit-wait.service` into `multi-user.target`. And `plymouth-start.service` gates
+        only on `ConditionKernelCommandLine=!plymouth.enable=0` and
+        `ConditionVirtualization=!container` -- never on `splash` -- so on bare metal `plymouthd
+        --mode=boot` starts on the next boot from the package alone, with no hook and no command
+        line word anywhere. (Measured, not assumed: `pacman -Fl plymouth` for the symlinks and
+        the unit files themselves out of package 26.134.222-2.)
+
+        THE TRAP IS A COLD-BOOT ONE. `quiet splash` on a host whose initramfs carries no plymouth
+        hook buys no splash and still pays the `quiet`: the kernel log is gone for exactly the
+        boot that now has nothing in its place. On THIS backend there is no boot-menu escape from
+        that -- the command line is baked into the UKI at build time, `loader.editor` defaults to
+        false, and a signed UKI's stub ignores an externally supplied command line anyway. Nor is
+        the fallback UKI one: it is built from the same `kernelCmdline`. Recovery is re-staging
+        with a different declared command line or removing the package, both of which need the
+        box to boot far enough to run them.
+
+        DELIBERATELY NOT ASSERTED AGAINST `kernelCmdline`. NixBoot could grep that string for
+        `splash` and refuse the mismatch, and elsewhere it would: a setting that does nothing is
+        a bug here, not a shrug. It does not here because a splash rollout on a machine that must
+        be physically rebooted is legitimately three separate steps -- package, hook, command
+        line -- taken in whatever order the operator can test one at a time, and refusing the
+        intermediate states would refuse the only safe way to do it. The command line stays
+        opaque, as it is everywhere else in this backend.
+
+        Arch plane only, for a DIFFERENT reason than `tools.hwdetect`'s (which is Arch-only
+        because nixpkgs has no such package at all): nixpkgs does have plymouth, and NixOS's
+        stock `boot.plymouth.*` already does the whole job -- initrd contents and kernel
+        parameters both. NixBoot writing into that would be a second owner of a knob that already
+        has one, so the NixOS backend declares nothing here and a NixOS host sets
+        `boot.plymouth.enable` directly.
+      '';
     };
 
     uki.prefix = lib.mkOption {
