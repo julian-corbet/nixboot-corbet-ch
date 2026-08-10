@@ -242,6 +242,10 @@ let
   collectScript = ''
     set -euo pipefail
 
+    # Native PATH -- see the note on `stageScript` below for why an absolutely-invoked
+    # /usr/bin/* script still needs it.
+    export PATH=/usr/bin:/usr/local/bin:''${PATH:-}
+
     esp=${lib.escapeShellArg cfg.esp.mountPoint}
     prefix=${lib.escapeShellArg cfg.uki.prefix}
 
@@ -275,6 +279,25 @@ let
 
   stageScript = ''
     set -euo pipefail
+
+    # THE NATIVE PATH, AND WHY EVERY SCRIPT HERE NEEDS IT DESPITE CALLING BY ABSOLUTE PATH.
+    #
+    # Every native command below is invoked as `/usr/bin/<name>`, so a unit's own PATH looks
+    # irrelevant. It is not. Those absolute paths are SHELL SCRIPTS on Arch --
+    # `/usr/bin/mkinitcpio` begins `#!/usr/bin/env bash` -- and `env bash` resolves through the
+    # PATH of the process that execs it. A generated unit's PATH is a handful of nix store
+    # directories (coreutils, findutils, gnugrep, gnused, systemd-minimal) and contains no bash.
+    #
+    # MEASURED, not theorised: without this, the UKI build died with `env: 'bash': No such file or
+    # directory` and `status=127`, on every kernel update, for five days -- while every preflight
+    # check below passed, because the binaries genuinely were present and executable. The result
+    # was a machine running a kernel whose package had already been replaced, carrying no UKI for
+    # the kernel it actually had installed, and nothing anywhere saying so.
+    #
+    # `/usr/bin` and not `pkgs.bash`: this module is the native-Arch plane, it installs nothing,
+    # and it already hardcodes `/usr/bin/*` throughout. Handing a native script a nix bash would be
+    # a different and less honest coupling than letting it find its own interpreter.
+    export PATH=/usr/bin:/usr/local/bin:''${PATH:-}
 
     esp=${lib.escapeShellArg cfg.esp.mountPoint}
     prefix=${lib.escapeShellArg cfg.uki.prefix}
@@ -404,6 +427,10 @@ let
   verifyScript = ''
     set -euo pipefail
 
+    # Native PATH -- see the note on `stageScript` below for why an absolutely-invoked
+    # /usr/bin/* script still needs it.
+    export PATH=/usr/bin:/usr/local/bin:''${PATH:-}
+
     esp=${lib.escapeShellArg cfg.esp.mountPoint}
     prefix=${lib.escapeShellArg cfg.uki.prefix}
     fail=0
@@ -455,6 +482,10 @@ let
   # operator is an unambiguous statement, not a decision.
   bootedKernelVerifyScript = ''
     set -euo pipefail
+
+    # Native PATH -- see the note on `stageScript` below for why an absolutely-invoked
+    # /usr/bin/* script still needs it.
+    export PATH=/usr/bin:/usr/local/bin:''${PATH:-}
 
     for command in /usr/bin/basename /usr/bin/install /usr/bin/mv /usr/bin/uname; do
       [ -x "$command" ] || {
@@ -555,6 +586,10 @@ let
   cutoverScript = ''
     set -euo pipefail
 
+    # Native PATH -- see the note on `stageScript` below for why an absolutely-invoked
+    # /usr/bin/* script still needs it.
+    export PATH=/usr/bin:/usr/local/bin:''${PATH:-}
+
     esp=${lib.escapeShellArg cfg.esp.mountPoint}
     secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
     sbctl_config=${if cfg.secureBoot.sbctlConfig == null then "''" else lib.escapeShellArg cfg.secureBoot.sbctlConfig}
@@ -598,6 +633,10 @@ let
 
   retireLimineScript = ''
     set -euo pipefail
+
+    # Native PATH -- see the note on `stageScript` below for why an absolutely-invoked
+    # /usr/bin/* script still needs it.
+    export PATH=/usr/bin:/usr/local/bin:''${PATH:-}
 
     esp=${lib.escapeShellArg cfg.esp.mountPoint}
     legacy_artifacts=( ${lib.concatMapStringsSep " " lib.escapeShellArg cfg.retireLimine.legacyArtifacts} )
