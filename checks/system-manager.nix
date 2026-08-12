@@ -129,8 +129,15 @@ let
 
     (check "declared/native-package-selection-is-complete"
       (lib.all (package: lib.elem package declared.nixboot.systemdBoot.archPackages) [
-        "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" "linux-firmware"
-        "linux-cachyos" "linux-cachyos-headers" "linux-cachyos-lts" "linux-cachyos-lts-headers"
+        "mkinitcpio"
+        "systemd-ukify"
+        "sbctl"
+        "efibootmgr"
+        "linux-firmware"
+        "linux-cachyos"
+        "linux-cachyos-headers"
+        "linux-cachyos-lts"
+        "linux-cachyos-lts-headers"
       ])
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
 
@@ -371,11 +378,13 @@ let
     # against the unit's PATH, which on a system-manager host holds no native tools at all, and the
     # result is a bare 127 instead of this backend's named "required native command is absent".
     (check "scripts/no-bare-native-command-invocations"
-      (lib.all (script:
-        !(lib.hasInfix "$(head " script)
-        && !(lib.hasInfix "| sed " script)
-        && !(lib.hasInfix "$(dirname " script)
-      ) (map (unit: unit.script) (lib.attrValues retirement.systemd.services)))
+      (lib.all
+        (script:
+          !(lib.hasInfix "$(head " script)
+          && !(lib.hasInfix "| sed " script)
+          && !(lib.hasInfix "$(dirname " script)
+        )
+        (map (unit: unit.script) (lib.attrValues retirement.systemd.services)))
       "a script invokes head/sed/dirname by bare name; use /usr/bin/<tool> and add it to that script's preflight loop")
 
     (check "stage/pacman-hook-rebuilds-ukis-after-native-boot-updates"

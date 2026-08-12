@@ -44,19 +44,47 @@ precedent.
 Nixboot is a public repository. It contains no Secure Boot private key, SOPS
 payload, recovery passphrase, host name, or recipient list.
 
-A consumer may commit an encrypted Secure Boot PKI archive to its **private**
-infrastructure repository when all of the following are true:
+A consumer may commit an encrypted Secure Boot PKI archive to a public or
+private GitHub repository. Repository visibility is not part of the security
+boundary: the archive must remain safe when an attacker has the complete
+ciphertext and the public db certificate. The operator may use the same one
+master passphrase already used for data encryption; nixboot does not introduce
+or require a second password. Publishing the ciphertext lets anyone attempt
+offline passphrase guesses, so this design is valid only when that existing
+master passphrase already has enough entropy for offline attack resistance;
+making the GitHub repository private is not a substitute for that property.
+
+This repository exports `lib.mkPkiArchiveTools`, which provides:
+
+From a checkout, `nix shell .#pki-archive-tools` puts all three commands on
+`PATH`; a consumer flake may instead instantiate `lib.mkPkiArchiveTools`.
+
+| Command | Contract |
+|---|---|
+| `nixboot-encrypt-pki PKI-DIRECTORY OUTPUT.tar.age` | Creates an `age --passphrase` archive interactively and refuses to overwrite an existing ciphertext. |
+| `nixboot-with-pki ARCHIVE.tar.age -- COMMAND ...` | Decrypts interactively into a private tmpfs directory, exports `NIXBOOT_PKI_DIR`, runs one command, and destroys the temporary plaintext. |
+| `nixboot-sign-uki-with-pki ARCHIVE.tar.age REQUEST-DIRECTORY OUTPUT-DIRECTORY` | Combines the tmpfs unlock with the two-phase signer, using the archived db key and certificate without exposing their paths to the caller. |
+
+The archive is suitable for GitHub when all of the following are true:
 
 - the archive is encrypted before it is committed;
-- decryption recipients are controlled recovery identities, not the target
-  host alone;
+- the master passphrase is entered interactively and is never committed as a
+  GitHub Actions secret or written to a passphrase file;
 - the plaintext exists only in controlled build or recovery environments;
 - an offline copy independent of GitHub and the boot disk exists; and
 - recovery from that copy is exercised before the key is treated as durable.
 
 Plaintext private signing keys do not belong in either public or private Git
-history. A private Git repository is a delivery and audit record, not the
-only recovery medium.
+history. GitHub is a ciphertext distribution and audit mechanism, not an
+unsealing authority and not the only recovery medium.
+
+The signing flow is intentionally two-phase. `lib.mkUkiSigningRequest` builds
+the common unsigned UKI plus its digest and generic class/role identity.
+`lib.mkUkiSigner` consumes that request and runtime db key paths outside the
+Nix store. `lib.mkSignedUkiVerifier` then proves the signed bytes still name
+the exact request and verify under the intended db certificate. Thus one
+generic rescue payload may receive different outer signatures for different
+firmware trust roots without becoming a different package-set rescue build.
 
 Each physical machine has its own Secure Boot identity. A laptop and a
 server do not share PK/KEK/db material: revoking, recovering, or replacing

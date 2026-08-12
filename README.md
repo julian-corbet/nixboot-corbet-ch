@@ -33,6 +33,15 @@ only evidence often appears at the *next* boot, by which point the box may
 not come back at all. `nixboot-verify` closes that gap by checking, not
 assuming.
 
+For offline cloud and VM disks, `nixboot.imageArtifact` now produces the
+checked UEFI/systemd-boot portion directly from the evaluated NixOS system.
+The separate `lib.mkEfiDiskImageCheck` proves the final raw disk's sector
+interpretation, GPT partition types/filesystems and byte-exact ESP contents
+before upload. Provider adapters supply facts; they do not grow another ESP
+renderer. The manifest keeps the offline disk's mandatory removable-media
+first boot distinct from the live host's later removable/NVRAM policy. See
+[Cloud and VM boot artifacts](docs/cloud-images.md).
+
 It also owns one thing that is deliberately usable **without** taking on any
 of the above: `media.usb.enable` adds the initrd kernel modules a stage-1
 boot needs to find and drive a USB-attached device — a stick — before any
@@ -133,10 +142,13 @@ The other two ownership boundaries are equally strict:
   delivery: scheduling, transport, materialization, slot rotation and
   selection, activation, rollback, reimage, and typed outcomes.
 
-This is the architectural target, not the current option surface. Today the
+This remains the architectural target, not the complete current option
+surface. The NixOS offline-image path has landed the first class-and-role-bearing
+common artifact (`nixboot.imageArtifact.deviceClass` / `.role`) and
+provider-neutral disk gate. Today the
 NixOS backend uses `nixboot.*`, the system-manager backend uses the separate
 `nixboot.systemdBoot.*` tree, no Home Manager module is exported, and no
-device-class/boot-role schema has landed. Kernel selection/packaging and some
+complete cross-plane device-class/boot-role schema has landed. Kernel selection/packaging and some
 boot-medium construction also still live in class or consumer repos. Those
 move into the class backends here while their source facts stay in the
 specialist domains. nixboot's current maintainer timers and slot rotation are
@@ -224,6 +236,12 @@ or puts key material in the Nix store. A secure stage signs both its separate
 systemd-boot binary and its NixBoot-owned UKIs; it never signs or replaces the
 current fallback path before the separately reviewed cutover.
 
+When a Secure Boot PKI is stored as an encrypted archive, its interactive
+`age` prompt means the **same master passphrase used for disk encryption**.
+It is not a new or rescue-specific password. The ciphertext may be public;
+the master passphrase and plaintext keys may not be committed or supplied to
+unattended CI. See [Boot Security And Recovery](docs/security-recovery.md).
+
 `cutover.enable` is a second, independent manual gate. Its unit first reruns
 the stage verification, then uses `bootctl install` with EFI-variable writes
 enabled to replace the active fallback and create the systemd-boot firmware
@@ -284,16 +302,16 @@ use for its system-manager modules).
 ## Status
 
 Pre-alpha. The NixOS and system-manager backends, their assertions, and their
-eval/build checks exist today. Firmware-specific behavior still requires
-physical-host verification; successful evaluation is not proof that a
-firmware implementation will boot an artifact.
+eval/build checks exist today. OVMF now proves the signed-UKI Secure Boot
+handoff and swtpm proves the TPM-gated SSH identity lifecycle; physical
+firmware and TPM quirks still require physical-host verification.
 
 Two pieces that an earlier revision of this file called out as deliberately
 deferred are now implemented: `extraEntries.*`
 (the `ukify`+`sbsign`+place+rotate pipeline for a durable rescue/BMC boot
 entry — [`modules/extra-entries.nix`](modules/extra-entries.nix)), and
-`remoteUnlock.*` (headless in-initrd SSH, both the TPM2-sealed and
-plaintext host-key paths — see `secureBoot.pkiBundle`/`keySource` and
+`remoteUnlock.*` (headless in-initrd SSH with a fail-closed TPM2-sealed
+host identity — see `secureBoot.pkiBundle`/`keySource` and
 `remoteUnlock.*` in [`modules/nixboot.nix`](modules/nixboot.nix), and
 [CONTRACT.md](CONTRACT.md)'s B21–B24). What genuinely remains outside this
 module, stated as a ceiling rather than an oversight: the initrd-time
@@ -305,8 +323,15 @@ comment on `remoteUnlock`'s common initrd-network block); and the initrd
 **console keymap** is a known requirement but is not yet implemented in this
 repo.
 
-The cross-plane device-class/boot-role schema described above is not
-implemented yet. Existing class integrations therefore remain adapters over
+The former `remoteUnlock.sealHostKey`, `remoteUnlock.hostKeyPath`, and
+`remoteUnlock.tpm2.enable` compatibility paths are intentionally gone.
+`remoteUnlock.enable = true` now means exactly one thing: use a TPM-sealed
+SSH identity under operator Secure Boot. Device classes without a TPM leave
+remote unlock disabled and use their local, serial, or BMC console.
+
+The offline NixOS artifact now carries an explicit device class and boot role.
+The complete cross-plane schema described above is not implemented yet.
+Existing class integrations therefore remain adapters over
 the current backend-specific option trees. New documentation and code should
 converge toward the common schema and the nixdeploy delivery boundary rather
 than add another mirrored boot or rollout surface.
@@ -386,7 +411,11 @@ artifact is delivery and therefore belongs to nixdeploy.
 | `flake.nix` | Flake entry point: `nixosModules.nixboot` / `.default`, `systemManagerModules.nixboot` / `.default`. |
 | `modules/nixboot.nix` | The NixOS module itself. |
 | `modules/extra-entries.nix` | `nixboot.extraEntries.*` — second, non-default UKIs on the same ESP (NixOS only). |
+| `modules/image-artifact.nix` | Checked offline UEFI/systemd-boot artifact derived from the evaluated NixOS system. |
 | `modules/system-manager-systemd-boot.nix` | Staged native systemd-boot and UKI backend for system-manager hosts. |
+| `lib/mk-efi-disk-image-{verifier,check}.nix` | Provider-neutral final raw-disk acceptance gate. |
+| `lib/mk-uki-{signing-request,signer}.nix` / `lib/mk-signed-uki-verifier.nix` | Secret-safe two-phase UKI signing: reproducible request, runtime signature, independent verification. |
+| `lib/mk-pki-archive-tools.nix` | Interactive passphrase encryption/decryption for a Secure Boot PKI ciphertext that may live in a public Git repository. |
 | `lib/register-boot-entry.nix` | The idempotent/self-healing NVRAM registrar, shared by both backends. |
 | `docs/` | Reader-facing option-surface walkthrough and FAQ. |
 | `CONTRACT.md` | The option surface as a fixed behavioral contract. |

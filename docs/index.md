@@ -35,7 +35,9 @@ scheduling, transport, materialization, slot rotation and selection,
 activation, rollback, reimage, and typed outcomes. The private composition
 supplies all host identities and chosen production values.
 
-That common schema is not implemented today. The NixOS option tree is
+That common schema is not completely implemented today. The offline NixOS
+path now carries `imageArtifact.deviceClass` / `.role` and the provider-neutral disk gate; the
+remaining NixOS option tree is
 `nixboot.*`, system-manager still uses `nixboot.systemdBoot.*`, and no Home
 Manager module or class/role schema is exported. Current maintainer timers
 and artifact rotation in nixboot are migration debt against the nixdeploy
@@ -106,20 +108,16 @@ loader.program's own generations) and of `secureBoot.enable`/`loader.program`
 off, can still carry a signed or unsigned extra entry) — see
 `modules/extra-entries.nix` and CONTRACT.md's B13–B16.
 
-**`remoteUnlock.*`** — a headless in-initrd secret prompt (most commonly a
-LUKS passphrase/PIN this host's own disk-layout config blocks on) answered
+**`remoteUnlock.*`** — a headless in-initrd passphrase prompt answered
 over SSH: a NIC and sshd come up in the initrd, an operator connects with a
 key from `remoteUnlock.authorizedKeys`, and hands the secret to systemd's
-password agent. The host key defaults to a TPM2-sealed systemd CREDENTIAL
-(`sealHostKey = true`, folded with `remoteUnlock.tpm2.enable` — a value this
-module *reads*, never a TPM2 policy it owns itself, see that option's own
-doc) that `nixboot-seal-hostkey` generates on first boot and SELF-HEALS
-across the one PCR change a Secure Boot key enrollment causes, serving a
-loudly-flagged EPHEMERAL key before any seal exists so the very first boot
-is unlockable too; or a plaintext, build-time `hostKeyPath` (LAN/tailnet-only)
-when `sealHostKey = false`. Both require `boot.initrd.systemd.enable = true`
-(the common NIC/DHCP wiring depends on it regardless of which host-key path
-is chosen) — refused, not silently inert, if it is missing. See
+password agent. The host key is a TPM2-sealed systemd credential that
+`nixboot-seal-hostkey` generates after the first successful local boot and self-heals
+across the one PCR change a Secure Boot key enrollment causes. Until that
+credential exists, or whenever TPM/PCR unseal fails, initrd SSH has no host
+identity and stays down; the local/IPMI console remains usable. There is no plaintext or
+ephemeral fallback. Remote unlock requires `boot.initrd.systemd.enable = true` and
+operator Secure Boot; a no-TPM device class leaves remote unlock disabled. See
 CONTRACT.md's B22–B23 for the full failure-mode reasoning, including the one
 `mkForce` this module needs to defend against a TPM dictionary-attack
 lockout.
@@ -136,6 +134,33 @@ on `boot.lanzaboote.autoGenerateKeys.enable` plus the landlock/ENOENT
 workaround `generate-sb-keys.service` needs on a genuine first boot. The
 configuration reaches both the signer and its supporting tools so they
 cannot silently disagree — see CONTRACT.md's B21.
+
+**`imageArtifact.*`** — a provider-neutral, checked UEFI/systemd-boot tree for
+an offline-baked NixOS disk. Its required `deviceClass` and independent `role`
+are generic mechanism selectors, never provider or machine names. It derives
+one Type-1 entry from the evaluated
+system's exact kernel, initrd, toplevel and command line, always carries the
+removable-media fallback, and records that unavoidable first-boot handoff
+separately from the running host's removable/NVRAM policy. It requires the
+existing bootloader self-heal on every real boot; self-heal repairs NVRAM too
+when that policy is `write`. `lib.mkEfiDiskImageCheck` then proves the final disk's
+declared sector interpretation, GPT types, filesystems and packed ESP bytes
+before upload. See [Cloud and VM boot artifacts](cloud-images.md) and
+CONTRACT.md's B29–B30.
+
+**`lib.mkUkiSigningRequest` / `lib.mkUkiSigner` /
+`lib.mkSignedUkiVerifier`** — a two-phase signed-UKI boundary. The reproducible
+request contains the common UKI and its digest but no key. Signing receives db
+key paths only at runtime, outside the Nix store; verification binds the result
+back to the exact request and intended db certificate. This is how one shared
+nixrescue payload can receive the signature required by each firmware trust
+root without becoming a host-specific rescue build.
+
+**`lib.mkPkiArchiveTools`** — interactive `age --passphrase` custody for the
+Secure Boot PKI. The encrypted archive may live in a public GitHub repository;
+`nixboot-with-pki` decrypts it only into tmpfs for one command. No unattended
+or second-password path is introduced. See [Boot Security And Recovery](security-recovery.md)
+and CONTRACT.md's B31.
 
 ## Why a `*-verify` service at all
 
@@ -184,6 +209,13 @@ runs after boot and after every native kernel transaction, reports whether the
 running release still has a module tree and is still the only release its
 package installs, and writes its verdict to `/run/nixboot/booted-kernel`. It
 reports and stops there — see CONTRACT.md's B25.
+
+`lib.mkTpmSshCredential` is the cross-plane producer for the global
+`loader/credentials/nixboot-initrd-hostkey.cred` consumed by systemd-stub. A
+NixOS remote-unlock host instantiates it automatically; a system-manager host
+can run the same package after a successful local boot so a shared rescue UKI
+gets a per-device PCR-bound SSH identity without embedding one in its image.
+Failure never creates a plaintext fallback.
 
 `plymouth.enable` widens this backend, on purpose, past what boots a machine to
 what a human sees while it does. The argument for putting a splash in a boot

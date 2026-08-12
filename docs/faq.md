@@ -95,7 +95,7 @@ it as a nixboot gap; it was actually a gap between two repos each pointing
 at the other, now closed on nixluks's side.
 
 `extraEntries.*` (second, non-default UKIs on the same ESP) and
-`remoteUnlock.*` (headless in-initrd SSH, sealed or plaintext host key) were
+`remoteUnlock.*` (headless in-initrd SSH with a TPM-gated host identity) were
 the other deferred pieces as of earlier revisions of this page — both are
 now implemented, in `modules/extra-entries.nix` and `modules/nixboot.nix`
 respectively. See the next question, and CONTRACT.md's B21–B24.

@@ -9,6 +9,7 @@
 , name
 , toplevel
 , osRelease ? "${toplevel}/etc/os-release"
+, kernelParamFiles ? [ ]
 }:
 
 pkgs.runCommand "${name}.efi"
@@ -18,10 +19,20 @@ pkgs.runCommand "${name}.efi"
   ''
     set -euo pipefail
 
+    cmdline="init=${toplevel}/init $(cat ${toplevel}/kernel-params)"
+    parameter_files=(${pkgs.lib.concatMapStringsSep " " pkgs.lib.escapeShellArg kernelParamFiles})
+    for parameter_file in "''${parameter_files[@]}"; do
+      [ -r "$parameter_file" ] || {
+        echo "nixboot.mkUki: kernel parameter file is unreadable: $parameter_file" >&2
+        exit 1
+      }
+      cmdline="$cmdline $(tr '\r\n' '  ' < "$parameter_file")"
+    done
+
     ukify build \
       --linux="${toplevel}/kernel" \
       --initrd="${toplevel}/initrd" \
-      --cmdline="init=${toplevel}/init $(cat ${toplevel}/kernel-params)" \
+      --cmdline="$cmdline" \
       --os-release="@${osRelease}" \
       --output="$out"
 

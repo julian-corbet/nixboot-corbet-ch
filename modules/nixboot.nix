@@ -35,9 +35,8 @@
 #           exposure for sbctl/efitools/sbsigntool; firmware maintenance and
 #           local SMBIOS inventory tools (firmware.fwupd and firmware.dmidecode);
 #           the initrd-SSH remote unlock surface (remoteUnlock.*) -- NIC-up + sshd in the
-#           initrd, the choice between a TPM2-sealed systemd credential
-#           and a plaintext build-time key for the host key, and the
-#           self-healing seal service that survives a Secure Boot key
+#           initrd, its TPM2-sealed systemd credential host identity, and
+#           the self-healing seal service that survives a Secure Boot key
 #           enrollment -- while only READING the TPM2 enable/pcrs/device
 #           values it seals against, never declaring that policy itself
 #           (see remoteUnlock.tpm2.* below and the NOT note underneath);
@@ -78,16 +77,9 @@
 #           with whoever packages the kernel (nixnas today; a future
 #           `nixkernel` is the right home, not this file).
 #   NOT   : disk-layout identity -- LUKS members, ZFS pool import, the
-#           store/hot vs store/usb split, impermanence/persist.*, and the
-#           TPM2 policy that guards the DATA unlock itself (PCR set / PIN
-#           requirement / device -- nixnas's `crypto.tpm2.*`). Those are
-#           appliance state that happens to be consulted from stage 1.
-#           remoteUnlock.tpm2.* is deliberately NOT that policy: it is a
-#           same-shaped enable/pcrs/device MIRROR a composing module feeds
-#           a value into, so the initrd-SSH host-key seal has something
-#           honest to bind to without this module re-declaring a second
-#           TPM2 owner -- see the option doc for exactly why the two can
-#           legitimately disagree on PCRs. The initrd console keymap is
+#           store/hot vs store/usb split, and impermanence/persist.*. Nixboot
+#           never releases a disk key. Its TPM use is limited to the
+#           per-device initrd-SSH host identity. The initrd console keymap is
 #           real and evidenced but is NOT implemented in this first cut.
 #   NOT   : power policy (nixpower's `sleep.allowed`, ASPM, EPP) even
 #           though a suspend/resume cycle is boot-adjacent. Two managers
@@ -194,27 +186,16 @@ let
   ## `espProjectedMiB` already uses for `cfg.generations.keep`.
   ru = cfg.remoteUnlock;
 
-  # Whether the TPM2-sealed-credential path (Path A) is actually active.
-  # Folds in `ru.tpm2.enable` -- the one value this module READS instead of
-  # OWNING; see the option doc on `remoteUnlock.tpm2.enable` for why nixboot
-  # never declares its own TPM2 policy the way nixnas's `crypto.tpm2.*` does.
-  sealActive = ru.sealHostKey && ru.tpm2.enable;
+  # Remote unlock has one identity path: a TPM2-sealed systemd credential.
+  # A device class without a usable TPM leaves remoteUnlock disabled and uses
+  # its local/IPMI console.
+  sealActive = ru.enable;
 
   # Same openssh package whose sshd the nixpkgs initrd-ssh module copies in
   # -- reusing it for ssh-keygen adds (almost) nothing to the initrd closure.
   # Also used by nixboot-verify below, on the STAGE-2 system, where it's
   # already a normal store path (not initrd-embedded).
   sshPackage = config.programs.ssh.package;
-
-  # ── Path B (plaintext): non-store destination for the host key inside the initrd.
-  hostKeyDest = "/etc/ssh/nixboot_initrd_host_ed25519_key";
-  # Source as its own tracked store path (proper context so builtins.path
-  # actually resolves at eval time). Guarded with a null check so Nix never
-  # forces builtins.path on a null path when Path A is in use instead.
-  hostKeySource =
-    if ru.hostKeyPath != null
-    then builtins.path { path = ru.hostKeyPath; name = "nixboot-initrd-host-key"; }
-    else null;
 
   # The host key travels as a TPM2-sealed *systemd credential*. This name is
   # shared across three touch-points: the sealed file `<credName>.cred`, the
@@ -235,18 +216,15 @@ let
   # (and for nixboot-verify's Check 7, below).
   pubEspPath = "${lib.removeSuffix ".cred" credEspPath}.pub";
 
-  # ── Path A first-boot fallback: EPHEMERAL host key, generated in the initrd. ──
-  # Both paths live on the initrd's RAM-backed rootfs -- discarded at
-  # switch-root, never persisted anywhere. /etc/ssh already exists in the
-  # initrd (sshd_config lives there).
-  ephemeralKeyPath = "/etc/ssh/nixboot_initrd_ephemeral_ed25519_key";
-  bannerPath = "/etc/ssh/nixboot_initrd_banner";
-
-  # `--tpm2-pcrs=` wants a comma-joined list; `ru.tpm2.pcrs` is the
-  # nixboot-side option a composing module (e.g. nixnas's `crypto.tpm2.pcrs`)
-  # feeds a value into -- see that option's doc for why this is NOT
-  # necessarily the same PCR set as the data-unlock policy.
-  tpm2PcrsArg = lib.concatMapStringsSep "," toString ru.tpm2.pcrs;
+  # Shared runtime producer for both NixOS initrd SSH and system-manager rescue consumers.
+  tpmSshCredentialMaintainer = import ../lib/mk-tpm-ssh-credential.nix {
+    inherit pkgs;
+    name = "initrd";
+    espMountPoint = cfg.esp.mountPoint;
+    credentialName = credName;
+    pcrs = ru.tpm2.pcrs;
+    tpm2Device = ru.tpm2.device;
+  };
 
   # ── nixboot-enroll-sb: the operator-run firmware key enrollment ─────────
   # Bound here, rather than inline at its `environment.systemPackages` call
@@ -460,7 +438,7 @@ in
           only ever boots via the fallback path makes `bootctl status`
           return non-zero, which aborts the bootloader-install step of
           EVERY switch-to-configuration. "removable" is also what lets a
-          nixnas rescue stick boot on any spare box regardless of what is
+          nixrescue USB stick boot on any spare box regardless of what is
           already in that box's NVRAM.
         '';
       };
@@ -489,8 +467,11 @@ in
           install` -- a VM-less repart-baked image whose disk was written
           by a build step, not by a live NixOS activation? Every boot must
           then re-assert the install. When true this ships a oneshot
-          running `bootctl --esp-path=<esp.mountPoint> --no-variables
-          --graceful install`, `SuccessExitStatus = "0 1"`, guarded by
+          running `bootctl --esp-path=<esp.mountPoint> --graceful install`,
+          adding `--no-variables` exactly when `efiVariables = "removable"`.
+          Thus a host declaring `"write"` also repairs its NVRAM entry,
+          while a fallback-only host never attempts that write.
+          `SuccessExitStatus = "0 1"`, guarded by
           `ConditionPathIsMountPoint=<esp.mountPoint>` so it is a no-op
           before the ESP is mounted rather than a boot-blocking failure.
 
@@ -853,17 +834,13 @@ in
       };
     };
 
-    ## ── Remote unlock (initrd SSH for a headless in-initrd secret prompt) ──
-    ## nixnas hangs this off its own `crypto.tpm2.enable`; nixboot has no
-    ## such option of its own -- see remoteUnlock.tpm2.* for how the
-    ## boundary is drawn.
+    ## ── Remote unlock (TPM-gated initrd SSH for an in-initrd secret prompt) ──
     remoteUnlock = {
       enable = lib.mkOption {
         type = lib.types.bool;
         default = false;
         description = ''
-          Does this host need an in-initrd secret prompt (a LUKS
-          passphrase/PIN, most commonly) answered over SSH, because
+          Does this host need an in-initrd passphrase prompt answered over SSH, because
           nobody can type it at a console? Brings a NIC up in the initrd
           and runs sshd there: `ssh root@<host>` (a key in
           `remoteUnlock.authorizedKeys`) and hand the secret to systemd's
@@ -897,89 +874,7 @@ in
         '';
       };
 
-      sealHostKey = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = ''
-          Does the initrd-SSH host key ride as a TPM2-sealed systemd
-          CREDENTIAL instead of a plaintext key baked into the initrd at
-          build time? On first boot the key is generated and sealed
-          (the `nixboot-seal-hostkey` service, below, stage 2); on every
-          later boot the lanzaboote stub delivers the sealed credential
-          straight into the initrd and sshd itself unseals it during
-          credential activation -- no bespoke unseal service, systemd
-          does the unwrap. A tampered boot chain (a PCR 7 mismatch) cannot
-          recover the plaintext key, so a stolen stick cannot impersonate
-          this host's unlock prompt to phish the real secret out of an
-          operator who trusts the fingerprint.
-
-          REQUIRES `secureBoot.enable` -- asserted below, not left to fail
-          quietly -- because only the lanzaboote (UKI) stub scans the
-          ESP's `\loader\credentials\*.cred` drop-in and packs it into the
-          initrd; plain systemd-boot boots kernel+initrd directly, so the
-          sealed credential would simply never arrive and every single
-          boot (not just the first) would fall back to a freshly
-          generated EPHEMERAL key -- a DIFFERENT fingerprint every time,
-          never pinnable, defeating the entire point of a stable host
-          identity. Also folds in `remoteUnlock.tpm2.enable` (this module
-          reads, not owns, whether a TPM2 is even present -- see below);
-          with either half false, this whole path is inactive and
-          `hostKeyPath` becomes required instead (also asserted).
-
-          Set false to use a fixed plaintext key at `hostKeyPath`
-          (LAN/tailnet-only: it lands on the plaintext ESP).
-        '';
-      };
-
-      hostKeyPath = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
-        default = null;
-        description = ''
-          Plaintext initrd-SSH host key (a BUILD-MACHINE Nix path), used
-          only when `sealHostKey = false` -- no TPM2 on this board, or an
-          operator who deliberately wants a fixed, offline-inspectable
-          key instead of a sealed one. Embedded in the initrd at build
-          time and landed on the plaintext ESP inside the signed (or
-          unsigned) UKI, hence LAN/tailnet-only: anyone who reads the ESP
-          reads this key. Ignored while `sealHostKey = true` (the
-          default).
-        '';
-      };
-
       tpm2 = {
-        enable = lib.mkOption {
-          type = lib.types.bool;
-          default = false;
-          # NO default worth guessing beyond false -- see the NOT note in
-          # the header SCOPE comment: this mirrors, and is fed by, a real
-          # TPM2 policy owned elsewhere (nixnas's `crypto.tpm2.enable`).
-          description = ''
-            Does a TPM2 chip actually back this host, for the purpose of
-            sealing the initrd-SSH host key? nixboot does NOT own TPM2
-            configuration -- the real enable/pcrs/device policy for the
-            DATA unlock is a disk-layout+crypto concern that stays with
-            whoever declares it (e.g. nixnas's `crypto.tpm2.enable`). This
-            option exists ONLY so `sealHostKey` has something honest to read instead of
-            inventing its own TPM2 detection: set it to the SAME value as
-            that real policy's own enable flag. This is the boundary the
-            header SCOPE note promises -- nixboot READS a TPM2
-            configuration here, it never re-declares one. Left false
-            while `sealHostKey = true` (the default) is not an error by
-            itself: sealing is simply inactive (see `sealHostKey`'s own
-            "folds in" note), and `hostKeyPath` becomes the required
-            fallback, exactly as on a board with no TPM2 at all.
-
-            The host-key seal and the DATA unlock's own TPM2 policy are
-            otherwise UNRELATED cryptographic operations that merely
-            happen to share one physical chip: the host key uses
-            `--with-key=auto-initrd` (TPM2-only key derivation, no PIN,
-            because the initrd has no `/var` credential secret to combine
-            it with), while the data keyslot may additionally require a
-            PIN every boot (`crypto.tpm2.requirePin`). Do not assume
-            enabling one says anything about the PIN policy of the other.
-          '';
-        };
-
         pcrs = lib.mkOption {
           type = lib.types.listOf lib.types.ints.unsigned;
           default = [ 7 ];
@@ -1000,14 +895,8 @@ in
             throughout this file is specifically about PCR 7 -- verify it
             still holds for whatever set you pick.
 
-            This is a SEPARATE seal from any TPM2 policy guarding the
-            DATA unlock (nixnas's `crypto.tpm2.pcrs`, also defaults `[ 7 ]`
-            but is independently configurable there) -- nixnas itself never
-            reads that option for the host-key seal either, it hardcodes
-            `--tpm2-pcrs=7`. The two seals are structurally decoupled (a
-            systemd credential vs. a LUKS keyslot) and nixboot does not assert they agree;
-            whatever composes nixboot alongside a real TPM2-backed data
-            unlock is responsible for deciding whether they SHOULD.
+            This policy protects only the SSH host identity. Nixboot has no
+            TPM disk-unlock path and never releases a LUKS key.
           '';
         };
 
@@ -1111,40 +1000,17 @@ in
             message = "nixboot.loader.consoleMode / .graceful / .selfHeal are systemd-boot/lanzaboote-only (they write boot.loader.systemd-boot.* or hardcode bootctl) but loader.program = \"${cfg.loader.program}\". Drop whichever of consoleMode/graceful/selfHeal is set, or switch loader.program to \"systemd-boot\" or \"lanzaboote\".";
           }
           {
-            # Enabling the surface with NEITHER a working seal path NOR a
-            # plaintext fallback leaves the initrd with no host key at
-            # all, not a graceful default -- sshd would come up keyless and
-            # loop-crash ("no hostkeys available").
-            assertion = !ru.enable || sealActive || ru.hostKeyPath != null;
-            message = ''
-              nixboot.remoteUnlock.enable is set but no initrd-SSH host key is configured. Either:
-                - Set remoteUnlock.tpm2.enable = true to the SAME value as this host's real TPM2-backed
-                  unlock policy (keeps sealHostKey = true, the default): the key is generated + sealed on
-                  first boot, and every boot after that the initrd unseals it. The very first boot still
-                  serves initrd-SSH -- with a loudly-flagged EPHEMERAL, RAM-only host key (fingerprint
-                  changes once the sealed identity exists) -- no monitor or IPMI needed even on boot #1.
-                - Or set remoteUnlock.sealHostKey = false and supply a plaintext key via
-                  remoteUnlock.hostKeyPath (embedded in the initrd at build time, lands on the plaintext
-                  ESP -- LAN/tailnet-only).
-                - Or set remoteUnlock.enable = false if this host is unlocked over IPMI-SOL / a physical
-                  console instead.
-            '';
-          }
-          {
-            # Path A's delivery vehicle is the LANZABOOTE stub: it is what scans
+            # The delivery vehicle is the LANZABOOTE stub: it scans
             # \loader\credentials\*.cred and packs the sealed key into the
             # initrd. Plain systemd-boot boots kernel+initrd directly -- no
             # stub, no credential, so the sealed key would never arrive and
-            # EVERY boot (not just the first) would instead serve a fresh
-            # ephemeral key with a bogus "first boot" banner. Fail the build
+            # EVERY boot would lack the TPM-gated identity. Fail the build
             # instead of shipping a permanently-unpinnable unlock channel.
             assertion = !sealActive || cfg.secureBoot.enable;
             message = ''
-              nixboot.remoteUnlock.sealHostKey = true (the default) with remoteUnlock.tpm2.enable
-              = true requires nixboot.secureBoot.enable: only the lanzaboote (UKI) stub delivers
-              the TPM2-sealed host-key credential into the initrd. Enable secureBoot, or set
-              remoteUnlock.sealHostKey = false with a plaintext hostKeyPath, or set remoteUnlock.tpm2.enable
-              = false / remoteUnlock.enable = false.
+              nixboot.remoteUnlock.enable requires nixboot.secureBoot.enable: only the
+              lanzaboote UKI stub delivers the TPM2-sealed host-key credential into the initrd.
+              Enable Secure Boot, or disable remote unlock and use a local/IPMI console.
             '';
           }
           {
@@ -1156,42 +1022,33 @@ in
             message = "nixboot.remoteUnlock.enable is set but remoteUnlock.authorizedKeys is empty -- initrd sshd is key-only, so nothing could ever answer the unlock prompt over the network.";
           }
           {
-            # THE GAP THIS CLOSES -- WIDER THAN IT FIRST LOOKS: it is tempting to
-            # scope this to the sealed path only (Path A's `LoadCredentialEncrypted`
+            # The sealed path's `LoadCredentialEncrypted`
             # / credential-aware `preStart` / `boot.initrd.systemd.storePaths` do
             # live entirely under `boot.initrd.systemd.services.*`, a tree nixpkgs'
             # own systemd-initrd module only ever renders when
             # `config.boot.initrd.systemd.enable = true` -- verified against that
             # module's own `config = mkIf (config.boot.initrd.enable && cfg.enable)`
-            # gate). But the COMMON block both paths share (just below) ALSO writes
-            # `boot.initrd.systemd.network.enable = true` UNCONDITIONALLY, for
-            # EITHER path -- and that option's own module
+            # gate). The network block below also writes
+            # `boot.initrd.systemd.network.enable = true`, and that option's own module
             # (nixos/modules/system/boot/resolved.nix) defaults
             # `boot.initrd.services.resolved.enable` to
             # `config.boot.initrd.systemd.network.enable`, which that same module
             # then asserts CANNOT be true without systemd stage 1 ("'boot.initrd.
             # services.resolved.enable' can only be enabled with systemd stage 1").
-            # So `remoteUnlock.enable = true` ALONE -- Path A or Path B, sealed or
-            # plaintext -- already fails to EVALUATE at all without
+            # So `remoteUnlock.enable = true` already fails to evaluate without
             # `boot.initrd.systemd.enable`, a fact this repo's own eval-tests
-            # exposed (a first, narrower draft of this assertion that scoped only
-            # to Path A left Path B's own fixture failing for an unrelated,
-            # unasserted reason instead of a clear message). Refused HERE, with an
-            # honest explanation, rather than left for nixpkgs' own unrelated
+            # exposed. Refused here, with an honest explanation, rather than left for nixpkgs' own unrelated
             # resolved.nix assertion to surface with no mention of remoteUnlock at
             # all.
             assertion = !ru.enable || config.boot.initrd.systemd.enable;
             message = ''
               nixboot.remoteUnlock.enable requires boot.initrd.systemd.enable = true. The
-              common NIC/DHCP wiring this feature shares between both host-key paths writes
-              boot.initrd.systemd.network.enable = true unconditionally, which nixpkgs' own
+              NIC/DHCP wiring writes boot.initrd.systemd.network.enable = true, which nixpkgs' own
               resolved.nix then refuses outside systemd stage 1 -- and the sealed host-key
-              path (sealHostKey = true, the default, with remoteUnlock.tpm2.enable = true)
-              separately needs it for its systemd CREDENTIAL delivery
-              (LoadCredentialEncrypted), which the classic (non-systemd) initrd builder
+              TPM-gated identity needs systemd credential delivery (LoadCredentialEncrypted),
+              which the classic (non-systemd) initrd builder
               silently discards instead of erroring. Set boot.initrd.systemd.enable = true
-              (nixnas's own boot glue does this as a side effect of its LUKS TPM2 unlock
-              wiring -- a host composing nixboot without nixnas must set it directly), or
+              (nixnas's own boot glue does this directly), or
               set remoteUnlock.enable = false
               if this host is unlocked over IPMI-SOL / a physical console instead.
             '';
@@ -1311,19 +1168,9 @@ in
             serviceConfig.ExecStart = lib.mkForce "${pkgs.sbctl}/bin/sbctl create-keys --disable-landlock";
           };
 
-        # boot.initrd.systemd.enable is DELIBERATELY NOT owned here, unlike the
-        # console= wiring below, for two reasons: it is the supported path for
-        # TPM2-LUKS unlock, which is squarely the disk-layout/crypto appliance
-        # identity this module's SCOPE note at the top already excludes from
-        # this first cut ("LUKS members, ZFS pool import, the store/hot vs
-        # store/usb split ... NOT implemented in this first cut"); and nixboot
-        # already owns and writes the two lanzaboote options that matter to IT
-        # (enable, bootCounting.initialTries) without needing an opinion on
-        # stage-1's init system otherwise -- if a host's own crypto/appliance
-        # config needs systemd in the initrd (as nixnas's does), that host sets
-        # `boot.initrd.systemd.enable` itself, the same way it will declare its
-        # own LUKS members itself. Judged appliance identity, not generic
-        # boot-chain wiring; left out.
+        # boot.initrd.systemd.enable is deliberately not owned here. Remote unlock
+        # asserts that a composing host enabled it, while a host using only the other
+        # nixboot mechanisms remains free to choose its initrd implementation.
 
         # Console ordering: reorder, never drop. Both console= parameters are
         # ALWAYS present when console.primary is managed -- removing
@@ -1379,7 +1226,7 @@ in
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
-            ExecStart = "${pkgs.systemd}/bin/bootctl --esp-path=${cfg.esp.mountPoint} --no-variables --graceful install";
+            ExecStart = "${pkgs.systemd}/bin/bootctl --esp-path=${cfg.esp.mountPoint} ${lib.optionalString (cfg.loader.efiVariables == "removable") "--no-variables "}--graceful install";
             SuccessExitStatus = "0 1";
           };
         };
@@ -1526,7 +1373,7 @@ in
                 status="$(LC_ALL=C ${pkgs.systemd}/bin/bootctl --esp-path="$esp" status 2>/dev/null || true)"
                 case "${cfg.loader.program}" in
                   lanzaboote)
-                    if echo "$status" | grep -qi 'lanzastub'; then
+                    if echo "$status" | grep -i 'lanzastub' >/dev/null; then
                       echo "PASS  loader.program = lanzaboote (lanzastub active on $esp)"
                     else
                       echo "FAIL  loader.program = lanzaboote requested, but bootctl status on $esp shows no lanzastub entry"
@@ -1534,7 +1381,7 @@ in
                     fi
                     ;;
                   systemd-boot)
-                    if echo "$status" | grep -Eq 'Product: *systemd-boot'; then
+                    if grep -Eq 'Product: *systemd-boot' <<< "$status"; then
                       echo "PASS  loader.program = systemd-boot ($esp)"
                     else
                       echo "FAIL  loader.program = systemd-boot requested, but bootctl status on $esp shows no systemd-boot Product line"
@@ -1549,7 +1396,7 @@ in
                 # one. It also makes a signed-chain claim unverifiable, because the measured
                 # UKI did not come from the declared medium. Fail rather than training an
                 # operator to treat the warning as harmless.
-                if echo "$status" | grep -q '^WARNING: The boot loader reports a different partition UUID'; then
+                if echo "$status" | grep '^WARNING: The boot loader reports a different partition UUID' >/dev/null; then
                   echo "FAIL  loader.espHandoff: firmware reports a different loader-partition UUID than the ESP mounted at $esp -- do not enter a LUKS passphrase until the firmware handoff is recovered and re-verified"
                   fail=1
                 else
@@ -1699,11 +1546,11 @@ in
             ${lib.optionalString cfg.secureBoot.sbctlCompat ''
               if command -v sbctl >/dev/null 2>&1; then
                 sbctl_out="$(sbctl status --json 2>&1 || true)"
-                if ! echo "$sbctl_out" | grep -q '"installed"'; then
+                if ! echo "$sbctl_out" | grep '"installed"' >/dev/null; then
                   echo "FAIL  secureBoot.sbctlCompat: sbctl returned no status at all -- /etc/sbctl/sbctl.conf is missing, unreadable, or not valid YAML. sbctl exits 0 on a config parse error, so this breaks every sbctl invocation on this host while still looking like success to anything that only checks exit status."
                   echo "      sbctl status --json said: $(echo "$sbctl_out" | head -n3 | tr '\n' ' ')"
                   fail=1
-                elif echo "$sbctl_out" | grep -Eq '"installed"[[:space:]]*:[[:space:]]*true'; then
+                elif grep -Eq '"installed"[[:space:]]*:[[:space:]]*true' <<< "$sbctl_out"; then
                   echo "PASS  secureBoot.sbctlCompat: sbctl parses /etc/sbctl/sbctl.conf and reports installed"
                 else
                   echo "FAIL  secureBoot.sbctlCompat: sbctl parses its config but reports NOT installed -- the keydir that file names does not exist. Check /etc/sbctl/sbctl.conf against secureBoot.pkiBundle."
@@ -1811,8 +1658,7 @@ in
             # ── Check 8: the sealed initrd-SSH host key, i.e. what the NEXT
             # boot's initrd will actually present ── Nothing on the running
             # system records which fingerprint THIS boot's initrd actually
-            # served (the ephemeral-vs-sealed choice is made, and the ephemeral
-            # key thrown away, in stage 1, before nixboot-verify exists) -- so
+            # served, so
             # this checks the only thing that honestly IS verifiable post-boot
             # without reaching into TPM internals: does the credential
             # nixboot-seal-hostkey left on the ESP still decrypt against the
@@ -1825,7 +1671,7 @@ in
             # trust the WRONG key on their NEXT initrd-SSH connection --
             # exactly the class of bug this module exists to catch before the
             # next boot, not after.
-            ${lib.optionalString (ru.enable && sealActive) ''
+            ${lib.optionalString ru.enable ''
               cred="${credEspPath}"
               pub="${pubEspPath}"
               if [ -f "$cred" ]; then
@@ -1848,11 +1694,8 @@ in
                 fi
                 shred -u "$tmpkey" 2>/dev/null || rm -f "$tmpkey"
               else
-                echo "SKIP  remoteUnlock: $cred does not exist yet -- genuine first boot, or nixboot-seal-hostkey has not run; initrd-SSH is currently serving the EPHEMERAL fallback key instead"
+                echo "PASS  remoteUnlock: $cred does not exist yet -- initrd SSH is correctly unavailable until a console boot seals the stable identity"
               fi
-            ''}
-            ${lib.optionalString (ru.enable && !sealActive) ''
-              echo "SKIP  remoteUnlock: sealHostKey = false (or tpm2.enable = false) -- the plaintext hostKeyPath fingerprint is fixed at build time, nothing to verify post-boot"
             ''}
             ${lib.optionalString (!ru.enable) ''
               echo "SKIP  remoteUnlock: not managed by nixboot"
@@ -1943,22 +1786,17 @@ in
           "tg3"
           "atlantic" # common server/desktop NICs
         ]
-        # ── TPM2 driver, only when the sealed-host-key path needs to talk to a chip ──
-        # THE GAP THIS CLOSES: `remoteUnlock.tpm2.enable = true` makes sshd's
+        # ── TPM2 driver, only when remote unlock needs to talk to a chip ──
+        # `remoteUnlock.enable = true` makes sshd's
         # LoadCredentialEncrypted= run `systemd-creds decrypt --tpm2-device=...` INSIDE THE
         # INITRD (see nixboot-seal-hostkey/the sshd credential wiring above) -- which needs the
         # kernel to already be talking to the TPM chip (/dev/tpmrm0) by then. Without the driver
         # in the initrd's own module set, that decrypt simply cannot reach the chip at all,
         # regardless of whether the PCR/passphrase side of things is otherwise correct.
-        # `remoteUnlock.tpm2.enable` is documented (see that option's own doc) as a value nixboot
-        # only READS, never a policy it owns -- but a driver MODULE is mechanics, not policy, and
-        # nixboot is the one module that actually knows the sealed-key path needs it; nixnas's own
-        # `crypto/tpm2.nix` adds the identical two modules as a side effect of its OWN
-        # `crypto.tpm2.enable`, but a host that composes nixboot's remoteUnlock WITHOUT nixnas (the
-        # explicitly-supported "usable on hosts generically" case this module's own header claims)
-        # got no driver at all until this line. Additive-only (a list-type option merges), so this
+        # A driver module is mechanics, and nixboot is the component that knows the
+        # sealed-key path needs it. Additive-only (a list-type option merges), so this
         # can never collide with a host that already lists these some other way.
-        ++ lib.optionals ru.tpm2.enable [ "tpm_crb" "tpm_tis" ];
+        ++ lib.optionals ru.enable [ "tpm_crb" "tpm_tis" ];
 
         # ── CROSS-MODULE COUPLING nixboot cannot see, let alone fix ──
         # Everything above only gets an operator AS FAR AS a live sshd
@@ -1980,46 +1818,20 @@ in
         # forever for a human" promise is false past 90 seconds.
       })
 
-      ## ── Path B: sealHostKey = false -- embed the plaintext key in the initrd.
-      (lib.mkIf (ru.enable && !sealActive && ru.hostKeyPath != null) {
-        # A non-store STRING destination (NixOS uses it verbatim as the
-        # in-initrd HostKey path).
-        boot.initrd.network.ssh.hostKeys = [ hostKeyDest ];
-        # Override the auto-derived secret SOURCE with the real, tracked key
-        # so it is copied into the initrd during the image build. mkForce,
-        # not mkOverride 500: `boot.initrd.secrets` is an attrsOf where THIS
-        # module's own auto-derivation (from `boot.initrd.network.ssh.hostKeys`
-        # above, via the nixpkgs initrd-ssh module) would otherwise supply a
-        # plain-priority (100) default source for the same destination path --
-        # not a `boot.loader.*` write, so the top-of-file priority-discipline
-        # note does not constrain it, and mkOverride 500 (priority 500) would
-        # simply lose to that plain-priority default silently.
-        boot.initrd.secrets.${hostKeyDest} = lib.mkForce hostKeySource;
-      })
-
-      ## ── Path A: sealHostKey = true + remoteUnlock.tpm2.enable -- TPM2-sealed
-      ## key, delivered as a systemd CREDENTIAL (no bespoke unseal service).
-      ## See the remoteUnlock.sealHostKey option doc for the bootstrap story.
-      (lib.mkIf (ru.enable && sealActive) {
+      ## ── TPM2-sealed key, delivered as a systemd credential ──
+      (lib.mkIf ru.enable {
 
         # No static key in the initrd. sshd itself loads the TPM2-sealed
         # credential the stub delivered and systemd decrypts it during
         # activation -- the plaintext lands in the unit's
-        # $CREDENTIALS_DIRECTORY, which the first HostKey points at. The
-        # second HostKey is the first-boot EPHEMERAL fallback (generated by
-        # the preStart below); on every other boot that file simply does not
-        # exist -- sshd logs "Unable to load host key" for the absent one
-        # and carries on with whichever is present (verified against a live
-        # sshd on the source host). The Banner file is only written on the
-        # ephemeral path; when it is absent sshd sends no banner.
+        # $CREDENTIALS_DIRECTORY, which HostKey points at. A missing
+        # credential means no SSH identity and therefore no remote prompt.
         # ignoreEmptyHostKeys silences the NixOS empty-hostKeys assertion.
         # No ESP mount of its own here, no vfat/codepage modules, no
         # bespoke unseal unit -- systemd's credential machinery does it all.
         boot.initrd.network.ssh.ignoreEmptyHostKeys = true;
         boot.initrd.network.ssh.extraConfig = ''
           HostKey ${hostKeyCredPath}
-          HostKey ${ephemeralKeyPath}
-          Banner ${bannerPath}
         '';
 
         # sshd inherits the stub-provided credential by name and TPM2-decrypts
@@ -2029,13 +1841,12 @@ in
         #     stable identity.
         #   - credential DELIVERED + decrypt FAILS    -> tampered chain / PCR
         #     mismatch: the unit hard-fails during credential setup, BEFORE
-        #     any ExecStartPre -- NO ephemeral fallback, the box stays locked
+        #     any ExecStartPre -- the box stays locked
         #     (intentional: a stolen stick cannot present a plausible unlock
         #     prompt).
-        #   - credential MISSING (genuine first boot)  -> an ID-only
-        #     LoadCredentialEncrypted= is "missing_ok": non-fatal, the unit
-        #     starts with an empty $CREDENTIALS_DIRECTORY and the preStart
-        #     below generates the ephemeral key + warning banner.
+        #   - credential MISSING (genuine first boot)  -> sshd has no host
+        #     identity and remote unlock remains unavailable until stage 2
+        #     seals one after a console boot.
         boot.initrd.systemd.services.sshd.serviceConfig.LoadCredentialEncrypted = [ credName ];
 
         # ── BOUND THE FAILED-UNSEAL HAMMER (the DA-lockout defense) ──
@@ -2067,54 +1878,8 @@ in
         # one, is still there -- Secure Boot enrollment is a
         # physically-present step anyway), and `nixboot-seal-hostkey`
         # RE-SEALS in stage 2 so the NEXT boot's initrd-SSH comes up clean.
-        # The intentional anti-downgrade semantics stay UNCHANGED: still no
-        # ephemeral fallback for a credential that WAS delivered.
+        # The intentional anti-downgrade semantics stay unchanged.
         boot.initrd.systemd.services.sshd.serviceConfig.Restart = lib.mkForce "no";
-
-        # make-initrd-ng copies listed objects + ELF library deps only -- it
-        # does NOT chase store references inside script text, so the
-        # ssh-keygen the preStart calls must be listed explicitly (same
-        # pattern the nixpkgs module itself uses for the sshd binaries).
-        boot.initrd.systemd.storePaths = [ "${sshPackage}/bin/ssh-keygen" ];
-
-        # ── First-boot fallback: serve an EPHEMERAL host key rather than not
-        # serving at all. A host with `remoteUnlock.enable = true` must be
-        # unlockable without IPMI and without a monitor even on the very
-        # first boot, before any credential has ever been sealed. The key
-        # lives on the initrd's RAM rootfs; nothing survives switch-root.
-        # Loud, honest UX: the SSH banner (shown before authentication) says
-        # the fingerprint is a throwaway and where to verify the real one
-        # from boot #2 on.
-        boot.initrd.systemd.services.sshd.preStart = ''
-          # Boot 2+: systemd decrypted the sealed credential -- stable
-          # identity, nothing to do.
-          if [ -s "''${CREDENTIALS_DIRECTORY:-/run/credentials/sshd.service}/${credName}" ]; then
-            exit 0
-          fi
-          # GENUINE first boot: no credential was delivered by the stub. (A
-          # delivered-but-undecryptable credential never reaches this script
-          # -- see the Restart comment above: that case hard-fails earlier.)
-          if [ ! -s ${ephemeralKeyPath} ] || [ ! -s ${ephemeralKeyPath}.pub ]; then
-            rm -f ${ephemeralKeyPath} ${ephemeralKeyPath}.pub
-            ${sshPackage}/bin/ssh-keygen -t ed25519 -N "" -C "nixboot-ephemeral-first-boot" \
-              -f ${ephemeralKeyPath} -q
-          fi
-          fp="$(${sshPackage}/bin/ssh-keygen -lf ${ephemeralKeyPath}.pub)"
-          {
-            echo "=================================================================="
-            echo " nixboot FIRST BOOT: initrd SSH is using an EPHEMERAL host key"
-            echo "   $fp"
-            echo " RAM-only, thrown away at switch-root. The fingerprint WILL"
-            echo " CHANGE once the TPM-sealed identity is created later this boot"
-            echo " (nixboot-seal-hostkey, right after you unlock). From the NEXT"
-            echo " boot on, verify the new fingerprint against"
-            echo "   ${pubEspPath}"
-            echo " (also printed on console+journal by the seal service) and expect"
-            echo " a one-time ssh known-hosts change warning -- that one is expected."
-            echo "=================================================================="
-          } > ${bannerPath}
-          echo "nixboot: FIRST BOOT - initrd sshd is serving an EPHEMERAL host key: $fp"
-        '';
 
         # ── Stage-2 seal service (SELF-HEALING) ──────────────────────────────
         # Generates the ed25519 key and TPM2-seals it into the ESP's
@@ -2151,75 +1916,8 @@ in
             RemainAfterExit = true;
             StandardOutput = "journal+console";
             StandardError = "journal+console";
+            ExecStart = "${tpmSshCredentialMaintainer}/bin/nixboot-seal-initrd-ssh-credential";
           };
-          path = [ pkgs.systemd sshPackage pkgs.coreutils ];
-          script = ''
-            echo "=== NIXBOOT-SEAL-START ==="
-
-            # ── Self-healing idempotency: gate the reseal on a REAL decrypt
-            # self-test against the live TPM/PCR state -- NOT on the .cred
-            # merely existing (the exact gate that bricked the source
-            # host's first implementation). `-` writes the decrypted
-            # plaintext to stdout, discarded to /dev/null so the key never
-            # hits the journal. A successful unseal does NOT touch the TPM
-            # dictionary-attack counter, so this per-boot self-test is free;
-            # a STALE cred costs exactly one failed unseal (one DA
-            # increment) and then heals below -- never a retry loop.
-            if [ -f "${credEspPath}" ]; then
-              if systemd-creds decrypt --tpm2-device=${ru.tpm2.device} --name=${credName} "${credEspPath}" - >/dev/null 2>&1; then
-                echo "nixboot: sealed initrd SSH host key still decrypts against the current TPM/PCR state -- no reseal."
-                ssh-keygen -lf "${pubEspPath}" 2>/dev/null || true
-                echo "=== NIXBOOT-SEAL-END ==="
-                exit 0
-              fi
-              echo "!! nixboot: the sealed initrd SSH host key credential no longer decrypts against the"
-              echo "!! current TPM / PCR state. EXPECTED exactly once -- right after Secure Boot key"
-              echo "!! enrollment (nixboot-enroll-sb) changed PCR 7. RE-SEALING now; the initrd host-key"
-              echo "!! FINGERPRINT WILL CHANGE this once -- re-pin it on your next initrd-SSH connect."
-            fi
-
-            # (Re)generate + (re)seal. Temp DIRECTORY so the key file does not
-            # pre-exist (ssh-keygen -f would prompt). A stale .cred/.pub from
-            # a pre-enrollment seal is OVERWRITTEN below.
-            tmpdir="$(mktemp -d -t nixboot-initrd-hostkey-XXXXXX)"
-            tmpkey="$tmpdir/key"
-            cleanup() { find "$tmpdir" -type f -exec shred -u {} \; 2>/dev/null || true; rm -rf "$tmpdir"; }
-            trap cleanup EXIT
-            ssh-keygen -t ed25519 -N "" -C "${credName}" -f "$tmpkey" -q
-            mkdir -p "$(dirname "${credEspPath}")"
-            # --with-key=auto-initrd: seal to the TPM2 only (no /var secret),
-            # so the initrd can decrypt it; --name must match sshd's
-            # LoadCredentialEncrypted= name; --tpm2-pcrs anchors it.
-            # Remove any stale blob first -- systemd-creds encrypt refuses to
-            # clobber an existing output file, and on the self-heal path the
-            # old .cred is still present.
-            rm -f "${credEspPath}"
-            if ! systemd-creds encrypt \
-                --with-key=auto-initrd \
-                --tpm2-device=${ru.tpm2.device} \
-                --tpm2-pcrs=${tpm2PcrsArg} \
-                --name=${credName} \
-                "$tmpkey" \
-                "${credEspPath}"; then
-              echo "!! nixboot: FAILED to TPM2-seal the initrd SSH host key. If the TPM is in"
-              echo "!! dictionary-attack lockout (TPM_RC_LOCKOUT), clear it and re-run this service:"
-              echo "!!   tpm2_dictionarylockout --clear-lockout && systemctl start nixboot-seal-hostkey"
-              echo "=== NIXBOOT-SEAL-END ==="
-              exit 1
-            fi
-            chmod 600 "${credEspPath}"
-            # Surface the PUBLIC half (it is public -- plaintext ESP is fine)
-            # so the operator can VERIFY the initrd-SSH connection instead of
-            # TOFU-accepting it, and so nixboot-verify's Check 8 (below) has
-            # something to compare the sealed credential against. Overwrites
-            # any stale .pub. Without this the fingerprint would be destroyed
-            # with the tmpdir and the channel unverifiable.
-            install -m 0644 "$tmpkey.pub" "${pubEspPath}"
-            echo "nixboot: initrd SSH host key fingerprint (verify this on your next initrd-SSH connect):"
-            ssh-keygen -lf "$tmpkey.pub"
-            echo "nixboot: initrd SSH host key sealed to ${credEspPath} (public key beside it)"
-            echo "=== NIXBOOT-SEAL-END ==="
-          '';
         };
 
         # nixboot-verify reads the sealed credential back (Check 8, in its

@@ -24,6 +24,7 @@
           imports = [
             ./modules/nixboot.nix
             ./modules/extra-entries.nix
+            ./modules/image-artifact.nix
             ./modules/lanzaboote-retention.nix
           ];
         };
@@ -52,7 +53,21 @@
 
       lib = {
         mkUki = import ./lib/mk-uki.nix;
+        mkUkiSigningRequest = import ./lib/mk-uki-signing-request.nix;
+        mkUkiSigner = import ./lib/mk-uki-signer.nix;
+        mkSignedUkiVerifier = import ./lib/mk-signed-uki-verifier.nix;
+        mkPkiArchiveTools = import ./lib/mk-pki-archive-tools.nix;
+        mkTpmSshCredential = import ./lib/mk-tpm-ssh-credential.nix;
+        mkSystemdBootArtifact = import ./lib/mk-systemd-boot-artifact.nix;
+        mkEfiDiskImageVerifier = import ./lib/mk-efi-disk-image-verifier.nix;
+        mkEfiDiskImageCheck = import ./lib/mk-efi-disk-image-check.nix;
       };
+
+      packages = forAllSystems (system: {
+        pki-archive-tools = self.lib.mkPkiArchiveTools {
+          pkgs = pkgsFor system;
+        };
+      });
 
       # EVAL-TIME tests only -- no VM, no lanzaboote input (every fixture
       # below deliberately stays on loader.program = "systemd-boot" / "none"
@@ -74,6 +89,33 @@
         // (import ./checks/system-manager.nix {
           pkgs = pkgsFor system;
         })
+        // (import ./checks/image-artifact.nix {
+          pkgs = pkgsFor system;
+          inherit (self.lib) mkSystemdBootArtifact mkEfiDiskImageVerifier mkEfiDiskImageCheck;
+        })
+        // {
+          # Cross-plane runtime helper: both NixOS and system-manager hosts can maintain the
+          # same systemd-stub credential without baking a device identity into a rescue image.
+          tpm-ssh-credential-maintainer = self.lib.mkTpmSshCredential {
+            pkgs = pkgsFor system;
+          };
+          tpm-ssh-credential-vm = import ./checks/tpm-ssh-credential.nix {
+            pkgs = pkgsFor system;
+            inherit (self.lib) mkTpmSshCredential;
+          };
+          two-phase-uki-signing = import ./checks/uki-signing.nix {
+            pkgs = pkgsFor system;
+            inherit (self.lib) mkUki mkUkiSigningRequest mkUkiSigner mkSignedUkiVerifier;
+          };
+          pki-archive-tools = import ./checks/pki-archive-tools.nix {
+            pkgs = pkgsFor system;
+            inherit (self.lib) mkPkiArchiveTools;
+          };
+          secure-boot-uki-vm = import ./checks/secure-boot-uki.nix {
+            pkgs = pkgsFor system;
+            inherit (self.lib) mkUki mkUkiSigningRequest mkUkiSigner mkSignedUkiVerifier;
+          };
+        }
       );
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);

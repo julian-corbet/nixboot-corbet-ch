@@ -325,41 +325,42 @@ let
   # lib/register-boot-entry.nix exposes its own.
   retainedLzbt =
     if capacity.lanzabootePackage == null then null
-    else (mkRetainedLzbt { }).overrideAttrs (old: {
-      passthru = (old.passthru or { }) // {
-        mkTestVariant = args: mkRetainedLzbt args;
-      };
-    });
+    else
+      (mkRetainedLzbt { }).overrideAttrs (old: {
+        passthru = (old.passthru or { }) // {
+          mkTestVariant = args: mkRetainedLzbt args;
+        };
+      });
 in
 {
   config = lib.mkMerge [
     (lib.mkIf (cfg.enable && capacity.enable) {
-    assertions = [
-      {
-        assertion = cfg.loader.program == "lanzaboote";
-        message = "nixboot.generations.capacity.enable is a Lanzaboote-specific retention path; set loader.program = \"lanzaboote\" or leave capacity.enable = false.";
-      }
-      {
-        assertion = capacity.lanzabootePackage != null;
-        message = "nixboot.generations.capacity.enable requires generations.capacity.lanzabootePackage from the exact Lanzaboote flake composed by this host; lzbt is not a nixpkgs package.";
-      }
-      {
-        assertion = cfg.esp.capacityMiB != null;
-        message = "nixboot.generations.capacity.enable needs esp.capacityMiB so its declared normal, rescue and write-reserve budget can be validated before an ESP fills.";
-      }
-      {
-        assertion = everyExtraEntryBudgeted;
-        message = "nixboot.generations.capacity.enable requires every declared extraEntries entry to state espCapacityMiB; protected rescue UKIs must be in the ESP budget, never an uncounted afterthought.";
-      }
-      {
-        assertion = cfg.esp.capacityMiB == null || requiredMiB <= cfg.esp.capacityMiB;
-        message = "nixboot.generations.capacity budget is ${toString requiredMiB} MiB (fixed ${toString capacity.fixedMiB} + reserve ${toString capacity.reserveMiB} + ${toString cfg.generations.keep} normal generation(s) x ${toString capacity.generationMiB} + externally-maintained protected UKIs ${toString capacity.extraReservedMiB} + extraEntries UKIs ${toString entryBudgetMiB}), but esp.capacityMiB is only ${toString (if cfg.esp.capacityMiB == null then 0 else cfg.esp.capacityMiB)} MiB. Reduce retained entries or increase the ESP; do not ship an impossible boot budget.";
-      }
-      {
-        assertion = cfg.generations.keep >= 2;
-        message = "nixboot.generations.capacity requires generations.keep >= 2 so the exact booted entry and at least one new candidate can coexist.";
-      }
-    ];
+      assertions = [
+        {
+          assertion = cfg.loader.program == "lanzaboote";
+          message = "nixboot.generations.capacity.enable is a Lanzaboote-specific retention path; set loader.program = \"lanzaboote\" or leave capacity.enable = false.";
+        }
+        {
+          assertion = capacity.lanzabootePackage != null;
+          message = "nixboot.generations.capacity.enable requires generations.capacity.lanzabootePackage from the exact Lanzaboote flake composed by this host; lzbt is not a nixpkgs package.";
+        }
+        {
+          assertion = cfg.esp.capacityMiB != null;
+          message = "nixboot.generations.capacity.enable needs esp.capacityMiB so its declared normal, rescue and write-reserve budget can be validated before an ESP fills.";
+        }
+        {
+          assertion = everyExtraEntryBudgeted;
+          message = "nixboot.generations.capacity.enable requires every declared extraEntries entry to state espCapacityMiB; protected rescue UKIs must be in the ESP budget, never an uncounted afterthought.";
+        }
+        {
+          assertion = cfg.esp.capacityMiB == null || requiredMiB <= cfg.esp.capacityMiB;
+          message = "nixboot.generations.capacity budget is ${toString requiredMiB} MiB (fixed ${toString capacity.fixedMiB} + reserve ${toString capacity.reserveMiB} + ${toString cfg.generations.keep} normal generation(s) x ${toString capacity.generationMiB} + externally-maintained protected UKIs ${toString capacity.extraReservedMiB} + extraEntries UKIs ${toString entryBudgetMiB}), but esp.capacityMiB is only ${toString (if cfg.esp.capacityMiB == null then 0 else cfg.esp.capacityMiB)} MiB. Reduce retained entries or increase the ESP; do not ship an impossible boot budget.";
+        }
+        {
+          assertion = cfg.generations.keep >= 2;
+          message = "nixboot.generations.capacity requires generations.keep >= 2 so the exact booted entry and at least one new candidate can coexist.";
+        }
+      ];
     })
 
     (lib.mkIf (cfg.enable && capacity.enable && capacity.lanzabootePackage != null) {

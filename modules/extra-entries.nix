@@ -64,7 +64,7 @@ let
   # ── The per-entry build/sign/place/rotate pipeline ───────────────────────
   # One writeShellApplication per attrsOf entry -- writeShellApplication runs
   # shellcheck at BUILD time, which is the cheap guard on this pipeline the
-  # way the source rescue-maintain script relies on the same thing.
+  # way the source artifact pipeline relies on the same thing.
   mkExtraEntryMaintainer = name: entry:
     let
       espDir = "${cfg.esp.mountPoint}/EFI/Linux";

@@ -55,9 +55,11 @@ let
     };
   });
 
-  kernelPackages = lib.concatMap (kernel:
-    [ kernel.package ] ++ lib.optional (kernel.headersPackage != null) kernel.headersPackage
-  ) cfg.kernels;
+  kernelPackages = lib.concatMap
+    (kernel:
+      [ kernel.package ] ++ lib.optional (kernel.headersPackage != null) kernel.headersPackage
+    )
+    cfg.kernels;
 
   firmwareToolPackages = config.nixboot.firmware.packageNames;
   efitoolsPackage = lib.optional config.nixboot.tools.efitools.enable "efitools";
@@ -152,17 +154,21 @@ let
 
   bootedKernelHookFile = pkgs.writeText "96-nixboot-booted-kernel.hook" bootedKernelHookText;
 
-  kernelCalls = lib.concatMapStrings (kernel: ''
-    build_uki ${lib.escapeShellArg kernel.packageBase} ${lib.escapeShellArg kernel.id} ${if kernel.fallback then "yes" else "no"}
-  '') cfg.kernels;
+  kernelCalls = lib.concatMapStrings
+    (kernel: ''
+      build_uki ${lib.escapeShellArg kernel.packageBase} ${lib.escapeShellArg kernel.id} ${if kernel.fallback then "yes" else "no"}
+    '')
+    cfg.kernels;
 
   # The exact ESP filenames the DECLARATION asks for. Derived from `kernels`, not from what a
   # build produced -- that difference is what lets collection run before staging, which is the
   # whole point of separating them (see collectFunction).
-  desiredUkiNames = lib.concatMap (kernel:
-    [ "${cfg.uki.prefix}-${kernel.id}.efi" ]
-    ++ lib.optional kernel.fallback "${cfg.uki.prefix}-${kernel.id}-fallback.efi"
-  ) cfg.kernels;
+  desiredUkiNames = lib.concatMap
+    (kernel:
+      [ "${cfg.uki.prefix}-${kernel.id}.efi" ]
+      ++ lib.optional kernel.fallback "${cfg.uki.prefix}-${kernel.id}-fallback.efi"
+    )
+    cfg.kernels;
 
   # Reclamation of NixBoot-owned ESP files that no declared kernel wants.
   #
@@ -997,99 +1003,99 @@ in
     }
     (lib.mkIf cfg.enable {
       assertions = [
-      {
-        assertion = microcodePackage != null;
-        message = ''
-          nixboot.systemdBoot.enable requires nixcpu.capabilities.microcode.enable and an explicit
-          bare-metal Intel/AMD NixCPU declaration. NixBoot only READS
-          nixcpu.packages.bootMicrocode.archPackage to confirm early microcode was selected for
-          this boot path; it never installs the package itself, so a host declares the vendor
-          blob exactly once, in NixCPU.
-        '';
-      }
-      {
-        assertion = !cfg.stage.enable || cfg.kernelCmdline != null;
-        message = "nixboot.systemdBoot.stage.enable requires an explicit kernelCmdline; never inherit a potentially temporary /proc/cmdline.";
-      }
-      {
-        assertion = !cfg.stage.enable || cfg.kernels != [ ];
-        message = "nixboot.systemdBoot.stage.enable requires at least one declared native kernel.";
-      }
-      {
-        assertion = lib.length (lib.unique (map (kernel: kernel.id) cfg.kernels)) == lib.length cfg.kernels;
-        message = "nixboot.systemdBoot.kernels must use unique UKI ids.";
-      }
-      {
-        assertion = !cfg.secureBoot.enable || cfg.secureBoot.sbctlConfig != null;
-        message = "nixboot.systemdBoot.secureBoot.enable requires secureBoot.sbctlConfig: declare a root-owned runtime sbctl configuration through the host's secret-delivery mechanism, never a Nix store key path.";
-      }
-      {
-        assertion = !cfg.cutover.enable || cfg.stage.enable;
-        message = "nixboot.systemdBoot.cutover.enable requires stage.enable: a final fallback/NVRAM change is only valid after the separate staged path exists.";
-      }
-      {
-        assertion = !cfg.retireLimine.enable || cfg.cutover.enable;
-        message = "nixboot.systemdBoot.retireLimine.enable requires cutover.enable: Limine is retired only after final systemd-boot fallback/NVRAM ownership is declared.";
-      }
-      {
-        assertion = !cfg.retireLimine.enable || cfg.retireLimine.legacyArtifacts != [ ];
-        message = "nixboot.systemdBoot.retireLimine.enable requires explicit legacyArtifacts; never use a broad directory deletion on an ESP.";
-      }
-      {
-        assertion = !cfg.retireLimine.enable || cfg.retireLimine.protectedPaths != [ ];
-        message = "nixboot.systemdBoot.retireLimine.enable requires protectedPaths to detect unintended changes to recovery or firmware artifacts.";
-      }
+        {
+          assertion = microcodePackage != null;
+          message = ''
+            nixboot.systemdBoot.enable requires nixcpu.capabilities.microcode.enable and an explicit
+            bare-metal Intel/AMD NixCPU declaration. NixBoot only READS
+            nixcpu.packages.bootMicrocode.archPackage to confirm early microcode was selected for
+            this boot path; it never installs the package itself, so a host declares the vendor
+            blob exactly once, in NixCPU.
+          '';
+        }
+        {
+          assertion = !cfg.stage.enable || cfg.kernelCmdline != null;
+          message = "nixboot.systemdBoot.stage.enable requires an explicit kernelCmdline; never inherit a potentially temporary /proc/cmdline.";
+        }
+        {
+          assertion = !cfg.stage.enable || cfg.kernels != [ ];
+          message = "nixboot.systemdBoot.stage.enable requires at least one declared native kernel.";
+        }
+        {
+          assertion = lib.length (lib.unique (map (kernel: kernel.id) cfg.kernels)) == lib.length cfg.kernels;
+          message = "nixboot.systemdBoot.kernels must use unique UKI ids.";
+        }
+        {
+          assertion = !cfg.secureBoot.enable || cfg.secureBoot.sbctlConfig != null;
+          message = "nixboot.systemdBoot.secureBoot.enable requires secureBoot.sbctlConfig: declare a root-owned runtime sbctl configuration through the host's secret-delivery mechanism, never a Nix store key path.";
+        }
+        {
+          assertion = !cfg.cutover.enable || cfg.stage.enable;
+          message = "nixboot.systemdBoot.cutover.enable requires stage.enable: a final fallback/NVRAM change is only valid after the separate staged path exists.";
+        }
+        {
+          assertion = !cfg.retireLimine.enable || cfg.cutover.enable;
+          message = "nixboot.systemdBoot.retireLimine.enable requires cutover.enable: Limine is retired only after final systemd-boot fallback/NVRAM ownership is declared.";
+        }
+        {
+          assertion = !cfg.retireLimine.enable || cfg.retireLimine.legacyArtifacts != [ ];
+          message = "nixboot.systemdBoot.retireLimine.enable requires explicit legacyArtifacts; never use a broad directory deletion on an ESP.";
+        }
+        {
+          assertion = !cfg.retireLimine.enable || cfg.retireLimine.protectedPaths != [ ];
+          message = "nixboot.systemdBoot.retireLimine.enable requires protectedPaths to detect unintended changes to recovery or firmware artifacts.";
+        }
       ];
 
       systemd.services = lib.mkMerge [
-      # Wanted by multi-user.target, unlike every other unit in this backend. The others write the
-      # ESP, NVRAM, or the package set and are therefore manual by contract; this one only reads,
-      # and the question it answers is only meaningful about a boot that has actually happened.
-      (lib.mkIf cfg.bootedKernel.verify.enable {
-      nixboot-booted-kernel-verify = {
-        description = "NixBoot: report whether the booted kernel still matches the installed one";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "multi-user.target" ];
-        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-        script = bootedKernelVerifyScript;
-      };
-      })
+        # Wanted by multi-user.target, unlike every other unit in this backend. The others write the
+        # ESP, NVRAM, or the package set and are therefore manual by contract; this one only reads,
+        # and the question it answers is only meaningful about a boot that has actually happened.
+        (lib.mkIf cfg.bootedKernel.verify.enable {
+          nixboot-booted-kernel-verify = {
+            description = "NixBoot: report whether the booted kernel still matches the installed one";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "multi-user.target" ];
+            serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+            script = bootedKernelVerifyScript;
+          };
+        })
 
-      (lib.mkIf cfg.stage.enable ({
-      nixboot-systemd-boot-stage = {
-        description = "NixBoot: stage systemd-boot and native UKIs without cutover";
-        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-        script = stageScript;
-      };
-      nixboot-systemd-boot-verify = {
-        description = "NixBoot: verify staged systemd-boot and native UKIs";
-        after = [ "nixboot-systemd-boot-stage.service" ];
-        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-        script = verifyScript;
-      };
-      # Independently runnable, and deliberately NOT ordered after the stage unit. Staging already
-      # collects first; this exists so an operator facing a full ESP can reclaim NixBoot's own
-      # garbage without needing a staging run to succeed — the ordering that used to be impossible.
-      nixboot-systemd-boot-collect = {
-        description = "NixBoot: reclaim NixBoot-owned UKIs that no declared kernel wants";
-        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-        script = collectScript;
-      };
-      } // lib.optionalAttrs cfg.cutover.enable {
-      nixboot-systemd-boot-cutover = {
-        description = "NixBoot: replace active fallback and create the systemd-boot firmware entry";
-        after = [ "nixboot-systemd-boot-stage.service" ];
-        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-        script = cutoverScript;
-      };
-      } // lib.optionalAttrs cfg.retireLimine.enable {
-      nixboot-systemd-boot-retire-limine = {
-        description = "NixBoot: retire Limine only after a proven systemd-boot cutover";
-        after = [ "nixboot-systemd-boot-cutover.service" ];
-        serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
-        script = retireLimineScript;
-      };
-      }))
+        (lib.mkIf cfg.stage.enable ({
+          nixboot-systemd-boot-stage = {
+            description = "NixBoot: stage systemd-boot and native UKIs without cutover";
+            serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+            script = stageScript;
+          };
+          nixboot-systemd-boot-verify = {
+            description = "NixBoot: verify staged systemd-boot and native UKIs";
+            after = [ "nixboot-systemd-boot-stage.service" ];
+            serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+            script = verifyScript;
+          };
+          # Independently runnable, and deliberately NOT ordered after the stage unit. Staging already
+          # collects first; this exists so an operator facing a full ESP can reclaim NixBoot's own
+          # garbage without needing a staging run to succeed — the ordering that used to be impossible.
+          nixboot-systemd-boot-collect = {
+            description = "NixBoot: reclaim NixBoot-owned UKIs that no declared kernel wants";
+            serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+            script = collectScript;
+          };
+        } // lib.optionalAttrs cfg.cutover.enable {
+          nixboot-systemd-boot-cutover = {
+            description = "NixBoot: replace active fallback and create the systemd-boot firmware entry";
+            after = [ "nixboot-systemd-boot-stage.service" ];
+            serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+            script = cutoverScript;
+          };
+        } // lib.optionalAttrs cfg.retireLimine.enable {
+          nixboot-systemd-boot-retire-limine = {
+            description = "NixBoot: retire Limine only after a proven systemd-boot cutover";
+            after = [ "nixboot-systemd-boot-cutover.service" ];
+            serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+            script = retireLimineScript;
+          };
+        }))
       ];
 
       # /etc/pacman.d/hooks has higher precedence than package-provided hooks. `replaceExisting`

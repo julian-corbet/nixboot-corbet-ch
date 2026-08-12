@@ -82,7 +82,9 @@ these additional invariants:
    specialists remain authoritative for the source facts and physical
    provisioning; nixboot owns the projection required to reach switch-root.
 
-This target is not implemented yet. The current NixOS backend exposes
+This target is not completely implemented yet. The offline NixOS path now
+exposes one class-and-role-bearing artifact through `nixboot.imageArtifact` plus the
+provider-neutral final-disk gate in B29–B30. The current NixOS backend otherwise exposes
 `nixboot.*`; the current system-manager backend exposes
 `nixboot.systemdBoot.*`; no Home Manager backend or class/role schema is
 exported. Current nixboot maintainer timers and artifact rotation are
@@ -383,28 +385,23 @@ lanzaboote itself gates that unit's existence on
 (`modules/nixboot.nix`, the `boot.lanzaboote.pkiBundle` /
 `autoGenerateKeys.enable` writes and the `generate-sb-keys` override).
 
-**B22 — `remoteUnlock.*` delivers a headless in-initrd secret prompt over
-SSH, with the sealed host key as the default and a plaintext fallback,
-neither of which is allowed to silently fail to arrive.**
-Bringing a NIC + sshd up in the initrd is common to both paths
-(`remoteUnlock.enable`). Path A (`sealHostKey = true`, the default, folded
-with `remoteUnlock.tpm2.enable`) delivers the host key as a TPM2-sealed
+**B22 — `remoteUnlock.*` delivers a headless in-initrd passphrase prompt over
+SSH using only a TPM-gated identity.**
+`remoteUnlock.enable` brings up a NIC and sshd and delivers the host key as a TPM2-sealed
 systemd CREDENTIAL that `nixboot-seal-hostkey` generates and re-seals
 SELF-HEALINGLY (a real decrypt self-test against the live TPM/PCR state,
 not mere file existence — the gate required to survive a Secure Boot key
-enrollment), serves an
-EPHEMERAL, loudly-banner-flagged key on a genuine first boot before any
-seal exists, and forces `Restart = "no"` on the initrd sshd unit (`mkForce`,
+enrollment). Before a credential exists, or when TPM/PCR unseal fails, sshd
+has no host identity and the remote channel stays down; no unpinned fallback
+is permitted. The sealed path also forces `Restart = "no"` on the initrd sshd unit (`mkForce`,
 the one write in this whole file that genuinely needs it rather than
 `mkOverride 500` — nixpkgs' own `initrd-ssh.nix` sets `Restart = "on-failure"`
 at *plain* priority, which `mkOverride 500` would lose to silently) so a
 single post-enrollment stale credential costs exactly one failed TPM2
 unseal instead of a retry storm that can drive an fTPM into dictionary-attack
-lockout. Path B (`sealHostKey = false`) embeds a plaintext, build-time
-`hostKeyPath` instead — LAN/tailnet-only, no TPM needed. Both paths are
-refused, not left silently inert, when they cannot possibly work: enabling
-`remoteUnlock` with neither a working seal path nor a plaintext key,
-sealing without `secureBoot.enable` (only the lanzaboote stub delivers the
+lockout. There is no plaintext or ephemeral fallback. The configuration is
+refused, not left silently inert, when it cannot possibly work: enabling
+remote unlock without `secureBoot.enable` (only the lanzaboote stub delivers the
 sealed credential into the initrd), or an empty `authorizedKeys` (initrd
 sshd is key-only) are each an assertion failure. `nixboot-verify`'s Check 8
 re-runs the seal service's own decrypt self-test post-boot and additionally
@@ -414,21 +411,23 @@ wrong key on their next connection (`modules/nixboot.nix`, the
 `remoteUnlock` option group, the `ru.enable`-gated `config` blocks, and
 nixboot-verify Check 8).
 
-**B23 — Path A's systemd-credential writes cannot silently land nowhere.**
-Every write Path A makes — `LoadCredentialEncrypted`, the credential-aware
-`preStart`, `boot.initrd.systemd.storePaths` — lives entirely under
+**B23 — Remote unlock's systemd-credential writes cannot silently land nowhere.**
+Every write it makes — especially `LoadCredentialEncrypted` — lives under
 `boot.initrd.systemd.services.*`, an option tree nixpkgs' own systemd-initrd
 module only renders into the actual initrd when
 `boot.initrd.systemd.enable = true` (verified against that module's own
 `config = mkIf (config.boot.initrd.enable && cfg.enable)` gate). Turning on
-`remoteUnlock.sealHostKey` (the default) together with `remoteUnlock.tpm2.enable`
-without also setting `boot.initrd.systemd.enable` is therefore an assertion
+`remoteUnlock.enable` without also setting `boot.initrd.systemd.enable` is therefore an assertion
 failure, not a boot that quietly serves no host key at all — the same
 "setting requested, quietly not applied" bug class B4 already refuses for
-`bootCounting`. Path B needs no such assertion: `boot.initrd.network.ssh.hostKeys`
-and `boot.initrd.secrets` are rendered by the classic (non-systemd) initrd
-builder too (`modules/nixboot.nix`, the new assertion in the `ru.enable`
-block; proved both directions in `checks/default.nix`).
+`bootCounting` (`modules/nixboot.nix`; proved both directions in
+`checks/default.nix`).
+
+The runtime producer is also exported as `lib.mkTpmSshCredential`. This keeps
+the credential format, name, PCR self-test, atomic replacement, and failure
+semantics identical for system-manager hosts whose shared rescue consumes the
+credential even though their native primary initrd does not use nixboot's
+NixOS `remoteUnlock` module.
 
 **B24 — `nixboot-enroll-sb` is forced and shellchecked by `nix flake check`
 even when no host currently turns it on.**
@@ -573,12 +572,107 @@ of one knob is the mistake this whole contract is written against
 (`modules/system-manager-systemd-boot.nix`'s `plymouthPackage` binding and the
 `plymouth.enable` option; proved in `checks/system-manager.nix`).
 
+**B29 — An offline NixOS image has one checked boot-artifact producer.**
+`nixboot.imageArtifact.enable` requires a generic `deviceClass`, independent
+of `role`, and derives the ESP payload from the evaluated
+system's own toplevel, kernel, initrd and `boot.kernelParams`; it exposes the
+checked tree as `system.build.nixbootBootArtifact` and a machine-readable
+manifest as `system.build.nixbootBootArtifactManifest`. `init=` is never an
+input: `lib.mkSystemdBootArtifact` prepends the exact
+`${config.system.build.toplevel}/init` and rejects a second caller-supplied
+one. The finished tree carries systemd-boot at its normal path and the UEFI
+removable-media fallback, one Type-1 entry, its exact kernel/initrd, and the
+`entries.srel` marker. Both EFI executables are checked as PE images and every
+entry path and command line is read back during the build.
+The manifest distinguishes the immutable image fact
+`firmware.initialHandoff = "removable"` from the running host's declared
+`firmware.steadyStateHandoff`: an offline disk cannot contain a VM's or
+machine's NVRAM entry, even when the system is allowed to create and repair
+one after that fallback boot.
+The manifest records `firmwareVerified = false` and
+`initrdAuthenticatedByKernel = false`: a Type-1 entry with a separate initrd
+cannot honestly claim the signed-UKI guarantee.
+
+An offline tree has never run `bootctl install`, so the image artifact derives
+`loader.selfHeal = true`; explicitly turning it off is an assertion failure.
+This closes the first-switch failure in which the loader files exist and the
+ESP still lacks systemd-boot's install state. Self-heal passes
+`--no-variables` only for a `removable` steady-state handoff; a host declaring
+`write` re-asserts both the loader files and its NVRAM entry after every boot.
+The backend currently requires
+`loader.program = "systemd-boot"`: it does not relabel an unsigned split
+kernel/initrd as a signed-UKI or Limine artifact merely to make another enum
+value evaluate (`modules/image-artifact.nix`,
+`lib/mk-systemd-boot-artifact.nix`; proved in
+`checks/default.nix` and `checks/image-artifact.nix`).
+
+**B30 — The provider receives a checked disk, not merely checked source
+files.**
+`lib.mkEfiDiskImageVerifier` and `lib.mkEfiDiskImageCheck` consume declarative
+storage/provider facts: an optional image-materializer adapter, logical sector
+size, the ESP partition label, and a list of required GPT
+label/type-GUID/filesystem tuples. They contain no provider-name or
+image-format dispatch table. Raw input needs no adapter; any compressed,
+qcow2, VHD, VMDK or provider-specific envelope supplies runtime inputs plus a
+script that materializes raw bytes, after which the same checks apply.
+The verifier parses the final raw disk at
+the declared sector size, requires GPT, resolves every required label exactly
+once, checks its exact type GUID and filesystem signature, then reads every
+file from the FAT ESP without mounting and compares it byte-for-byte with the
+checked nixboot artifact. Extra ESP files are refused unless named explicitly
+in `allowedExtraEspFiles`; an image assembler cannot smuggle in a second
+default candidate through an otherwise valid FAT filesystem. When supplied
+with the artifact manifest and a root-path projection, it then maps the
+manifest's exact runtime `init` through the declared runtime/image prefixes,
+reads the unmounted ext2/3/4 or btrfs partition, and requires that file to
+exist and be executable. This is the gate that distinguishes `/@nix/store` from the bootable-
+looking but unreachable `/@nix/nix/store`. Without a root projection, output
+is explicitly scoped to firmware/loader handoff and never claims to reach
+`init`.
+
+**Not**: this does not create, size or format a partition, decide a root
+filesystem, upload an image, reimage a VM or select a recovery action. The
+layout owner supplies the facts and materializes the disk; nixdeploy decides
+whether and where it moves. The gate only turns their disagreement into a
+build failure before provider upload (`lib/mk-efi-disk-image-verifier.nix`,
+`lib/mk-efi-disk-image-check.nix`; positive and deliberate wrong-GPT-type /
+tampered-ESP refusals in `checks/image-artifact.nix`).
+
+**B31 — Secure Boot signing is a two-phase, secret-safe boundary.**
+`lib.mkUkiSigningRequest` emits an unsigned UKI and a manifest binding its
+SHA-256 digest to a generic device class, boot role, version and target EFI
+architecture. `lib.mkUkiSigner` receives the db private key and certificate
+only as runtime paths, signs outside the Nix store, refuses to replace an
+existing output, and emits the signed digest plus db-certificate fingerprint.
+`lib.mkSignedUkiVerifier` independently requires the original request, signed
+manifest, signed bytes and expected db certificate to agree. The same common
+nixrescue request can therefore receive different device trust-root signatures
+without rebuilding or forking its package payload.
+
+`lib.mkPkiArchiveTools` permits the encrypted PKI archive to be public: it uses
+interactive `age --passphrase`, offers no unattended passphrase input, decrypts
+only into tmpfs for one command, and removes the plaintext afterwards. Nixboot
+does not mandate a second password; the passphrase value remains an operator
+fact outside this public mechanism. Public ciphertext permits offline guessing,
+so the existing master passphrase must already resist that attack
+(`lib/mk-uki-signing-request.nix`,
+`lib/mk-uki-signer.nix`, `lib/mk-signed-uki-verifier.nix`,
+`lib/mk-pki-archive-tools.nix`; positive signature and wrong-certificate /
+post-signature-tamper refusals in `checks/uki-signing.nix`).
+
 ## Which behaviors become automated tests vs. stay observed
 
 - **Automatable** (a `pkgs.testers.nixosTest` VM can assert these directly):
   B1, B2, B3, B4, B5, B7, B9, B10, B12, B13, B14, B16, B17, B18, B19, B22
-  (the real seal/reseal/ephemeral-fallback/DA-lockout-avoidance sequence
-  needs a real TPM2 — swtpm — and a real reboot to prove, not eval alone).
+  (the real seal/reseal/fail-closed sequence needs a TPM2 — swtpm is
+  sufficient — rather than eval alone).
+- **Automated today in disposable VMs:** B22's TPM-gated SSH identity lifecycle
+  (real swtpm encryption/decryption, stable identity under an unchanged PCR,
+  fail-closed behavior after extending PCR 7, and one successful controlled
+  reseal) and B31's firmware handoff (OVMF Setup Mode, synthetic key creation,
+  signing and independent verification outside the Nix store, enrollment into
+  only the disposable guest, reboot with Secure Boot enabled in user mode, and
+  execution of the exact signed UKI).
 - **Automated today, at the eval/build level, without a VM** (see
   `checks/default.nix` and `checks/system-manager.nix`): B13, B14, B17, B18,
   B19, B20 (the option-surface and rendering half — real system-manager
@@ -586,8 +680,7 @@ of one knob is the mistake this whole contract is written against
   `checks/system-manager.nix`'s own header), B21 (pkiBundle/keySource reach
   `boot.lanzaboote.*`, and the landlock workaround applies only on the
   autogenerate path), B23 (the `boot.initrd.systemd.enable` requirement
-  fires when Path A is active and stays silent — proved in both
-  directions — when it is not, and Path B is proved unaffected either way),
+  fires when remote unlock is active and stays silent when it is not),
   B24 (`nixbootEnrollSb` is present in `system.build` and its derivation
   builds/shellchecks cleanly), B25 (the unit and its pacman hook are rendered
   when enabled and absent when not, the unit is the only one in the backend
@@ -606,7 +699,21 @@ of one knob is the mistake this whole contract is written against
   contract's promise — leaves `kernelCmdline` byte-identical, so a later
   revision cannot start composing `splash` in unnoticed; that the initramfs
   hook and the command-line word remain the consumer's is a gap this repo
-  states rather than a behavior it can assert),
+  states rather than a behavior it can assert), B29 (tree + manifest outputs,
+  the exact generated `init=`, fallback loader and self-heal requirement,
+  both first-boot/steady-state handoff combinations and their opposite
+  `--no-variables` behavior), B30 (complete synthetic btrfs and ext4 GPT
+  disks pass, zstd transport passes, and
+  a 4096-byte-sector image is refused under a 512-byte provider declaration,
+  and otherwise-valid images with a wrong root type, one altered ESP file, an
+  undeclared extra entry, or the selected system under `/@nix/nix/store` are
+  executed and refused), B31 (the signer and verifier are built and executed
+  against a synthetic db key; the expected certificate passes while a wrong
+  certificate and a byte appended after signing are both refused; the
+  interactive encrypted-PKI tools also build and shellcheck, explicitly tell
+  the operator to enter the same disk-encryption master passphrase, and expose
+  no unattended passphrase/key ingress, all without receiving a real
+  passphrase or key),
   B7's firmware-handoff branches (the retention wrapper's own script is RUN
   against stand-in `bootctl`/`findmnt`/`lsblk` binaries and a scratch ESP,
   once per direction: it installs on a healthy handoff and on a recorded
@@ -625,17 +732,17 @@ of one knob is the mistake this whole contract is written against
   its declared capacity over many generations), the REST of B15 (that a
   real firmware implementation accepts the entry and actually offers it at
   POST — the registrar's own logic is proved, real firmware quirks are not),
-  and the REST of B22 (a real TPM2 dictionary-attack lockout, and a real
-  Secure Boot key enrollment actually changing PCR 7 on real firmware — not
-  reproducible in a disposable VM suite without swtpm PCR-extension support
-  this repo does not yet drive).
+  and the REST of B22 (a physical TPM dictionary-attack lockout and a physical
+  machine's actual Secure Boot enrollment changing PCR 7; the disposable VM
+  proves the intended failure/reseal behavior by extending that PCR directly,
+  not the quirks of a particular firmware/TPM pair).
 
 `checks/default.nix` is this repo's first automated test suite — eval-level
 assertions plus the build-level execution proofs described above (the boot
 entry registrar's idempotency, and both directions of the retention wrapper's
-firmware-handoff decision). A
-full `pkgs.testers.nixosTest` VM suite covering the boot path itself (real
-UEFI via OVMF, real UKI discovery) remains future work — see
+firmware-handoff decision). `checks/tpm-ssh-credential.nix` and
+`checks/secure-boot-uki.nix` add the stateful VM proofs for swtpm and OVMF.
+Remaining physical-hardware experiments are tracked in
 [`experiments/README.md`](experiments/README.md) and
 [`studies/README.md`](studies/README.md).
 

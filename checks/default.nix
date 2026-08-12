@@ -183,6 +183,28 @@ let
     boot.loader.systemd-boot.editor = lib.mkDefault false;
   };
 
+  # ── Offline image artifact: the module derives its payload from this exact
+  # evaluated NixOS system and turns on the bootctl reconciliation that an ESP
+  # assembled outside a running system necessarily needs. ──────────────────
+  cfg-image-artifact = evalFor {
+    networking.hostName = "must-not-enter-artifact-name";
+    nixboot.loader.program = "systemd-boot";
+    nixboot.loader.efiVariables = "removable";
+    nixboot.imageArtifact = {
+      enable = true;
+      deviceClass = "nixvps";
+    };
+  };
+
+  cfg-image-artifact-write = evalFor {
+    nixboot.loader.program = "systemd-boot";
+    nixboot.loader.efiVariables = "write";
+    nixboot.imageArtifact = {
+      enable = true;
+      deviceClass = "nixvps";
+    };
+  };
+
   # ── secureBoot.pkiBundle / keySource actually reaching boot.lanzaboote.* ──────────────
   # loader.program = "lanzaboote" needs fakeLanzabooteModule's option surface to exist (this
   # flake carries no real lanzaboote input -- see this file's own header), which is exactly why
@@ -237,29 +259,22 @@ let
     };
   };
 
-  # ── remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set ──────
-  # boot.initrd.systemd.enable = true is REQUIRED here: the sealed path (Path A) writes
+  # ── remoteUnlock.enable -> tpm_crb/tpm_tis reach the initrd's own module set ───────────
+  # boot.initrd.systemd.enable = true is REQUIRED here: the sealed path writes
   # entirely into boot.initrd.systemd.services.*, which the classic initrd builder never
   # renders. A representative valid sealed-path host sets it, exactly as nixnas's own
-  # boot glue does as a side effect of its LUKS TPM2 unlock wiring.
+  # boot glue does explicitly.
   cfg-remoteunlock-tpm2 = evalFor {
     nixboot.remoteUnlock.enable = true;
     nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
-    nixboot.remoteUnlock.tpm2.enable = true;
     nixboot.secureBoot.enable = true;
     nixboot.loader.program = "lanzaboote";
     nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
     boot.initrd.systemd.enable = true;
   };
 
-  # Flip side: remoteUnlock enabled but the sealed/TPM2 path is NOT in use (plaintext
-  # hostKeyPath instead) -- the driver modules must NOT appear.
-  cfg-remoteunlock-no-tpm2 = evalFor {
-    nixboot.remoteUnlock.enable = true;
-    nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
-    nixboot.remoteUnlock.sealHostKey = false;
-    nixboot.remoteUnlock.hostKeyPath = ./default.nix; # any real path; content is irrelevant here
-  };
+  # Flip side: disabled remote unlock needs no TPM drivers.
+  cfg-remoteunlock-disabled = evalFor { };
 
   cfg-firmware-tools = evalFor {
     nixboot.enable = true;
@@ -277,6 +292,51 @@ let
         && cfg-firmware-tools.nixboot.firmware.packageNames == [ "fwupd" "dmidecode" ]
       )
       "packages: ${builtins.toJSON (pathNames cfg-firmware-tools)}")
+
+    # --- checked offline image artifact -----------------------------------------------
+    (check "image-artifact/exposes-checked-tree-and-manifest"
+      (cfg-image-artifact.system.build ? "nixbootBootArtifact"
+        && cfg-image-artifact.system.build ? "nixbootBootArtifactManifest")
+      "system.build keys: ${builtins.toJSON (builtins.attrNames cfg-image-artifact.system.build)}")
+
+    (check "image-artifact/derives-required-self-heal"
+      cfg-image-artifact.nixboot.loader.selfHeal
+      "nixboot.loader.selfHeal remained false on an offline-baked artifact")
+
+    (check "image-artifact/default-name-is-generic-not-host-derived"
+      (cfg-image-artifact.nixboot.imageArtifact.name == "nixvps-primary")
+      "imageArtifact.name: ${cfg-image-artifact.nixboot.imageArtifact.name}")
+
+    (check "image-artifact/removable-self-heal-refuses-nvram-writes"
+      (lib.hasInfix "--no-variables" cfg-image-artifact.systemd.services.nixboot-self-heal.serviceConfig.ExecStart)
+      "removable handoff self-heal would write firmware variables")
+
+    (check "image-artifact/write-self-heal-repairs-nvram"
+      (!lib.hasInfix "--no-variables" cfg-image-artifact-write.systemd.services.nixboot-self-heal.serviceConfig.ExecStart)
+      "write handoff self-heal suppressed firmware-variable repair")
+
+    (check "image-artifact/refuses-a-loader-it-does-not-produce"
+      (evalFailsBuild {
+        nixboot.loader.program = "none";
+        nixboot.loader.efiVariables = "removable";
+        nixboot.imageArtifact = {
+          enable = true;
+          deviceClass = "nixvps";
+        };
+      })
+      "an imageArtifact using loader.program = none reached system.build.toplevel")
+
+    (check "image-artifact/refuses-disabled-self-heal"
+      (evalFailsBuild {
+        nixboot.loader.program = "systemd-boot";
+        nixboot.loader.efiVariables = "removable";
+        nixboot.loader.selfHeal = false;
+        nixboot.imageArtifact = {
+          enable = true;
+          deviceClass = "nixvps";
+        };
+      })
+      "an offline-baked imageArtifact was allowed to disable bootctl self-heal")
 
     # --- decoupling from loader.program / secureBoot.enable (requirement 3) -------------
     (check "none-unsigned/builds-with-no-primary-chain-owned"
@@ -496,8 +556,8 @@ let
           parsed = builtins.fromJSON raw;
         in
         looksJson
-          && parsed.keydir == "/nix/lanzaboote/pki/keys"
-          && parsed.guid == "/nix/lanzaboote/pki/GUID"
+        && parsed.keydir == "/nix/lanzaboote/pki/keys"
+        && parsed.guid == "/nix/lanzaboote/pki/GUID"
       )
       "rendered /etc/sbctl/sbctl.conf: ${cfg-sb-stable.environment.etc."sbctl/sbctl.conf".text}")
 
@@ -825,30 +885,33 @@ let
       )
       "secureBoot.enable = false must never force boot.lanzaboote.pkiBundle away from lanzaboote's own default")
 
-    # --- remoteUnlock.tpm2.enable -> tpm_crb/tpm_tis reach the initrd's own module set -----
-    (check "remoteunlock/tpm2-enable-adds-tpm-driver-modules"
+    # --- remoteUnlock.enable -> tpm_crb/tpm_tis reach the initrd's own module set ----------
+    (check "remoteunlock/enable-adds-tpm-driver-modules"
       (
         let mods = cfg-remoteunlock-tpm2.boot.initrd.availableKernelModules;
         in lib.elem "tpm_crb" mods && lib.elem "tpm_tis" mods
       )
       "boot.initrd.availableKernelModules: ${builtins.toJSON cfg-remoteunlock-tpm2.boot.initrd.availableKernelModules}")
 
-    (check "remoteunlock/no-tpm2-means-no-tpm-driver-modules"
+    (check "remoteunlock/first-boot-denies-unpinned-identity"
+      (!lib.hasInfix "nixboot_initrd_ephemeral" cfg-remoteunlock-tpm2.boot.initrd.network.ssh.extraConfig
+        && cfg-remoteunlock-tpm2.boot.initrd.systemd.services.sshd.preStart == "")
+      "the TPM path unexpectedly rendered an unpinned host-key fallback")
+
+    (check "remoteunlock/disabled-means-no-tpm-driver-modules"
       (
-        let mods = cfg-remoteunlock-no-tpm2.boot.initrd.availableKernelModules;
+        let mods = cfg-remoteunlock-disabled.boot.initrd.availableKernelModules;
         in !(lib.elem "tpm_crb" mods) && !(lib.elem "tpm_tis" mods)
       )
-      "boot.initrd.availableKernelModules: ${builtins.toJSON cfg-remoteunlock-no-tpm2.boot.initrd.availableKernelModules}")
+      "boot.initrd.availableKernelModules: ${builtins.toJSON cfg-remoteunlock-disabled.boot.initrd.availableKernelModules}")
 
-    # --- remoteUnlock (either host-key path) requires boot.initrd.systemd.enable, proved
-    # both ways: the common NIC/DHCP block both paths share writes
+    # --- remoteUnlock requires boot.initrd.systemd.enable. The NIC/DHCP block writes
     # boot.initrd.systemd.network.enable = true unconditionally, which nixpkgs' own
     # resolved.nix then refuses outside systemd stage 1 -----------------------------
     (check "remoteunlock/sealed-without-systemd-initrd/eval-fails"
       (evalFailsBuild {
         nixboot.remoteUnlock.enable = true;
         nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
-        nixboot.remoteUnlock.tpm2.enable = true;
         nixboot.secureBoot.enable = true;
         nixboot.loader.program = "lanzaboote";
         nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
@@ -858,46 +921,20 @@ let
         # that turns it back off is exactly the case B23 exists to catch.
         boot.initrd.systemd.enable = false;
       })
-      "expected forcing system.build.toplevel to fail (Path A's systemd-credential writes are silently discarded without boot.initrd.systemd.enable) but it succeeded")
+      "expected forcing system.build.toplevel to fail (systemd-credential writes are silently discarded without boot.initrd.systemd.enable) but it succeeded")
 
     (check "remoteunlock/sealed-with-systemd-initrd/eval-succeeds"
       (
         !(evalFailsBuild {
           nixboot.remoteUnlock.enable = true;
           nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
-          nixboot.remoteUnlock.tpm2.enable = true;
           nixboot.secureBoot.enable = true;
           nixboot.loader.program = "lanzaboote";
           nixboot.secureBoot.pkiBundle = "/nix/lanzaboote/pki";
           boot.initrd.systemd.enable = true;
         })
       )
-      "expected forcing system.build.toplevel to succeed (boot.initrd.systemd.enable = true satisfies Path A's requirement) but it failed")
-
-    (check "remoteunlock/plaintext-path-b-without-systemd-initrd/eval-fails"
-      (evalFailsBuild {
-        nixboot.remoteUnlock.enable = true;
-        nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
-        nixboot.remoteUnlock.sealHostKey = false;
-        nixboot.remoteUnlock.hostKeyPath = ./default.nix;
-        # boot.initrd.systemd.enable EXPLICITLY false -- proves the COMMON block's
-        # unconditional boot.initrd.systemd.network.enable write requires systemd
-        # stage 1 even on the plaintext path, which never touches a credential at all.
-        boot.initrd.systemd.enable = false;
-      })
-      "expected forcing system.build.toplevel to fail (the common NIC/DHCP block's boot.initrd.systemd.network.enable write is refused by nixpkgs' own resolved.nix outside systemd stage 1, regardless of which host-key path is in use) but it succeeded")
-
-    (check "remoteunlock/plaintext-path-b-with-systemd-initrd/eval-succeeds"
-      (
-        !(evalFailsBuild {
-          nixboot.remoteUnlock.enable = true;
-          nixboot.remoteUnlock.authorizedKeys = [ "ssh-ed25519 AAAAfake test@example" ];
-          nixboot.remoteUnlock.sealHostKey = false;
-          nixboot.remoteUnlock.hostKeyPath = ./default.nix;
-          boot.initrd.systemd.enable = true;
-        })
-      )
-      "expected forcing system.build.toplevel to succeed (boot.initrd.systemd.enable = true satisfies the shared requirement, and Path B needs no credential machinery on top of it) but it failed")
+      "expected forcing system.build.toplevel to succeed (boot.initrd.systemd.enable = true satisfies the sealed credential requirement) but it failed")
 
     # --- nixboot-enroll-sb is exposed as a system.build output, like extraEntries' own
     # maintainer derivations, so CI forces + shellchecks it even when no host currently
@@ -1349,6 +1386,11 @@ let
 in
 {
   inherit eval-tests;
+  # Unlike the small library fixture in checks/image-artifact.nix, this forces
+  # the module output built from an actual evaluated NixOS kernel, initrd and
+  # toplevel. A PE check against a stand-in cannot prove those real paths and
+  # filenames compose correctly.
+  image-artifact-nixos-system = cfg-image-artifact.system.build.nixbootBootArtifact;
   register-boot-entry-idempotency = registerBootEntryIdempotencyTest;
   extra-entry-maintainer-builds = extraEntryMaintainerBuilds;
   lanzaboote-retention-installs = retentionInstallsTest;

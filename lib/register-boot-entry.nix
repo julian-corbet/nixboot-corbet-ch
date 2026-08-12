@@ -55,7 +55,7 @@ let
 
     existing="$(efibootmgr -v 2>/dev/null || true)"
 
-    if echo "$existing" | grep -F "$label" | grep -qF "$relpath_disp"; then
+    if echo "$existing" | grep -F "$label" | grep -F "$relpath_disp" >/dev/null; then
       echo "nixboot-register-boot-entry: '$label' -> $relpath_disp already registered -- no-op"
       exit 0
     fi
