@@ -1,0 +1,12 @@
+# Trusted pushes run on the warm Crow agent. Keep pull requests on the isolated
+# GitHub-hosted runner: Crow's local backend executes directly in our trusted
+# build environment and must not run code from an untrusted contribution.
+steps:
+  - name: flake-check
+    image: bash
+    commands:
+      # --all-systems is intentional: a plain flake check can report success
+      # after omitting checks that are incompatible with the runner system.
+      - nix flake check --all-systems --print-build-logs
+    when:
+      - event: [push, manual]
