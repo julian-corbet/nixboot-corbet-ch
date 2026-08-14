@@ -19,7 +19,7 @@ let
 in
 pkgs.writeShellApplication {
   name = "nixboot-seal-${name}-ssh-credential";
-  runtimeInputs = [ pkgs.coreutils pkgs.openssh pkgs.systemd ];
+  runtimeInputs = [ pkgs.coreutils pkgs.diffutils pkgs.openssh pkgs.systemd ];
   text = ''
     set -euo pipefail
     umask 077

@@ -29,7 +29,7 @@ pkgs.testers.nixosTest {
 
     credential = "/boot/loader/credentials/${credentialName}.cred"
     public_key = "/boot/loader/credentials/${credentialName}.pub"
-    command = "nixboot-seal-test-ssh-credential"
+    command = "${maintainer}/bin/nixboot-seal-test-ssh-credential"
 
     with subtest("first successful boot creates only a sealed identity and its public key"):
         machine.succeed(command)
@@ -50,7 +50,13 @@ pkgs.testers.nixosTest {
 
     with subtest("an unchanged PCR state preserves the exact identity"):
         machine.succeed(f"sha256sum {credential} {public_key} > /run/nixboot-before")
-        machine.succeed(command)
+        machine.succeed(
+            f"env -i {command} > /run/nixboot-maintainer.log 2>&1"
+        )
+        machine.fail("grep -F 'command not found' /run/nixboot-maintainer.log")
+        machine.succeed(
+            "grep -F 'matches the current PCR state' /run/nixboot-maintainer.log"
+        )
         machine.succeed("sha256sum -c /run/nixboot-before")
 
     with subtest("a changed Secure Boot PCR invalidates the old credential"):
