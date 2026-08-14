@@ -475,12 +475,13 @@ let
 
     (check "verify-script-checks-boot-counting-completion"
       (
-        lib.hasInfix "systemd-bless-boot.service" cfg-boot-counting.systemd.services.nixboot-verify.script
-        && lib.hasInfix "LoaderBootCountPath" cfg-boot-counting.systemd.services.nixboot-verify.script
+        lib.hasInfix "LoaderBootCountPath" cfg-boot-counting.systemd.services.nixboot-verify.script
+        && !(lib.hasInfix "systemd-bless-boot marked this boot good" cfg-boot-counting.systemd.services.nixboot-verify.script)
+        && lib.hasInfix "systemd-bless-boot marked this boot good" cfg-boot-counting.systemd.services.nixboot-verify-bless.script
+        && cfg-boot-counting.systemd.services.systemd-bless-boot.unitConfig.OnSuccess == "nixboot-verify-bless.service"
         && !(lib.hasInfix "compgen" cfg-boot-counting.systemd.services.nixboot-verify.script)
-        && lib.hasInfix "increase generations.keep" cfg-boot-counting.systemd.services.nixboot-verify.script
       )
-      "nixboot-verify script does not read systemd-bless-boot for a boot-counting host")
+      "boot-counting verification is not split across pre-completion path validation and post-bless OnSuccess readback")
 
     # --- nixboot-verify's OWN unit `path` must actually carry what its script resolves by bare
     # name (2026-08-01 incident: findmnt was never on it, so Check 2 could not PASS on ANY

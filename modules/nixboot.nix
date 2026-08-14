@@ -1440,32 +1440,28 @@ in
               echo "SKIP  loader.program = none, nothing to verify"
             ''}
 
-            # ── Check 1b: the boot-counting completion signal ────────────────
-            # The lanzaboote stub consumes a `+N` attempt suffix, then systemd-bless-boot
-            # marks the entry good after userspace reaches boot-complete.target. A bounded
-            # ESP generation history that deletes the entry of a long-running system leaves
-            # LoaderBootCountPath referring to a file that no longer exists; systemd-bless-boot
-            # then fails every subsequent switch. That is not just red cosmetics: the current
-            # generation is no longer a manual rollback candidate. Check the actual unit state
-            # whenever this module asked lanzaboote to use boot counting, rather than assuming a
-            # `+N` file on disk proves the running entry was blessed.
+            # ── Check 1b: boot counting published a path to bless ─────────────
+            # Blessing itself deliberately runs only AFTER boot-complete.target. This verifier
+            # participates in deciding whether the boot is healthy enough to complete, so it
+            # must not demand that blessing has already happened: doing so deadlocks the health
+            # gate against its own success condition. The separate nixboot-verify-bless unit,
+            # triggered by systemd-bless-boot's OnSuccess below, verifies completion afterwards.
             ${lib.optionalString (cfg.bootCounting.tries != null) ''
-              bless_state="$(LC_ALL=C ${pkgs.systemd}/bin/systemctl show --value --property=ActiveState systemd-bless-boot.service 2>/dev/null || true)"
-              bless_result="$(LC_ALL=C ${pkgs.systemd}/bin/systemctl show --value --property=Result systemd-bless-boot.service 2>/dev/null || true)"
-              if [ "$bless_state" = active ] && [ "$bless_result" = success ]; then
-                echo "PASS  bootCounting: systemd-bless-boot marked this boot good"
+              boot_count_path="$(find /sys/firmware/efi/efivars -maxdepth 1 -name 'LoaderBootCountPath-*' -print -quit 2>/dev/null)"
+              if [ -n "$boot_count_path" ]; then
+                echo "PASS  bootCounting: firmware published LoaderBootCountPath; completion will be verified after systemd-bless-boot"
               ${lib.optionalString (cfg.loader.efiVariables == "removable") ''
-              elif [ -z "$(find /sys/firmware/efi/efivars -maxdepth 1 -name 'LoaderBootCountPath-*' -print -quit 2>/dev/null)" ]; then
+              else
                 # A removable-media bootstrap enters through EFI/BOOT/BOOT*.EFI, not through
                 # the counted generation UKI itself. Firmware therefore reports no counted
-                # path for systemd-bless-boot to bless on that one handoff. Treating the unit's
-                # normal inactive/success state as a broken generation made every genuine first
-                # boot red; subsequent boots through a counted UKI still take the strict branch.
+                # path to bless on that one handoff. Subsequent counted boots publish one.
                 echo "SKIP  bootCounting: removable-media bootstrap reported no LoaderBootCountPath; no counted entry exists to bless on this handoff"
               ''}
+              ${lib.optionalString (cfg.loader.efiVariables != "removable") ''
               else
-                echo "FAIL  bootCounting: systemd-bless-boot is state='$bless_state', result='$bless_result' -- the running entry may have been removed from the ESP before it could be blessed; increase generations.keep above the host's rebuilds-per-uptime and perform a controlled reboot"
+                echo "FAIL  bootCounting: firmware published no LoaderBootCountPath for this counted boot, so systemd-bless-boot has no entry to mark good"
                 fail=1
+              ''}
               fi
             ''}
 
@@ -1776,6 +1772,34 @@ in
             echo "nixboot-verify: every managed boot knob verified against the live system."
           '';
         };
+
+        # systemd-bless-boot is ordered AFTER boot-complete.target by systemd itself. Observe
+        # its successful completion through OnSuccess instead of adding an observer to
+        # boot-complete.target (which would create target -> observer -> bless -> target).
+        systemd.services.systemd-bless-boot = lib.mkIf
+          (cfg.verify.enable && cfg.bootCounting.tries != null)
+          {
+            unitConfig.OnSuccess = "nixboot-verify-bless.service";
+          };
+
+        systemd.services.nixboot-verify-bless = lib.mkIf
+          (cfg.verify.enable && cfg.bootCounting.tries != null)
+          {
+            description = "nixboot: verify boot counting was blessed after boot completion";
+            after = [ "systemd-bless-boot.service" ];
+            serviceConfig.Type = "oneshot";
+            script = ''
+              set -uo pipefail
+              state="$(LC_ALL=C ${pkgs.systemd}/bin/systemctl show --value --property=ActiveState systemd-bless-boot.service 2>/dev/null || true)"
+              result="$(LC_ALL=C ${pkgs.systemd}/bin/systemctl show --value --property=Result systemd-bless-boot.service 2>/dev/null || true)"
+              if [ "$state" = active ] && [ "$result" = success ]; then
+                echo "PASS  bootCounting: systemd-bless-boot marked this boot good"
+              else
+                echo "FAIL  bootCounting: systemd-bless-boot completed in state='$state', result='$result'"
+                exit 1
+              fi
+            '';
+          };
       }
 
       ## ── Remote unlock: common initrd wiring (NIC up + sshd, either path) ──
