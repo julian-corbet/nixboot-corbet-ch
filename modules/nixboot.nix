@@ -1861,6 +1861,19 @@ in
         #     seals one after a console boot.
         boot.initrd.systemd.services.sshd.serviceConfig.LoadCredentialEncrypted = [ credName ];
 
+        # LoadCredentialEncrypted deliberately treats a genuinely missing credential as empty.
+        # Without an explicit condition, first-boot sshd therefore starts with HostKey pointing
+        # at a nonexistent file: it cannot authenticate any connection, but it still listens on
+        # port 22. Repeated health probes then accumulate OpenSSH per-source penalties against
+        # that unusable listener and can obscure the normal stage-2 daemon after console unlock.
+        # `%d` is systemd's per-unit credential directory. Credential loading/decryption happens
+        # before ExecCondition, so the three security outcomes remain exact:
+        #   missing (first boot) -> cleanly skipped, no listener;
+        #   present + valid      -> non-empty key, sshd starts;
+        #   present + invalid    -> credential setup hard-fails before this condition.
+        boot.initrd.systemd.services.sshd.serviceConfig.ExecCondition =
+          "${pkgs.coreutils}/bin/test -s %d/${credName}";
+
         # ── BOUND THE FAILED-UNSEAL HAMMER (the DA-lockout defense) ──
         # nixpkgs' initrd-ssh module (nixos/modules/system/boot/initrd-ssh.nix,
         # its `services.sshd.serviceConfig.Restart = "on-failure";`) sets this

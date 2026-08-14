@@ -902,7 +902,9 @@ let
 
     (check "remoteunlock/first-boot-denies-unpinned-identity"
       (!lib.hasInfix "nixboot_initrd_ephemeral" cfg-remoteunlock-tpm2.boot.initrd.network.ssh.extraConfig
-        && cfg-remoteunlock-tpm2.boot.initrd.systemd.services.sshd.preStart == "")
+        && cfg-remoteunlock-tpm2.boot.initrd.systemd.services.sshd.preStart == ""
+        && lib.hasInfix "test -s %d/nixboot-initrd-hostkey"
+          cfg-remoteunlock-tpm2.boot.initrd.systemd.services.sshd.serviceConfig.ExecCondition)
       "the TPM path unexpectedly rendered an unpinned host-key fallback")
 
     (check "remoteunlock/disabled-means-no-tpm-driver-modules"
