@@ -1454,6 +1454,15 @@ in
               bless_result="$(LC_ALL=C ${pkgs.systemd}/bin/systemctl show --value --property=Result systemd-bless-boot.service 2>/dev/null || true)"
               if [ "$bless_state" = active ] && [ "$bless_result" = success ]; then
                 echo "PASS  bootCounting: systemd-bless-boot marked this boot good"
+              ${lib.optionalString (cfg.loader.efiVariables == "removable") ''
+              elif ! compgen -G '/sys/firmware/efi/efivars/LoaderBootCountPath-*' >/dev/null; then
+                # A removable-media bootstrap enters through EFI/BOOT/BOOT*.EFI, not through
+                # the counted generation UKI itself. Firmware therefore reports no counted
+                # path for systemd-bless-boot to bless on that one handoff. Treating the unit's
+                # normal inactive/success state as a broken generation made every genuine first
+                # boot red; subsequent boots through a counted UKI still take the strict branch.
+                echo "SKIP  bootCounting: removable-media bootstrap reported no LoaderBootCountPath; no counted entry exists to bless on this handoff"
+              ''}
               else
                 echo "FAIL  bootCounting: systemd-bless-boot is state='$bless_state', result='$bless_result' -- the running entry may have been removed from the ESP before it could be blessed; increase generations.keep above the host's rebuilds-per-uptime and perform a controlled reboot"
                 fail=1
@@ -1557,7 +1566,13 @@ in
             #     than treating usable key material as implied by this line.
             ${lib.optionalString cfg.secureBoot.sbctlCompat ''
               if command -v sbctl >/dev/null 2>&1; then
-                sbctl_out="$(sbctl status --json 2>&1 || true)"
+                # sbctl's Landlock setup resolves every configured path before running the
+                # read-only status command. On the first autogenerate boot, pkiBundle/GUID does
+                # not exist until enrollment, so that setup exits before status and emits no
+                # JSON at all. The key generator already needs the same narrowly-scoped bypass;
+                # status is read-only, and nixboot verifies its output below rather than trusting
+                # the sandbox setup as evidence that the PKI exists.
+                sbctl_out="$(sbctl --disable-landlock status --json 2>&1 || true)"
                 if ! echo "$sbctl_out" | grep '"installed"' >/dev/null; then
                   echo "FAIL  secureBoot.sbctlCompat: sbctl returned no status at all -- /etc/sbctl/sbctl.conf is missing, unreadable, or not valid YAML. sbctl exits 0 on a config parse error, so this breaks every sbctl invocation on this host while still looking like success to anything that only checks exit status."
                   echo "      sbctl status --json said: $(echo "$sbctl_out" | head -n3 | tr '\n' ' ')"

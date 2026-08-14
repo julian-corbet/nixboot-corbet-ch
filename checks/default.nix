@@ -230,6 +230,7 @@ let
   # branch just because it happens to use the same loader.
   cfg-boot-counting = evalFor {
     nixboot.loader.program = "lanzaboote";
+    nixboot.loader.efiVariables = "removable";
     nixboot.bootCounting.tries = 3;
   };
 
@@ -475,6 +476,7 @@ let
     (check "verify-script-checks-boot-counting-completion"
       (
         lib.hasInfix "systemd-bless-boot.service" cfg-boot-counting.systemd.services.nixboot-verify.script
+        && lib.hasInfix "LoaderBootCountPath" cfg-boot-counting.systemd.services.nixboot-verify.script
         && lib.hasInfix "increase generations.keep" cfg-boot-counting.systemd.services.nixboot-verify.script
       )
       "nixboot-verify script does not read systemd-bless-boot for a boot-counting host")
@@ -613,7 +615,7 @@ let
     # inside an English sentence, which makes matching it hostage to sbctl's phrasing and the
     # unit's locale.
     (check "verify-script-reads-sbctl-json-not-the-human-table"
-      (lib.hasInfix "sbctl status --json" cfg-sb-stable.systemd.services.nixboot-verify.script
+      (lib.hasInfix "sbctl --disable-landlock status --json" cfg-sb-stable.systemd.services.nixboot-verify.script
         && !(lib.hasInfix "Installed:" cfg-sb-stable.systemd.services.nixboot-verify.script))
       "nixboot-verify is back to grepping sbctl's human-readable status output")
 
