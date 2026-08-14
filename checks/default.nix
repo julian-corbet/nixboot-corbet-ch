@@ -477,6 +477,7 @@ let
       (
         lib.hasInfix "systemd-bless-boot.service" cfg-boot-counting.systemd.services.nixboot-verify.script
         && lib.hasInfix "LoaderBootCountPath" cfg-boot-counting.systemd.services.nixboot-verify.script
+        && !(lib.hasInfix "compgen" cfg-boot-counting.systemd.services.nixboot-verify.script)
         && lib.hasInfix "increase generations.keep" cfg-boot-counting.systemd.services.nixboot-verify.script
       )
       "nixboot-verify script does not read systemd-bless-boot for a boot-counting host")

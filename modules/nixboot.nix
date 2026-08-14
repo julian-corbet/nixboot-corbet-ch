@@ -1455,7 +1455,7 @@ in
               if [ "$bless_state" = active ] && [ "$bless_result" = success ]; then
                 echo "PASS  bootCounting: systemd-bless-boot marked this boot good"
               ${lib.optionalString (cfg.loader.efiVariables == "removable") ''
-              elif ! compgen -G '/sys/firmware/efi/efivars/LoaderBootCountPath-*' >/dev/null; then
+              elif [ -z "$(find /sys/firmware/efi/efivars -maxdepth 1 -name 'LoaderBootCountPath-*' -print -quit 2>/dev/null)" ]; then
                 # A removable-media bootstrap enters through EFI/BOOT/BOOT*.EFI, not through
                 # the counted generation UKI itself. Firmware therefore reports no counted
                 # path for systemd-bless-boot to bless on that one handoff. Treating the unit's
