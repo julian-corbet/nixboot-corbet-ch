@@ -1574,11 +1574,20 @@ in
                 # the sandbox setup as evidence that the PKI exists.
                 sbctl_out="$(sbctl --disable-landlock status --json 2>&1 || true)"
                 if ! echo "$sbctl_out" | grep '"installed"' >/dev/null; then
-                  echo "FAIL  secureBoot.sbctlCompat: sbctl returned no status at all -- /etc/sbctl/sbctl.conf is missing, unreadable, or not valid YAML. sbctl exits 0 on a config parse error, so this breaks every sbctl invocation on this host while still looking like success to anything that only checks exit status."
+                  echo "FAIL  secureBoot.sbctlCompat: sbctl returned no status at all -- its config may be missing/unreadable/invalid, or the firmware may not expose usable Secure Boot variables."
                   echo "      sbctl status --json said: $(echo "$sbctl_out" | head -n3 | tr '\n' ' ')"
                   fail=1
                 elif grep -Eq '"installed"[[:space:]]*:[[:space:]]*true' <<< "$sbctl_out"; then
                   echo "PASS  secureBoot.sbctlCompat: sbctl parses /etc/sbctl/sbctl.conf and reports installed"
+                  ${lib.optionalString cfg.secureBoot.enable ''
+                    if grep -Eq '"secure_boot"[[:space:]]*:[[:space:]]*true' <<< "$sbctl_out"; then
+                      echo "PASS  secureBoot.enable: firmware reports Secure Boot enforcement active"
+                    else
+                      echo "FAIL  secureBoot.enable: the configuration requests Secure Boot, but firmware does not report enforcement active (Setup Mode or disabled/unsupported firmware)."
+                      echo "      sbctl status --json said: $(echo "$sbctl_out" | head -n8 | tr '\n' ' ')"
+                      fail=1
+                    fi
+                  ''}
                 else
                   echo "FAIL  secureBoot.sbctlCompat: sbctl parses its config but reports NOT installed -- the keydir that file names does not exist. Check /etc/sbctl/sbctl.conf against secureBoot.pkiBundle."
                   echo "      sbctl status --json said: $(echo "$sbctl_out" | head -n3 | tr '\n' ' ')"

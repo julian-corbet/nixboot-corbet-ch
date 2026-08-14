@@ -201,7 +201,10 @@ without that third condition every host enabling nixboot got a config file
 naming the literal path `null/keys`. A malformed file here is invisible from
 the outside (sbctl exits 0 on a config parse error and simply reports
 nothing), which is why `nixboot-verify` Check 5 asserts on sbctl's `--json`
-output and treats "no status at all" as its own distinct failure.
+output and treats "no status at all" as its own distinct failure. When
+`secureBoot.enable` is declared, the same machine-readable status must also
+report `secure_boot: true`; finding the key directory is not proof that the
+firmware is actually enforcing those keys.
 
 **B10 — Every managed knob is read back after boot, not just requested.**
 `nixboot-verify` runs after boot, reads every managed knob straight off the

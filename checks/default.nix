@@ -619,6 +619,13 @@ let
         && !(lib.hasInfix "Installed:" cfg-sb-stable.systemd.services.nixboot-verify.script))
       "nixboot-verify is back to grepping sbctl's human-readable status output")
 
+    (check "verify-script-requires-firmware-secure-boot-when-enabled"
+      (lib.hasInfix "\"secure_boot\"[[:space:]]*:[[:space:]]*true"
+        cfg-sb-stable.systemd.services.nixboot-verify.script
+        && lib.hasInfix "firmware does not report enforcement active"
+          cfg-sb-stable.systemd.services.nixboot-verify.script)
+      "nixboot-verify can report success when Secure Boot is configured but firmware enforcement is off")
+
     # --- assertions fire, verified by actually forcing system.build.toplevel -----------
     (check "espFileName-nixos-prefix-collision/eval-fails"
       (evalFailsBuild {
