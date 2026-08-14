@@ -1177,13 +1177,40 @@ let
     chmod +x $out/bin/bootctl $out/bin/findmnt $out/bin/lsblk
   '';
 
-  # Stands in for the lzbt the Lanzaboote flake supplies. It records what the wrapper
-  # decided to hand it, which is the only observable that distinguishes "installed the
-  # right generations" from "installed at all".
+  # Stands in for the lzbt the Lanzaboote flake supplies. Besides recording what the
+  # wrapper handed it, reproduce upstream's decisive contract: only generations passed
+  # as profile links become GC roots, and every other nixos-generation-* stub is removed.
+  # A recorder alone let the wrapper claim that it retained the booted entry immediately
+  # before real Lanzaboote deleted that unpassed entry in production.
   fakeLzbt = pkgs.writeShellApplication {
     name = "lzbt";
+    runtimeInputs = [ pkgs.coreutils ];
     text = ''
       printf '%s\n' "$@" >> "$NIXBOOT_TEST_LZBT_ARGS"
+
+      rooted=" "
+      for argument in "$@"; do
+        case "$argument" in
+          */system-*-link|system-*-link)
+            profile_name="''${argument##*/}"
+            generation="''${profile_name#system-}"
+            generation="''${generation%-link}"
+            rooted="$rooted$generation "
+            : > "$NIXBOOT_TEST_LZBT_ESP/EFI/Linux/nixos-generation-$generation-aaaaaaa.efi"
+            ;;
+        esac
+      done
+
+      for stub in "$NIXBOOT_TEST_LZBT_ESP"/EFI/Linux/nixos-generation-*.efi; do
+        [ -e "$stub" ] || continue
+        stub_name="''${stub##*/}"
+        generation="''${stub_name#nixos-generation-}"
+        generation="''${generation%%-*}"
+        case "$rooted" in
+          *" $generation "*) ;;
+          *) rm -f -- "$stub" ;;
+        esac
+      done
     '';
   };
 
@@ -1204,7 +1231,7 @@ let
     cfg-capacity-retention-runtime.system.build.nixbootLanzabooteRetention.passthru.mkTestVariant {
       systemdPackage = fakeRetentionTools;
       utilLinuxPackage = fakeRetentionTools;
-      currentSystemLink = retentionTestCurrentSystem;
+      bootedSystemLink = retentionTestCurrentSystem;
       profilesDirectory = retentionTestProfiles;
     };
 
@@ -1215,6 +1242,7 @@ let
     esp=${retentionTestEsp}
     profiles=${retentionTestProfiles}
     export NIXBOOT_TEST_LZBT_ARGS="$PWD/lzbt-args"
+    export NIXBOOT_TEST_LZBT_ESP="$esp"
     export NIXBOOT_TEST_BOOTCTL_STATUS="$PWD/bootctl-status"
     export NIXBOOT_TEST_PARTITION_TABLE="$PWD/partition-table"
 
@@ -1295,8 +1323,8 @@ let
       { echo "healthy handoff: lzbt kept its own configuration limit"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
     grep -qx -- "$profiles/system-210-link" "$NIXBOOT_TEST_LZBT_ARGS" ||
       { echo "healthy handoff: the newest generation was not installed"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
-    grep -qx -- "$profiles/system-209-link" "$NIXBOOT_TEST_LZBT_ARGS" &&
-      { echo "healthy handoff: the booted entry was rebuilt from the profile link"; exit 1; }
+    grep -qx -- "$profiles/system-209-link" "$NIXBOOT_TEST_LZBT_ARGS" ||
+      { echo "healthy handoff: the exact booted profile was not passed through as a Lanzaboote GC root"; exit 1; }
 
     # ── Scenario 2: the incident. Firmware recorded a partition UUID that no longer
     # exists anywhere on this system (a boot medium rebuilt under the running system,
@@ -1325,10 +1353,25 @@ let
       { echo "stale loader UUID: the booted generation was not restored"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
     grep -qx -- "$profiles/system-208-link" "$NIXBOOT_TEST_LZBT_ARGS" &&
       { echo "stale loader UUID: the slot budget was exceeded"; cat "$NIXBOOT_TEST_LZBT_ARGS"; exit 1; }
+    stub_exists 209 || { echo "stale loader UUID: the exact booted entry was not reconstructed"; exit 1; }
     stub_exists 210 || { echo "stale loader UUID: the newest generation was collected"; exit 1; }
     stub_exists 208 && { echo "stale loader UUID: generation 208 outlived a 2-slot budget"; exit 1; }
 
-    echo "lanzaboote retention: healthy handoff and stale-recording install proofs PASSED"
+    # ── Scenario 3: firmware handoff is healthy but the booted stub is already absent.
+    # Recovery is safe only because the immutable generation-209 profile resolves exactly
+    # to /run/booted-system. Reinstall that exact bootspec without requiring a reboot.
+    reset_host
+    write_partition_table
+    write_boot_status agree
+    if ! install_run > "$PWD/out-recover" 2> "$PWD/err-recover"; then
+      echo "healthy handoff recovery: the wrapper refused an exactly reconstructable booted entry"
+      cat "$PWD/err-recover"; exit 1
+    fi
+    grep -qx -- "$profiles/system-209-link" "$NIXBOOT_TEST_LZBT_ARGS" ||
+      { echo "healthy handoff recovery: the exact booted profile was not passed to Lanzaboote"; exit 1; }
+    stub_exists 209 || { echo "healthy handoff recovery: the booted entry was not reconstructed"; exit 1; }
+
+    echo "lanzaboote retention: preservation and exact reconstruction proofs PASSED"
     touch $out
   '';
 
@@ -1378,6 +1421,8 @@ let
     reset_host
     write_partition_table
     write_boot_status agree
+    rm "$profiles/system-209-link"
+    ln -s /nix/store/not-the-booted-system "$profiles/system-209-link"
     expect_refusal "booted entry absent with a healthy loader"
 
     echo "lanzaboote retention: ambiguous-handoff refusal proofs PASSED"

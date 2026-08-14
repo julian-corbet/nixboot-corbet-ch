@@ -36,7 +36,7 @@ let
   mkRetainedLzbt =
     { systemdPackage ? pkgs.systemd
     , utilLinuxPackage ? pkgs.util-linux
-    , currentSystemLink ? "/run/current-system"
+    , bootedSystemLink ? "/run/booted-system"
     , profilesDirectory ? "/nix/var/nix/profiles"
     }: pkgs.writeShellApplication {
       name = "lzbt";
@@ -174,7 +174,7 @@ let
 
         current_entry=""
         current_generation=""
-        if [ -e ${lib.escapeShellArg currentSystemLink} ]; then
+        if [ -e ${lib.escapeShellArg bootedSystemLink} ]; then
           current_entry="$(printf '%s\n' "$boot_status" |
             ${pkgs.gnused}/bin/sed -n -E 's/^[[:space:]]*Current Entry:[[:space:]]*(nixos-generation-[^[:space:]]+\.efi).*$/\1/p')"
           # systemd-boot can report the attempt-counter form. The file may have
@@ -190,10 +190,40 @@ let
           fi
         fi
 
+        # Real Lanzaboote garbage collection roots ONLY the generation links it
+        # receives. Reserving the booted generation in our slot count is not enough:
+        # locate its immutable profile link and prove that it resolves to the exact
+        # booted system before either preserving or reconstructing its UKI.
+        booted_profile=""
+        if [ -n "$current_generation" ]; then
+          for profile in "''${profiles[@]}"; do
+            base="''${profile##*/}"
+            generation="''${base#system-}"
+            generation="''${generation%-link}"
+            if [ "$generation" = "$current_generation" ]; then
+              booted_profile="$profile"
+              break
+            fi
+          done
+
+          booted_system="$(${pkgs.coreutils}/bin/readlink -f ${lib.escapeShellArg bootedSystemLink} 2>/dev/null || true)"
+          booted_profile_system="$(${pkgs.coreutils}/bin/readlink -f "$booted_profile" 2>/dev/null || true)"
+          if [ -z "$booted_profile" ] || [ -z "$booted_system" ] || [ "$booted_profile_system" != "$booted_system" ]; then
+            if [ "$loader_esp_stale" = yes ]; then
+              echo "nixboot: WARNING: the recorded boot medium is gone and no exact generation-$current_generation profile link can root the booted system; treating it as an ordinary retention candidate." >&2
+              current_entry=""
+              current_generation=""
+              booted_profile=""
+            else
+              echo "nixboot: generation $current_generation does not resolve through an exact profile link to ${lib.escapeShellArg bootedSystemLink}; refusing to collect or install boot artifacts." >&2
+              exit 1
+            fi
+          fi
+        fi
+
         # Resolve the booted entry to a file on THIS ESP before choosing
-        # anything. Whether that file is here decides how many retention slots
-        # are already spoken for, and -- in the stale-loader state above --
-        # whether the booted generation still needs installing at all.
+        # anything. An absent file is reconstructable only because the profile
+        # proof above binds the bootctl generation to /run/booted-system.
         booted_stub=""
         if [ -n "$current_entry" ] && [ -d "$linux_dir" ]; then
           for stub in "$linux_dir"/nixos-generation-*.efi; do
@@ -207,21 +237,7 @@ let
           done
         fi
         if [ -n "$current_entry" ] && [ -z "$booted_stub" ]; then
-          if [ "$loader_esp_stale" = yes ]; then
-            # The guard above already established that the medium firmware
-            # recorded is gone from this system. The entry file it named went
-            # with it, so there is no booted entry on this ESP to preserve:
-            # refusing would protect a file that does not exist, at the price of
-            # a host that can never switch again. Drop the reservation instead
-            # and let this generation compete for a slot like any other, which
-            # is what lets this very installation write its entry back.
-            echo "nixboot: WARNING: the booted entry $current_entry is absent from $linux_dir, as expected while the recorded boot medium is gone; treating generation $current_generation as an ordinary retention candidate so this installation can restore it." >&2
-            current_entry=""
-            current_generation=""
-          else
-            echo "nixboot: the exact booted entry $current_entry is absent from $linux_dir; refusing to collect or install boot artifacts." >&2
-            exit 1
-          fi
+          echo "nixboot: WARNING: the exact booted entry $current_entry is absent from $linux_dir; reconstructing it from $booted_profile, which resolves exactly to ${lib.escapeShellArg bootedSystemLink}." >&2
         fi
 
         declare -A retained_generations=()
@@ -229,9 +245,11 @@ let
         selected_count=0
         if [ -n "$current_generation" ]; then
           retained_generations["$current_generation"]=1
-          # The booted entry already exists on the ESP. Do not recreate it from
-          # the current-system link: that symlink changes after an in-place
-          # switch while the booted kernel and LoaderBootCountPath do not.
+          # Passing the immutable generation link is load-bearing: upstream lzbt
+          # roots only the profiles it receives, then garbage-collects every other
+          # nixos-* entry. If the stub already exists lzbt registers it without
+          # rewriting; if it is missing, this exact bootspec reconstructs it.
+          selected+=("$booted_profile")
           selected_count=1
         fi
 
