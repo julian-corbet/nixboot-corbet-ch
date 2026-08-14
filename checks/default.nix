@@ -878,6 +878,13 @@ let
       (lib.hasInfix "--disable-landlock" (cfg-sb-autogenerate.systemd.services.generate-sb-keys.serviceConfig.ExecStart or ""))
       "generate-sb-keys ExecStart: ${builtins.toJSON (cfg-sb-autogenerate.systemd.services.generate-sb-keys.serviceConfig.ExecStart or null)}")
 
+    (check "secureboot/keySource-autogenerate-orders-verification-after-key-generation"
+      (
+        lib.elem "generate-sb-keys.service" cfg-sb-autogenerate.systemd.services.nixboot-verify.wants
+        && lib.elem "generate-sb-keys.service" cfg-sb-autogenerate.systemd.services.nixboot-verify.after
+      )
+      "nixboot-verify wants=${builtins.toJSON cfg-sb-autogenerate.systemd.services.nixboot-verify.wants}, after=${builtins.toJSON cfg-sb-autogenerate.systemd.services.nixboot-verify.after}")
+
     (check "secureboot/pkiBundle-inert-when-secureBoot-disabled"
       (
         let cfg = evalFor { nixboot.loader.program = "systemd-boot"; nixboot.loader.efiVariables = "removable"; };

@@ -1309,7 +1309,19 @@ in
         systemd.services.nixboot-verify = lib.mkIf cfg.verify.enable {
           description = "nixboot: read every managed boot knob back and report what actually took";
           wantedBy = [ "multi-user.target" ];
-          after = [ "multi-user.target" ];
+          # On an autogenerate host the first boot has no PKI until
+          # generate-sb-keys finishes. Both units are reached around
+          # multi-user.target, so target ordering alone leaves a real race:
+          # verify can ask sbctl before the GUID/keydir exists and permanently
+          # report a failed boot policy even though key generation succeeds a
+          # moment later. Pull the producer in and order the readback after it.
+          # Stable-key hosts have no such unit and keep the ordinary path.
+          wants = lib.optional
+            (cfg.secureBoot.enable && cfg.secureBoot.keySource == "autogenerate")
+            "generate-sb-keys.service";
+          after = [ "multi-user.target" ] ++ lib.optional
+            (cfg.secureBoot.enable && cfg.secureBoot.keySource == "autogenerate")
+            "generate-sb-keys.service";
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
