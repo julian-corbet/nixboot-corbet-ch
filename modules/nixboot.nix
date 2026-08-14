@@ -264,6 +264,13 @@ let
         "microsoft" = "--microsoft";
         "none" = "";
       }.${cfg.secureBoot.opromPolicy};
+      # The first installation of an autogenerate-key host is deliberately unsigned: the
+      # signing key does not exist until generate-sb-keys runs on that host's first boot.
+      # Firmware enrollment must therefore be preceded by the ordinary boot-loader installer,
+      # which re-emits every ESP artifact with the now-present db key.  This is NixOS's
+      # canonical installer handle (and includes nixboot's Lanzaboote retention wrapper when
+      # enabled), rather than a second hand-written lzbt invocation that could drift from it.
+      bootInstaller = config.system.build.installBootLoader;
     in
     pkgs.writeShellApplication {
       name = "nixboot-enroll-sb";
@@ -323,6 +330,13 @@ let
         install -d -m 0700 /var/lib/sbctl
         cp -a "$pki/keys" /var/lib/sbctl/keys
         cp -a "$pki/GUID" /var/lib/sbctl/GUID
+
+        # ORDER IS SECURITY-CRITICAL. On an autogenerate host the ESP is initially unsigned;
+        # enrolling db first would make the next boot reject every existing EFI artifact and
+        # strand the machine in firmware. Re-sign while Setup Mode still permits this boot,
+        # then enroll exactly the key which now verifies the on-disk chain.
+        echo "nixboot-enroll-sb: signing the installed boot chain with the enrollment key..."
+        ${bootInstaller}
 
         sbctl enroll-keys --disable-landlock ${opromFlag}
 

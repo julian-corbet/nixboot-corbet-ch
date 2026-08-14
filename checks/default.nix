@@ -23,6 +23,7 @@
 let
   lib = pkgs.lib;
   retentionSource = builtins.readFile ../modules/lanzaboote-retention.nix;
+  nixbootSource = builtins.readFile ../modules/nixboot.nix;
 
   # A stand-in system.build.toplevel: only its SHAPE matters here (the four paths
   # extra-entries.nix's maintainer script references), never its actual bootability --
@@ -624,8 +625,8 @@ let
     (check "verify-script-requires-firmware-secure-boot-when-enabled"
       (lib.hasInfix "\"secure_boot\"[[:space:]]*:[[:space:]]*true"
         cfg-sb-stable.systemd.services.nixboot-verify.script
-        && lib.hasInfix "firmware does not report enforcement active"
-          cfg-sb-stable.systemd.services.nixboot-verify.script)
+      && lib.hasInfix "firmware does not report enforcement active"
+        cfg-sb-stable.systemd.services.nixboot-verify.script)
       "nixboot-verify can report success when Secure Boot is configured but firmware enforcement is off")
 
     # --- assertions fire, verified by actually forcing system.build.toplevel -----------
@@ -915,7 +916,7 @@ let
       (!lib.hasInfix "nixboot_initrd_ephemeral" cfg-remoteunlock-tpm2.boot.initrd.network.ssh.extraConfig
         && cfg-remoteunlock-tpm2.boot.initrd.systemd.services.sshd.preStart == ""
         && lib.hasInfix "test -s %d/nixboot-initrd-hostkey"
-          cfg-remoteunlock-tpm2.boot.initrd.systemd.services.sshd.serviceConfig.ExecCondition)
+        cfg-remoteunlock-tpm2.boot.initrd.systemd.services.sshd.serviceConfig.ExecCondition)
       "the TPM path unexpectedly rendered an unpinned host-key fallback")
 
     (check "remoteunlock/disabled-means-no-tpm-driver-modules"
@@ -965,6 +966,20 @@ let
         in cfg.system.build ? "nixbootEnrollSb"
       )
       "system.build keys did not include nixbootEnrollSb")
+
+    # An autogenerate-key host's first ESP installation is unsigned by design. The enrollment
+    # tool must run the evaluated boot-loader installer before sbctl changes firmware policy,
+    # otherwise the first enforced boot rejects the entire existing chain. Pin both the action
+    # and its source order; swapping these two lines is a real unbootable-machine regression.
+    (check "secureboot/enrollment-resigns-before-firmware-policy-changes"
+      (
+        let
+          atEnrollment = lib.splitString "sbctl enroll-keys --disable-landlock" nixbootSource;
+          beforeEnrollment = builtins.head atEnrollment;
+        in
+        builtins.length atEnrollment == 2 && lib.hasInfix "bootInstaller}" beforeEnrollment
+      )
+      "nixboot-enroll-sb must invoke system.build.installBootLoader before sbctl enroll-keys")
   ];
 
   failed = builtins.filter (r: !r.ok) results;
