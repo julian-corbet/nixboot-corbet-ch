@@ -260,6 +260,19 @@ let
       (staged.systemd.services ? "${stage}" && staged.systemd.services ? "${verify}")
       "units: ${builtins.toJSON (builtins.attrNames staged.systemd.services)}")
 
+    # Absence of WantedBy= is not enough with system-manager: its switch script starts any changed
+    # service unless X-RestartIfChanged=false is rendered. Every manual unit must opt out explicitly,
+    # especially cutover, which writes the fallback loader and firmware variables.
+    (check "manual-units/do-not-run-during-system-manager-switch"
+      (
+        lib.all
+          (unit: staged.systemd.services.${unit}.restartIfChanged == false)
+          [ stage verify collectUnit ]
+        && cutover.systemd.services.${cutoverUnit}.restartIfChanged == false
+        && retirement.systemd.services.${retireLimineUnit}.restartIfChanged == false
+      )
+      "every manual stage, verify, collect, cutover, and retirement unit must set restartIfChanged=false")
+
     (check "cutover/manual-unit-verifies-stage-and-replaces-fallback"
       (
         cutover.systemd.services ? "${cutoverUnit}"

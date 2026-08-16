@@ -1064,12 +1064,16 @@ in
         (lib.mkIf cfg.stage.enable ({
           nixboot-systemd-boot-stage = {
             description = "NixBoot: stage systemd-boot and native UKIs without cutover";
+            # system-manager's switch script starts changed services even without WantedBy=. This
+            # unit writes the ESP and must run only through the explicit pacman hook or an operator.
+            restartIfChanged = false;
             serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
             script = stageScript;
           };
           nixboot-systemd-boot-verify = {
             description = "NixBoot: verify staged systemd-boot and native UKIs";
             after = [ "nixboot-systemd-boot-stage.service" ];
+            restartIfChanged = false;
             serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
             script = verifyScript;
           };
@@ -1078,6 +1082,7 @@ in
           # garbage without needing a staging run to succeed — the ordering that used to be impossible.
           nixboot-systemd-boot-collect = {
             description = "NixBoot: reclaim NixBoot-owned UKIs that no declared kernel wants";
+            restartIfChanged = false;
             serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
             script = collectScript;
           };
@@ -1085,6 +1090,7 @@ in
           nixboot-systemd-boot-cutover = {
             description = "NixBoot: replace active fallback and create the systemd-boot firmware entry";
             after = [ "nixboot-systemd-boot-stage.service" ];
+            restartIfChanged = false;
             serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
             script = cutoverScript;
           };
@@ -1092,6 +1098,7 @@ in
           nixboot-systemd-boot-retire-limine = {
             description = "NixBoot: retire Limine only after a proven systemd-boot cutover";
             after = [ "nixboot-systemd-boot-cutover.service" ];
+            restartIfChanged = false;
             serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
             script = retireLimineScript;
           };

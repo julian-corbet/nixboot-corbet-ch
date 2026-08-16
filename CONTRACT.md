@@ -336,10 +336,12 @@ chain without pretending the host is NixOS.**
 no `boot.*` option surface or Nix-built kernel closure. It declares the
 native Arch package set, discovers actual releases under
 `/usr/lib/modules/*/pkgbase`, and builds uniquely-prefixed Type #2 UKIs with
-`mkinitcpio --uki` from an explicitly declared command line. The stage and
-verify units are manual even when declared: staging builds every UKI outside
-the ESP, measures the additional ESP bytes required, and fails with no ESP
-write if they will not fit. Only then does it write a separate
+`mkinitcpio --uki` from an explicitly declared command line. The stage,
+verify, collect, cutover, and retirement units are manual even when declared:
+each sets `restartIfChanged = false` because omitting `wantedBy` alone does not
+stop system-manager from starting a changed service during a switch. Staging
+builds every UKI outside the ESP, measures the additional ESP bytes required,
+and fails with no ESP write if they will not fit. Only then does it write a separate
 `EFI/systemd/systemd-bootx64.efi`, `loader.conf`, and NixBoot-owned UKIs; it
 never changes `EFI/BOOT/BOOTX64.EFI`, NVRAM, or Secure Boot enrollment.
 An operator must physically boot the staged loader once before a separately
