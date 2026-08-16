@@ -78,18 +78,20 @@ let
   # prose: a NixOS host cannot set an option it does not have, so there is no silent no-op to
   # warn about -- it uses stock `boot.plymouth.*`.
   plymouthPackage = lib.optional cfg.plymouth.enable "plymouth";
+  secureBootPackages = lib.optional cfg.secureBoot.enable "sbctl";
 
   # Microcode is deliberately absent from this list: it is a NixCPU-owned Arch package (see
   # `microcodePackage` above), installed once through NixCPU's own system-manager backend. Once
   # pacman has it installed, mkinitcpio's `-S autodetect` hook picks up the vendor ucode image on
   # its own -- NixBoot's UKI build needs the blob to exist, not to be the one that names it.
   nativePackages = lib.unique (
-    [ "mkinitcpio" "systemd-ukify" "sbctl" "efibootmgr" cfg.firmwarePackage ]
+    [ "mkinitcpio" "systemd-ukify" "efibootmgr" cfg.firmwarePackage ]
     ++ kernelPackages
     ++ firmwareToolPackages
     ++ efitoolsPackage
     ++ hwdetectPackage
     ++ plymouthPackage
+    ++ secureBootPackages
   );
 
   cmdlineFile = pkgs.writeText "nixboot-kernel-cmdline" "${cfg.kernelCmdline}\n";
@@ -320,7 +322,9 @@ let
     secure_boot=${if cfg.secureBoot.enable then "yes" else "no"}
     sbctl_config=${if cfg.secureBoot.sbctlConfig == null then "''" else lib.escapeShellArg cfg.secureBoot.sbctlConfig}
 
-    for command in /usr/bin/basename /usr/bin/df /usr/bin/du /usr/bin/findmnt /usr/bin/install /usr/bin/mkinitcpio /usr/bin/mktemp /usr/bin/rm /usr/bin/sbctl /usr/bin/sed /usr/bin/stat; do
+    required_commands=(/usr/bin/basename /usr/bin/df /usr/bin/du /usr/bin/findmnt /usr/bin/install /usr/bin/mkinitcpio /usr/bin/mktemp /usr/bin/rm /usr/bin/sed /usr/bin/stat)
+    [ "$secure_boot" != yes ] || required_commands+=(/usr/bin/sbctl)
+    for command in "''${required_commands[@]}"; do
       [ -x "$command" ] || {
         echo "nixboot: required native command is absent: $command" >&2
         echo "nixboot: activate the declared native package set before staging." >&2

@@ -364,7 +364,9 @@ loader or an EFI file alone is never grounds to delete the current loader.
 When Secure Boot signing is enabled, an explicit root-owned runtime
 `secureBoot.sbctlConfig` is mandatory. That configuration is the host's
 secret-delivery boundary: NixBoot invokes `sbctl` through it but never
-materializes or defaults a private-key location. The explicit stage signs its
+materializes or defaults a private-key location. `sbctl` is absent from the
+native package selection when signing is disabled, so its global mkinitcpio
+hook cannot create a second signing lifecycle on a non-secure host. The explicit stage signs its
 separate systemd-boot EFI binary and NixBoot-owned UKIs under that identity;
 it does not sign or replace the active fallback until the separately reviewed
 cutover.

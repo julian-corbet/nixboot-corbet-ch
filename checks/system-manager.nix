@@ -131,7 +131,6 @@ let
       (lib.all (package: lib.elem package declared.nixboot.systemdBoot.archPackages) [
         "mkinitcpio"
         "systemd-ukify"
-        "sbctl"
         "efibootmgr"
         "linux-firmware"
         "linux-cachyos"
@@ -140,6 +139,16 @@ let
         "linux-cachyos-lts-headers"
       ])
       "packages: ${builtins.toJSON declared.nixboot.systemdBoot.archPackages}")
+
+    (check "secure-boot/selects-sbctl-only-when-enabled"
+      (
+        !(lib.elem "sbctl" declared.nixboot.systemdBoot.archPackages)
+        && lib.elem "sbctl" stagedSecure.nixboot.systemdBoot.archPackages
+        && lib.hasInfix
+          ''[ "$secure_boot" != yes ] || required_commands+=(/usr/bin/sbctl)''
+          staged.systemd.services.${stage}.script
+      )
+      "non-secure hosts must not acquire sbctl's global mkinitcpio hook; secure hosts still require its binary")
 
     # NixCPU owns microcode (CPU-keyed fact, vendor detection lives there); NixBoot cannot know
     # the CPU vendor and must not re-declare the vendor package into its own archPackages, even
