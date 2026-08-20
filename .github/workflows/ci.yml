@@ -6,6 +6,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Roughly 3x the slowest observed run, so a wedged evaluation fails fast instead of
+    # holding a runner for the six-hour default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
@@ -24,5 +27,8 @@ jobs:
       #
       # `systems` in flake.nix is deliberately narrow so this can be strict: only platforms that
       # can genuinely be evaluated are declared, and all of them really are.
+      #
+      # --keep-going for the same reason: without it the first failing check aborts the run
+      # and every remaining check goes unreported, so a single break hides all the others.
       - name: nix flake check (all systems)
-        run: nix flake check --all-systems --print-build-logs
+        run: nix flake check --all-systems --keep-going --print-build-logs
