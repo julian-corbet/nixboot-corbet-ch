@@ -10,4 +10,6 @@ steps:
     commands:
       # --all-systems is intentional: a plain flake check can report success
       # after omitting checks that are incompatible with the runner system.
-      - nix flake check --all-systems --print-build-logs
+      # --keep-going reports every failing check in one run; without it the
+      # first failure aborts and hides every check behind it.
+      - nix flake check --all-systems --keep-going --print-build-logs
