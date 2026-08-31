@@ -182,9 +182,10 @@ passphrase.
 
 **B8 — ESP capacity is warned, never enforced.**
 Resizing an ESP is an image reprovision, not a deploy nixboot can perform.
-`esp.capacityMiB` only ever produces an eval-time projected-usage warning
-(`modules/nixboot.nix:382-385`) and a runtime `df`-based WARN/FAIL in
-`nixboot-verify` (`modules/nixboot.nix:588-609`) — it never blocks a switch.
+`esp.capacityMiB` only ever produces an eval-time projected-usage warning and a runtime
+usage WARN/FAIL in `nixboot-verify` — it never blocks a switch. Runtime occupancy comes from
+`df`; declared partition geometry is compared with the mounted block device rather than FAT's
+slightly smaller formatted capacity.
 
 **B9 — A config file for an absent tool is a bug this module surfaces.**
 `secureBoot.sbctlCompat` writes `/etc/sbctl/sbctl.conf`; if `tools.sbctl.enable`

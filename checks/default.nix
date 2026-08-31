@@ -474,6 +474,20 @@ let
       )
       "nixboot-verify script does not reject a firmware loader/declared-ESP UUID mismatch")
 
+    # esp.capacityMiB is sourced from storage's partition geometry. FAT's formatted usable
+    # capacity is smaller than that partition, so comparing the declaration with df's filesystem
+    # size permanently warns on a correct 512 MiB ESP. Keep df for occupancy, but pin the geometry
+    # check to the mounted device so a future tidy-up cannot reintroduce that false positive.
+    (check "verify-script-compares-capacity-with-block-device-not-filesystem"
+      (
+        let script = cfg-capacity-retention.systemd.services.nixboot-verify.script;
+        in
+        lib.hasInfix "lsblk --bytes --nodeps --noheadings --output SIZE" script
+        && lib.hasInfix "mounted block device is 512 MiB" script
+        && !(lib.hasInfix "df --output=size" script)
+      )
+      "nixboot-verify compares declared partition capacity with formatted filesystem size")
+
     (check "verify-script-checks-boot-counting-completion"
       (
         lib.hasInfix "LoaderBootCountPath" cfg-boot-counting.systemd.services.nixboot-verify.script

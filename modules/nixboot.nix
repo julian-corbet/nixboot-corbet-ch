@@ -627,7 +627,7 @@ in
         type = lib.types.nullOr lib.types.ints.positive;
         default = if espSourcePart == null then null else (espSourcePart.sizeMiB or null);
         defaultText = lib.literalExpression "the esp partition's sizeMiB from esp.fromLayout, else null";
-        description = "How big is this ESP, so nixboot can warn before it overflows? Declared, never enforced -- resizing an ESP is an image reprovision, not something a deploy can do, so nixboot only ever warns loudly and lets a human schedule the reprovision.";
+        description = "How large is this ESP partition, so nixboot can warn before it overflows? Runtime usage is read from the mounted filesystem, while declared geometry is checked against the mounted block device: a formatted FAT filesystem is normally slightly smaller than its partition. Declared, never enforced -- resizing an ESP is an image reprovision, not something a deploy can do, so nixboot only ever warns loudly and lets a human schedule the reprovision.";
       };
 
       foreignPaths = lib.mkOption {
@@ -1500,7 +1500,6 @@ in
             ${lib.optionalString (cfg.esp.capacityMiB != null) ''
               if [ -d "$esp" ]; then
                 pcent="$(df --output=pcent "$esp" 2>/dev/null | tail -n1 | tr -d ' %')"
-                sizeMiB="$(df --output=size -BM "$esp" 2>/dev/null | tail -n1 | tr -d ' M')"
                 if [ -n "$pcent" ]; then
                   if [ "$pcent" -ge 90 ]; then
                     echo "FAIL  esp.capacityMiB: $esp is $pcent% full (declared ${toString cfg.esp.capacityMiB} MiB)"
@@ -1513,9 +1512,26 @@ in
                 else
                   echo "SKIP  esp.capacityMiB: could not read df output for $esp"
                 fi
-                if [ -n "''${sizeMiB:-}" ] && [ "$sizeMiB" != "${toString cfg.esp.capacityMiB}" ]; then
-                  echo "WARN  esp.capacityMiB: declared ${toString cfg.esp.capacityMiB} MiB, filesystem at $esp reports ~$sizeMiB MiB -- update the declaration or investigate the mismatch"
-                fi
+
+                # capacityMiB comes from storage layout's PARTITION geometry. `df --output=size`
+                # reports the formatted filesystem's usable block count instead; FAT metadata
+                # makes that number slightly smaller (a real 512 MiB ESP commonly reports 511
+                # MiB), which used to emit a permanent false drift warning. Keep df for usage,
+                # but compare declared geometry to the mounted block device itself.
+                sourceDevice="$(findmnt -n -o SOURCE "$esp" 2>/dev/null || true)"
+                sizeBytes="$(lsblk --bytes --nodeps --noheadings --output SIZE "$sourceDevice" 2>/dev/null | tr -d '[:space:]')"
+                declaredBytes="$(( ${toString cfg.esp.capacityMiB} * 1024 * 1024 ))"
+                case "$sizeBytes" in
+                  "$declaredBytes")
+                    echo "PASS  esp.capacityMiB: mounted block device is ${toString cfg.esp.capacityMiB} MiB"
+                    ;;
+                  ""|*[!0-9]*)
+                    echo "SKIP  esp.capacityMiB: could not read block-device geometry for $esp (source '$sourceDevice')"
+                    ;;
+                  *)
+                    echo "WARN  esp.capacityMiB: declared ${toString cfg.esp.capacityMiB} MiB ($declaredBytes bytes), mounted block device reports $sizeBytes bytes -- update the declaration or investigate the mismatch"
+                    ;;
+                esac
               fi
             ''}
 
