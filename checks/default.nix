@@ -480,13 +480,20 @@ let
     # check to the mounted device so a future tidy-up cannot reintroduce that false positive.
     (check "verify-script-compares-capacity-with-block-device-not-filesystem"
       (
-        let script = cfg-capacity-retention.systemd.services.nixboot-verify.script;
+        let
+          script = cfg-capacity-retention.systemd.services.nixboot-verify.script;
+          readsBlockDevice = lib.hasInfix "lsblk --bytes --nodeps --noheadings --output SIZE" script;
+          reportsDeclaredGeometry = lib.hasInfix "mounted block device is 512 MiB" script;
+          avoidsFilesystemGeometry = !(lib.hasInfix "sizeMiB=\"$(df --output=size" script);
         in
-        lib.hasInfix "lsblk --bytes --nodeps --noheadings --output SIZE" script
-        && lib.hasInfix "mounted block device is 512 MiB" script
-        && !(lib.hasInfix "df --output=size" script)
+        readsBlockDevice && reportsDeclaredGeometry && avoidsFilesystemGeometry
       )
-      "nixboot-verify compares declared partition capacity with formatted filesystem size")
+      (
+        let
+          script = cfg-capacity-retention.systemd.services.nixboot-verify.script;
+        in
+        "nixboot-verify capacity source: readsBlockDevice=${toString (lib.hasInfix "lsblk --bytes --nodeps --noheadings --output SIZE" script)}, reportsDeclaredGeometry=${toString (lib.hasInfix "mounted block device is 512 MiB" script)}, avoidsFilesystemGeometry=${toString (!(lib.hasInfix "sizeMiB=\"$(df --output=size" script))}"
+      ))
 
     (check "verify-script-checks-boot-counting-completion"
       (
